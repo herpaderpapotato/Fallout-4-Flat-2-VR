@@ -1,0 +1,12 @@
+# build outputs (xmake)
+/build/
+/.xmake/
+/.xmake-*/
+.vs/
+# local scratch: captures, stereo regeneration work dirs
+/work/
+__pycache__/
+*.pyc
+# backups made by our tools (never deleted, renamed to <name>.old-<stamp>)
+*.old-*
+*.copy-*

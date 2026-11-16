@@ -1,0 +1,433 @@
+// FRIK-flat bridge: see FrikBridge.h / FrikBridgeApi.h. No RE types here (REL only, for the C351F3 hook).
+#include <F4SE/F4SE.h>  // CommonLib before any Windows header
+
+#include "plugin/FloatingGun.h"
+#include "plugin/FrikBridge.h"
+#include "plugin/FrikBridgeApi.h"
+#include "plugin/Settings.h"
+#include "xr/XrRuntime.h"
+
+#include <Windows.h>
+#undef ERROR
+
+#include "plugin/CallChain.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <cmath>
+#include <cstring>
+#include <format>
+#include <mutex>
+#include <string>
+
+namespace fo4flatvr::frikbridge
+{
+    namespace
+    {
+        std::mutex                            g_lock;
+        FO4FlatVR_Frame                       g_frame{};
+        std::chrono::steady_clock::time_point g_t{};
+        bool                                  g_have = false;
+        std::atomic<bool>                     g_frikActive{ false };
+        std::atomic<bool>                     g_installed{ false };
+        std::atomic<unsigned>                 g_vibrateRequests{ 0 };
+        std::string                           g_iniPath;
+        float                                 g_unitsPerMeter = 70.0f;
+
+        // ---- own per-frame hook: call C351F3 (Main::OnIdle_UpdatePlayer -> PlayerUpdateEvent Notify C403B0) ----
+        constexpr std::uintptr_t                kNotifyCallSite = 0xC351F3;
+        constexpr std::uintptr_t                kNotify = 0xC403B0;
+        using Notify_t = int (*)(void*, void*);
+        Notify_t                                g_origNotify = nullptr;  // the next hook in the chain (floating gun) or Notify
+        bool                                    g_hooked = false;
+        std::string                             g_hookWhy = "not installed";
+        std::atomic<FO4FlatVR_FrameCallback>    g_frameCb{ nullptr };
+        std::atomic<void*>                      g_frameCtx{ nullptr };
+        std::atomic<std::uint64_t>              g_frameCalls{ 0 };
+
+        // ---- v3: camera offset (FRIK smooth movement) ----
+        std::atomic<FO4FlatVR_CameraOffsetCallback> g_camCb{ nullptr };
+        std::atomic<void*>                          g_camCtx{ nullptr };
+        std::atomic<bool>                           g_smooth{ true };   // [FRIK] bSmoothMovement / pipe "frik smooth on|off"
+        std::atomic<bool>                           g_body{ false };    // [FRIK] bBody
+        // [FRIK] bSmoothHorizontal (default 0): FRIK smooths x/y too, but on flat roomscale moves the capsule after a physical
+        // step/lean and the x/y smoothing then lags that move: vremu 20 cm head step -> camera error up to 10 u (0.001 without
+        // smoothing), plus a 39-51 u trail behind the capsule while running (15 Nov 00:17). 0 = height only.
+        std::atomic<bool>                           g_smoothXY{ false };
+        std::atomic<bool>                           g_camValid{ false };
+        std::atomic<float>                          g_camX{ 0.0f }, g_camY{ 0.0f }, g_camZ{ 0.0f };
+        std::atomic<std::uint64_t>                  g_camSteps{ 0 }, g_camValidSteps{ 0 };
+        std::atomic<float>                          g_camMaxAbsZ{ 0.0f }, g_camMaxAbsXY{ 0.0f };
+
+        // ---- perf (pipe "frik perf"): game frame interval at this hook and FRIK.dll's frame callback time, per window ----
+        // "frik cb off" skips the callback (body frozen) so the frame time can be compared body on/off in one session.
+        std::atomic<bool> g_cbSkip{ false };
+        struct Perf
+        {
+            std::mutex    lock;
+            std::uint64_t n = 0, nCb = 0;
+            double        sumIntMs = 0, maxIntMs = 0, sumCbUs = 0, maxCbUs = 0;
+            std::uint32_t hist[64]{};  // frame interval histogram, 0.5 ms bins (last bin = 31.5+ ms)
+            long long     last = 0;
+        };
+        Perf g_perf;
+        double QpcFreq()
+        {
+            static const double f = [] { LARGE_INTEGER q; ::QueryPerformanceFrequency(&q); return static_cast<double>(q.QuadPart); }();
+            return f;
+        }
+        long long Qpc()
+        {
+            LARGE_INTEGER q;
+            ::QueryPerformanceCounter(&q);
+            return q.QuadPart;
+        }
+
+        int HkNotify(void* a_src, void* a_evt)
+        {
+            // 15 Nov: the floating gun (next in the chain) and the notify run FIRST, then FRIK-flat's frame: FRIK's primary hand
+            // takes the gun's WEAPON of this frame as its grip target (frik-flat C27), so the hand stays on the gun with no lag.
+            const int r = g_origNotify(a_src, a_evt);
+            const long long t0 = Qpc();
+            double cbUs = -1.0;
+            if (const auto cb = g_frameCb.load(std::memory_order_acquire); cb && !g_cbSkip.load(std::memory_order_relaxed)) {
+                ++g_frameCalls;
+                cb(g_frameCtx.load(std::memory_order_relaxed));  // FRIK-flat's frame (it catches its own exceptions)
+                cbUs = (Qpc() - t0) * 1.0e6 / QpcFreq();
+            }
+            {
+                std::scoped_lock l(g_perf.lock);
+                if (g_perf.last) {
+                    const double ms = (t0 - g_perf.last) * 1.0e3 / QpcFreq();
+                    if (ms < 1000.0) {  // not across a load / pause
+                        ++g_perf.n;
+                        g_perf.sumIntMs += ms;
+                        g_perf.maxIntMs = (std::max)(g_perf.maxIntMs, ms);
+                        ++g_perf.hist[(std::min)(63, static_cast<int>(ms * 2.0))];
+                    }
+                }
+                g_perf.last = t0;
+                if (cbUs >= 0.0) {
+                    ++g_perf.nCb;
+                    g_perf.sumCbUs += cbUs;
+                    g_perf.maxCbUs = (std::max)(g_perf.maxCbUs, cbUs);
+                }
+            }
+            return r;
+        }
+
+        // window report + reset: frames, interval mean/p50/p95/max ms, callback mean/max us
+        std::string PerfReport()
+        {
+            std::scoped_lock l(g_perf.lock);
+            auto pct = [&](double p) {
+                const std::uint64_t want = static_cast<std::uint64_t>(p * g_perf.n);
+                std::uint64_t       acc = 0;
+                for (int i = 0; i < 64; ++i) {
+                    acc += g_perf.hist[i];
+                    if (acc > want) return (i + 1) * 0.5;
+                }
+                return 32.0;
+            };
+            const auto s = std::format("perf frames={} int_mean={:.2f} p50<={:.1f} p95<={:.1f} max={:.2f} cb={} cb_mean_us={:.0f} cb_max_us={:.0f} cbskip={}",
+                g_perf.n, g_perf.n ? g_perf.sumIntMs / g_perf.n : 0.0, pct(0.5), pct(0.95), g_perf.maxIntMs, g_perf.nCb,
+                g_perf.nCb ? g_perf.sumCbUs / g_perf.nCb : 0.0, g_perf.maxCbUs, g_cbSkip.load() ? 1 : 0);
+            g_perf.n = g_perf.nCb = 0;
+            g_perf.sumIntMs = g_perf.maxIntMs = g_perf.sumCbUs = g_perf.maxCbUs = 0;
+            std::memset(g_perf.hist, 0, sizeof(g_perf.hist));
+            return s;
+        }
+
+        const std::string& IniPath()
+        {
+            static std::once_flag once;
+            std::call_once(once, [] {
+                g_iniPath = Settings::Path();
+                char buf[64]{};
+                ::GetPrivateProfileStringA("General", "fUnitsPerMeter", "70", buf, sizeof(buf), g_iniPath.c_str());
+                const float u = std::strtof(buf, nullptr);
+                g_unitsPerMeter = u > 1.0f ? u : 70.0f;
+            });
+            return g_iniPath;
+        }
+
+        bool Enabled()
+        {
+            return ::GetPrivateProfileIntA("FRIK", "bEnable", 1, IniPath().c_str()) != 0;
+        }
+
+        // v3: body ON by default since 15 Nov (verified visible under vremu); [FRIK] bBody=0 = smooth movement only
+        // test-only override (frik-flat/tools/frik_session.py): environment FO4FLATVR_FRIK_BODY=1, so body tests never touch the
+        // user's ini
+        bool IniBody()
+        {
+            char env[8]{};
+            if (::GetEnvironmentVariableA("FO4FLATVR_FRIK_BODY", env, sizeof(env)) && env[0] == '1') return true;
+            // or a flag file next to the ini (an elevated launch may not inherit the environment)
+            std::string flag = IniPath();
+            if (const auto slash = flag.find_last_of("\\/"); slash != std::string::npos) flag.resize(slash + 1);
+            flag += "fo4flatvr_frik_body.test";
+            if (::GetFileAttributesA(flag.c_str()) != INVALID_FILE_ATTRIBUTES) return true;
+            return ::GetPrivateProfileIntA("FRIK", "bBody", 1, IniPath().c_str()) != 0;
+        }
+        bool IniSmooth() { return ::GetPrivateProfileIntA("FRIK", "bSmoothMovement", 1, IniPath().c_str()) != 0; }
+        bool IniSmoothXY() { return ::GetPrivateProfileIntA("FRIK", "bSmoothHorizontal", 0, IniPath().c_str()) != 0; }
+        // FRIK.dll may call before Install (plugin load order): read the ini then
+        bool Body() { return g_installed.load() ? g_body.load() : (Enabled() && IniBody()); }
+
+        // --- same math as FloatingGunInput.cpp (head-relative grip in the camera basis)
+        xr::Vec3 Cross(const xr::Vec3& a, const xr::Vec3& b) { return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
+        xr::Vec3 Rot(const xr::Quat& q, const xr::Vec3& v)
+        {
+            const xr::Vec3 u{ q.x, q.y, q.z };
+            const xr::Vec3 c = Cross(u, v);
+            const xr::Vec3 t{ 2 * c.x, 2 * c.y, 2 * c.z };
+            const xr::Vec3 c2 = Cross(u, t);
+            return { v.x + q.w * t.x + c2.x, v.y + q.w * t.y + c2.y, v.z + q.w * t.z + c2.z };
+        }
+        void ToGame(const xr::Vec3& v, float o[3]) { o[0] = v.x, o[1] = -v.z, o[2] = v.y; }
+
+        void HeadRel(const xr::Pose& a_grip, bool a_valid, const xr::Pose& a_head, bool a_headValid, FO4FlatVR_HeadRel& a_out)
+        {
+            a_out = {};
+            a_out.valid = a_valid && a_headValid;
+            if (!a_out.valid) return;
+            const auto&    hq = a_head.orientation;
+            const xr::Quat inv{ -hq.x, -hq.y, -hq.z, hq.w };
+            ToGame(Rot(inv, { a_grip.position.x - a_head.position.x, a_grip.position.y - a_head.position.y, a_grip.position.z - a_head.position.z }),
+                a_out.pos);
+            const xr::Vec3 axes[3] = { { 1.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, -1.0f }, { 0.0f, 1.0f, 0.0f } };
+            for (int c = 0; c < 3; ++c) {
+                float g[3];
+                ToGame(Rot(inv, Rot(a_grip.orientation, axes[c])), g);
+                for (int r = 0; r < 3; ++r) a_out.rot[r][c] = g[r];
+            }
+        }
+
+        void Copy(const xr::Pose& a_in, FO4FlatVR_Pose& a_out)
+        {
+            a_out.q[0] = a_in.orientation.x, a_out.q[1] = a_in.orientation.y, a_out.q[2] = a_in.orientation.z, a_out.q[3] = a_in.orientation.w;
+            a_out.p[0] = a_in.position.x, a_out.p[1] = a_in.position.y, a_out.p[2] = a_in.position.z;
+        }
+
+        // --- C ABI
+        std::uint8_t GetFrame(FO4FlatVR_Frame* a_out)
+        {
+            if (!a_out || a_out->size < sizeof(FO4FlatVR_Frame)) return 0;
+            std::scoped_lock l(g_lock);
+            if (!g_have) return 0;
+            *a_out = g_frame;
+            a_out->size = sizeof(FO4FlatVR_Frame);
+            a_out->ageSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_t).count();
+            return 1;
+        }
+
+        void Vibrate(std::int32_t, float, float)
+        {
+            // First build: no path from here to xr::Runtime::Vibrate (the runtime lives in Presenter). Counted only.
+            ++g_vibrateRequests;
+        }
+
+        // What the floating gun does while FRIK-flat's body is active (15 Nov, measured): on flat the first-person rig is a
+        // flattened bone tree in player-relative space with no NiNode chain above WEAPON / RArm_Hand (FO4VR's Update1StPersonArm
+        // has nothing to move), so FRIK-flat drives its arms from stand-in hand nodes (FRIK's own PrimaryWeaponOffsetNode .
+        // glue^-1, absolute world) and the WEAPON node stays with the floating gun, which already places it with FRIK's glue and
+        // per-weapon JSONs (FloatingGun.h W1). The gun therefore keeps placing the weapon; only its controller stand-in models
+        // go (FO4VR+FRIK shows hands, not controllers) and come back with the ini value when FRIK goes inactive.
+        // [FRIK] bGunStepsAside=1 restores the old full step-aside (gun::StepAside: no weapon placement at all).
+        void ApplyGunRole(bool a_frikActive)
+        {
+            if (::GetPrivateProfileIntA("FRIK", "bGunStepsAside", 0, IniPath().c_str()) != 0) {
+                gun::StepAside(a_frikActive);
+                return;
+            }
+            const int ctrl = a_frikActive ? 0 : (::GetPrivateProfileIntA("Weapon", "bControllerModels", 1, IniPath().c_str()) != 0 ? 1 : 0);
+            const auto r = gun::Command(std::format("cfg ctrl {}", ctrl));
+            REX::INFO("[FRIK] floating gun keeps the weapon; controller models {} ({})", ctrl ? "back" : "hidden while FRIK's body is active", r);
+        }
+
+        void SetFrikActive(std::uint8_t a_active)
+        {
+            const bool on = a_active != 0;
+            if (on && !Body()) {
+                // v3 guard: without the body FRIK.dll must never switch the floating gun off (smooth-movement-only mode)
+                REX::WARN("[FRIK] FRIK-flat asked to go active with bBody=0 - refused (floating gun stays)");
+                return;
+            }
+            if (g_frikActive.exchange(on) == on) return;
+            REX::INFO("[FRIK] FRIK-flat reports {}", on ? "active" : "inactive");
+            ApplyGunRole(on);
+        }
+
+        const char* IniPathC() { return IniPath().c_str(); }
+
+        std::uint8_t SetFrameCallback(FO4FlatVR_FrameCallback a_cb, void* a_ctx)
+        {
+            if (a_cb && !Body()) {
+                REX::WARN("[FRIK] frame callback refused: bBody=0 (smooth-movement-only mode)");
+                return 0;
+            }
+            g_frameCtx.store(a_ctx, std::memory_order_relaxed);
+            g_frameCb.store(a_cb, std::memory_order_release);
+            REX::INFO("[FRIK] frame callback {} (C351F3 hook {}: {})", a_cb ? "registered" : "cleared", g_hooked ? "installed" : "NOT installed", g_hookWhy);
+            return g_hooked ? 1 : 0;
+        }
+
+        std::uint8_t BodyEnabled() { return Body() ? 1 : 0; }
+
+        std::uint8_t SetCameraOffsetCallback(FO4FlatVR_CameraOffsetCallback a_cb, void* a_ctx)
+        {
+            g_camCtx.store(a_ctx, std::memory_order_relaxed);
+            g_camCb.store(a_cb, std::memory_order_release);
+            g_camValid = false;
+            REX::INFO("[FRIK] camera offset (smooth movement) callback {}; bSmoothMovement={}", a_cb ? "registered" : "cleared", g_smooth.load() ? 1 : 0);
+            return g_smooth.load() ? 1 : 0;
+        }
+
+        constexpr FO4FlatVR_FrikBridge kBridge{ FO4FLATVR_FRIK_BRIDGE_VERSION, 0, &GetFrame, &Vibrate, &SetFrikActive, &IniPathC, &SetFrameCallback,
+            &BodyEnabled, &SetCameraOffsetCallback };
+    }
+
+    void Install()
+    {
+        g_installed = true;
+        const bool en = Enabled();
+        g_body = en && IniBody();
+        g_smooth = IniSmooth();
+        g_smoothXY = IniSmoothXY();
+        if (en && g_body.load()) {
+            // own hook, chained: accepts the original call or another fo4flatvr hook there (the floating gun's W1)
+            const std::uintptr_t base = REL::Offset(0).address();
+            if (callchain::Hookable(base + kNotifyCallSite, base + kNotify, g_hookWhy)) {
+                auto& tramp = REL::GetTrampoline();
+                if (tramp.empty()) tramp.create(64);
+                g_origNotify = reinterpret_cast<Notify_t>(tramp.write_call<5>(base + kNotifyCallSite, &HkNotify));
+                g_hooked = true;
+            } else {
+                REX::ERROR("[FRIK] C351F3 not hookable: {} - FRIK-flat would get no frame", g_hookWhy);
+            }
+        } else {
+            g_hookWhy = en ? "bBody=0 (smooth movement only)" : "bEnable=0";
+        }
+        REX::INFO("[FRIK] bridge v{}: bEnable={} bBody={} bSmoothMovement={} bSmoothHorizontal={} (FRIK.dll {}), unitsPerMeter={}, frame hook C351F3 {} ({})",
+            FO4FLATVR_FRIK_BRIDGE_VERSION, en ? 1 : 0, g_body.load() ? 1 : 0, g_smooth.load() ? 1 : 0, g_smoothXY.load() ? 1 : 0,
+            ::GetModuleHandleW(L"FRIK.dll") ? "loaded" : "not loaded", g_unitsPerMeter, g_hooked ? "ok" : "not installed", g_hookWhy);
+        if (g_frikActive.load()) {
+            ApplyGunRole(true);
+        }
+    }
+
+    void PublishXr(const xr::ControllerState& a_c, const xr::Pose& a_head, bool a_headValid, bool a_worldView, bool a_leftHanded)
+    {
+        FO4FlatVR_Frame f{};
+        f.size = sizeof(f);
+        f.active = a_c.active;
+        f.worldView = a_worldView;
+        f.leftHanded = a_leftHanded;
+        f.headValid = a_headValid;
+        IniPath();
+        f.unitsPerMeter = g_unitsPerMeter;
+        Copy(a_head, f.head);
+        for (int side = 0; side < 2; ++side) {
+            const bool left = side == 0;
+            auto&      h = f.hands[side];
+            h.gripValid = a_c.active && (left ? a_c.leftGripPoseValid : a_c.rightGripPoseValid);
+            h.aimValid = a_c.active && (left ? a_c.leftAimValid : a_c.rightAimValid);
+            h.a = left ? a_c.x : a_c.a;
+            h.b = left ? a_c.y : a_c.b;
+            h.stickClick = left ? a_c.leftStickClick : a_c.rightStickClick;
+            h.menu = left ? a_c.menu : 0;
+            h.stickX = left ? a_c.leftStickX : a_c.rightStickX;
+            h.stickY = left ? a_c.leftStickY : a_c.rightStickY;
+            h.trigger = left ? a_c.leftTrigger : a_c.rightTrigger;
+            h.grip = left ? a_c.leftGrip : a_c.rightGrip;
+            Copy(left ? a_c.leftGripPose : a_c.rightGripPose, h.gripPose);
+            Copy(left ? a_c.leftAim : a_c.rightAim, h.aimPose);
+            HeadRel(left ? a_c.leftGripPose : a_c.rightGripPose, h.gripValid, a_head, a_headValid, h.gripInHead);
+        }
+        std::scoped_lock l(g_lock);
+        f.seq = g_frame.seq + 1;
+        g_frame = f;
+        g_t = std::chrono::steady_clock::now();
+        g_have = true;
+    }
+}
+
+namespace fo4flatvr::frikbridge
+{
+    void StepCameraOffset()
+    {
+        const auto cb = g_camCb.load(std::memory_order_acquire);
+        if (!cb || !g_smooth.load(std::memory_order_relaxed)) {
+            g_camValid.store(false, std::memory_order_relaxed);
+            return;
+        }
+        ++g_camSteps;
+        float o[3]{};
+        const bool ok = cb(g_camCtx.load(std::memory_order_relaxed), o) != 0;
+        if (ok) {
+            ++g_camValidSteps;
+            g_camX.store(o[0], std::memory_order_relaxed);
+            g_camY.store(o[1], std::memory_order_relaxed);
+            g_camZ.store(o[2], std::memory_order_relaxed);
+            const float az = std::abs(o[2]), axy = std::sqrt(o[0] * o[0] + o[1] * o[1]);
+            if (az > g_camMaxAbsZ.load(std::memory_order_relaxed)) g_camMaxAbsZ.store(az, std::memory_order_relaxed);
+            if (axy > g_camMaxAbsXY.load(std::memory_order_relaxed)) g_camMaxAbsXY.store(axy, std::memory_order_relaxed);
+        }
+        g_camValid.store(ok, std::memory_order_release);
+    }
+
+    bool CameraOffset(float& a_x, float& a_y, float& a_z)
+    {
+        if (!g_camValid.load(std::memory_order_acquire) || !g_smooth.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        const bool xy = g_smoothXY.load(std::memory_order_relaxed);
+        a_x = xy ? g_camX.load(std::memory_order_relaxed) : 0.0f;
+        a_y = xy ? g_camY.load(std::memory_order_relaxed) : 0.0f;
+        a_z = g_camZ.load(std::memory_order_relaxed);
+        return true;
+    }
+
+    std::string Command(const std::string& a_arg)
+    {
+        if (a_arg == "smooth on" || a_arg == "smooth off") {
+            g_smooth = a_arg == "smooth on";
+            g_camValid = false;
+            REX::INFO("[FRIK] pipe: smooth movement {}", g_smooth.load() ? "on" : "off");
+        } else if (a_arg == "smooth xy on" || a_arg == "smooth xy off") {
+            g_smoothXY = a_arg == "smooth xy on";
+        } else if (a_arg == "smooth reset" || a_arg == "reset") {
+            g_camSteps = 0, g_camValidSteps = 0, g_camMaxAbsZ = 0.0f, g_camMaxAbsXY = 0.0f;
+        } else if (a_arg == "perf") {
+            return PerfReport();
+        } else if (a_arg == "cb off" || a_arg == "cb on") {
+            g_cbSkip = a_arg == "cb off";
+            REX::INFO("[FRIK] pipe: FRIK.dll frame callback {}", g_cbSkip.load() ? "skipped (body frozen; perf A/B)" : "running");
+        } else if (!a_arg.empty() && a_arg != "status") {
+            return "error: frik [status|smooth on|off|smooth xy on|off|reset|perf|cb on|off]";
+        }
+        return std::format("frik v={} enable={} body={} smooth={} xy={} frikdll={} camcb={} steps={} valid={} off=({:.3f},{:.3f},{:.3f}) maxz={:.3f} "
+                           "maxxy={:.3f} framecb={} frames={} active={}",
+            FO4FLATVR_FRIK_BRIDGE_VERSION, Enabled() ? 1 : 0, g_body.load() ? 1 : 0, g_smooth.load() ? 1 : 0, g_smoothXY.load() ? 1 : 0,
+            ::GetModuleHandleW(L"FRIK.dll") ? 1 : 0, g_camCb.load() ? 1 : 0, g_camSteps.load(), g_camValidSteps.load(),
+            g_camX.load(), g_camY.load(), g_camZ.load(), g_camMaxAbsZ.load(), g_camMaxAbsXY.load(), g_frameCb.load() ? 1 : 0,
+            g_frameCalls.load(), g_frikActive.load() ? 1 : 0);
+    }
+}
+
+extern "C" __declspec(dllexport) const FO4FlatVR_FrikBridge* FO4FLATVR_GetFrikBridge(std::uint32_t a_version)
+{
+    using namespace fo4flatvr::frikbridge;
+    if (a_version != FO4FLATVR_FRIK_BRIDGE_VERSION) {
+        REX::WARN("[FRIK] FRIK.dll asked for bridge v{}, have v{}: FRIK-flat stays dormant", a_version, FO4FLATVR_FRIK_BRIDGE_VERSION);
+        return nullptr;
+    }
+    if (!Enabled()) {
+        REX::INFO("[FRIK] bEnable=0: FRIK-flat stays dormant");
+        return nullptr;
+    }
+    return &kBridge;
+}

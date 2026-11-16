@@ -1,0 +1,7 @@
+# binary game data: never touch line endings
+*.nif binary
+*.dds binary
+*.fos binary
+*.f4se binary
+*.pack binary
+*.tbl binary
