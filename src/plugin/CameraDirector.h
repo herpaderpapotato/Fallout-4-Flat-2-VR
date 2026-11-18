@@ -56,10 +56,12 @@ namespace fo4flatvr::camdir
     // sit state is normal again (TaskQueue Show1stPerson(true)). Main thread, every frame.
     void PollWorkbenchBody();
     // POV head hide ([Camera] bPovHeadHide, 15 Nov, user: "FRIK removes the player head ... both FRIK and AAF POV views take
-    // that into account"): in a SCENE state whose game camera sits at an actor's Head bone (AAF POV on the player or on an
-    // NPC; within fPovHeadRadius), that actor's head geometry (face, hair, eyes, mouth, head gear: FRIK's face list + the
-    // head biped slots) is culled; shown again as soon as the view leaves that head. First person stays FRIK's (C35: FRIK
-    // shows its own culls again outside first person). Main thread, every frame.
+    // that into account"): in the free-camera scene view (state Free = AAF POV/TFC, SCENE policy) whose game camera sits at
+    // an actor's Head bone (on the player or on an NPC; within fPovHeadRadius for 2 finds in a row, kept out to 1.5x), that
+    // actor's whole head is culled: its BSFaceGenNiNodeSkinned node (every head part) + the armour in FRIK's head slots + head
+    // gear by FRIK's face-list names in its other armour; without a FaceGen node nothing is hidden. Never in first person /
+    // iron sights / selfie / third person / other states (17 Nov fix); shown again as soon as the view leaves that head.
+    // First person stays FRIK's (C35: FRIK shows its own culls again outside first person). Main thread, every frame.
     void PollHeadHide();
 
     // Fade opacity now (0..1), advancing the fade clock. Main thread (Presenter, every Present).

@@ -1,6 +1,7 @@
 #include "plugin/CameraDirector.h"
 
 #include "plugin/GameBridge.h"
+#include "plugin/Gestures.h"
 #include "plugin/HeadPose.h"
 #include "plugin/Roomscale.h"
 #include "plugin/Settings.h"
@@ -1854,13 +1855,24 @@ namespace fo4flatvr::camdir
             float                                  radius{ 40.0f };
             std::vector<std::string>               tokens;
             RE::NiPointer<RE::Actor>               actor;          // whose head is hidden now
+            RE::NiPointer<RE::Actor>               cand;           // in the radius on the last find, not hidden yet (dwell)
+            int                                    candFinds{ 0 };
             std::vector<RE::NiPointer<RE::NiAVObject>> culled;     // nodes this hid (flag bit 0 was clear before)
             Clock::time_point                      lastFind{}, lastScan{};
             float                                  lastDist{ -1.0f };
-            std::uint64_t                          hides{ 0 }, restores{ 0 };
+            std::uint64_t                          hides{ 0 }, restores{ 0 }, noFace{ 0 };
             std::string                            last{ "-" };
+            const char*                            why{ "-" };     // why nothing is hidden now (status)
         };
         HeadHide g_hh;
+
+        // the actor's FaceGen head (face, hair, eyes, brows, teeth, beard: every head part) is this one node under its
+        // third-person 3D; culling it hides the whole head at once
+        constexpr const char* kFaceNode = "BSFaceGenNiNodeSkinned";
+        // AAF POV: the free camera (TFC) at the head bone. FirstPerson / IronSights (FRIK's own head, selfie), ThirdPerson
+        // and every other orbit/scene state never hide a head (17 Nov, user: "ours is breaking the face")
+        constexpr float kLeaveFactor = 1.5f;  // hysteresis: a hidden head is shown again beyond radius x this
+        constexpr int   kDwellFinds = 2;      // 10 Hz finds in the radius before a head is hidden (~0.1-0.2 s)
 
         // FRIK's Mesh_Hide\face.ini list (FRIK-flat\FRIK_Config), the geometry names FRIK hides for the player's head
         constexpr const char* kHeadTokens[] = { "bandage", "beard", "cap", "cowl", "crown", "eyepiece", "eyes", "fedora", "glasses",
@@ -1884,7 +1896,7 @@ namespace fo4flatvr::camdir
             const float r = std::strtof(buf, &end);
             if (end != buf && r > 1.0f) g_hh.radius = r;
             for (const char* t : kHeadTokens) g_hh.tokens.emplace_back(t);
-            REX::INFO("camdir: POV head hide {} (radius {} units: the game camera within that of an actor's Head bone in a SCENE state)",
+            REX::INFO("camdir: POV head hide {} (radius {} units: the free camera's scene view within that of an actor's Head bone; never first person / selfie / third person)",
                 g_hh.on ? "on" : "off (bPovHeadHide=0)", g_hh.radius);
         }
 
@@ -1934,19 +1946,32 @@ namespace fo4flatvr::camdir
             }
         }
 
-        void HeadHideScan(RE::Actor* a)
+        // Whole head or nothing (17 Nov): the FaceGen node (all head parts), the armour in FRIK's head slots, and head gear by
+        // FRIK's face-list names inside the actor's other armour pieces. Before, the face list was matched against every
+        // geometry of the actor: a head part whose name has none of the words (mod hair, brows, ...) stayed while the face
+        // went, and body geometry with a matching word went too. Returns false (nothing culled) without a FaceGen node.
+        bool HeadHideScan(RE::Actor* a)
         {
-            if (auto* root = ActorRoot(a)) {
-                CollectHead(root, 0);
+            auto* root = ActorRoot(a);
+            auto* face = root ? root->GetObjectByName(RE::BSFixedString(kFaceNode)) : nullptr;
+            if (!face) {
+                return false;
             }
+            CullNode(face);
             if (auto* biped = a->biped.get()) {
-                for (const int slot : kHeadSlots) {
+                for (int slot = 0; slot < 32; ++slot) {
                     const auto& b = biped->object[slot];
-                    if (b.parent.object && b.partClone && b.parent.object->GetFormType() == RE::ENUM_FORM_ID::kARMO) {
-                        CullNode(b.partClone.get());
+                    if (!b.parent.object || !b.partClone || b.parent.object->GetFormType() != RE::ENUM_FORM_ID::kARMO) {
+                        continue;
+                    }
+                    if (std::find(std::begin(kHeadSlots), std::end(kHeadSlots), slot) != std::end(kHeadSlots)) {
+                        CullNode(b.partClone.get());  // head slot: the whole piece
+                    } else {
+                        CollectHead(b.partClone.get(), 0);  // other slots: only its head-gear geometry (hat on slot 54/55, hood)
                     }
                 }
             }
+            return true;
         }
 
         void HeadHideRestore(const char* a_why)
@@ -1964,25 +1989,30 @@ namespace fo4flatvr::camdir
             g_hh.actor.reset();
         }
 
-        // the actor whose Head bone the game camera sits at (nearest within the radius), or null
-        RE::NiPointer<RE::Actor> FindPovActor(const V3& a_cam, float& a_dist)
+        // distance from the camera to the actor's Head bone, or -1 (no 3D / no Head bone / far from the actor)
+        float HeadDist(RE::Actor* a, const V3& a_cam)
+        {
+            if (!a) return -1.0f;
+            const auto& l = a->data.location;
+            const float lx = l.x - a_cam.x, ly = l.y - a_cam.y, lz = l.z - a_cam.z;
+            if (lx * lx + ly * ly + lz * lz > 400.0f * 400.0f) return -1.0f;  // the Head bone is within ~150 u of the actor's origin
+            auto* root = ActorRoot(a);
+            auto* head = root ? root->GetObjectByName(RE::BSFixedString("Head")) : nullptr;
+            if (!head) return -1.0f;
+            const auto& h = head->world.translate;
+            const float dx = h.x - a_cam.x, dy = h.y - a_cam.y, dz = h.z - a_cam.z;
+            return std::sqrt(dx * dx + dy * dy + dz * dz);
+        }
+
+        // the actor whose Head bone the game camera sits at (nearest within a_radius), or null
+        RE::NiPointer<RE::Actor> FindPovActor(const V3& a_cam, float a_radius, float& a_dist)
         {
             RE::NiPointer<RE::Actor> best;
             a_dist = -1.0f;
-            float bestD = g_hh.radius;
-            const RE::BSFixedString headName("Head");
+            float bestD = a_radius;
             auto consider = [&](RE::Actor* a) {
-                if (!a) return;
-                const auto& l = a->data.location;
-                const float lx = l.x - a_cam.x, ly = l.y - a_cam.y, lz = l.z - a_cam.z;
-                if (lx * lx + ly * ly + lz * lz > 400.0f * 400.0f) return;  // the Head bone is within ~150 u of the actor's origin
-                auto* root = ActorRoot(a);
-                auto* head = root ? root->GetObjectByName(headName) : nullptr;
-                if (!head) return;
-                const auto& h = head->world.translate;
-                const float dx = h.x - a_cam.x, dy = h.y - a_cam.y, dz = h.z - a_cam.z;
-                const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
-                if (d < bestD) {
+                const float d = HeadDist(a, a_cam);
+                if (d >= 0.0f && d < bestD) {
                     bestD = d;
                     best.reset(a);
                     a_dist = d;
@@ -2007,26 +2037,56 @@ namespace fo4flatvr::camdir
         {
             std::scoped_lock l(g_lock);
             st = g_d.state;
-            active = g_hh.on && g_d.installed && g_cfg.enabled && st >= 0 && st < kStates && g_d.sceneSt[st];
+            // AAF POV = the free camera in its scene view only (17 Nov): never first person / iron sights (FRIK's head and
+            // the selfie mirror body), third person or any other orbit / scene state
+            active = g_hh.on && g_d.installed && g_cfg.enabled && st == kStateFree && g_d.sceneSt[st];
             cam = g_d.tg;  // the game camera's position (AAF's POV point), before the head offset
         }
-        if (!active) {
-            HeadHideRestore("view not in a SCENE state");
+        const char* why = !g_hh.on ? "off (bPovHeadHide=0)" : !active ? "not the free-camera scene view" : nullptr;
+        if (!why && gestures::SelfieState().active) {
+            why = "selfie";
+        }
+        if (why) {
+            g_hh.why = why;
+            g_hh.cand.reset();
+            g_hh.candFinds = 0;
+            HeadHideRestore(why);
             return;
         }
         const auto now = Clock::now();
         if (Ms(g_hh.lastFind, now) >= 100.0) {  // 10 Hz: the POV point moves with the head bone, actors do not swap often
             g_hh.lastFind = now;
-            float d = -1.0f;
-            auto  a = FindPovActor(cam, d);
-            g_hh.lastDist = d;
-            if (a.get() != g_hh.actor.get()) {
-                HeadHideRestore(a ? "view moved to another head" : "view left the head");
-                if (a) {
-                    g_hh.actor = a;
-                    g_hh.lastScan = {};
-                    ++g_hh.hides;
-                    g_hh.last = std::format("{:08X} at {:.1f} u (state {})", a->GetFormID(), d, StateName(st));
+            // a hidden head stays hidden out to radius x kLeaveFactor (no hide/show flicker at the edge); a head is hidden only
+            // after kDwellFinds finds in a row inside the radius (a camera passing a head does not hide it)
+            const float dCur = g_hh.actor ? HeadDist(g_hh.actor.get(), cam) : -1.0f;
+            const bool  keep = g_hh.actor && dCur >= 0.0f && dCur <= g_hh.radius * kLeaveFactor;
+            float       d = -1.0f;
+            auto        a = FindPovActor(cam, g_hh.radius, d);
+            if (keep && (!a || a.get() == g_hh.actor.get() || d >= dCur)) {
+                g_hh.lastDist = dCur;
+                g_hh.why = "-";
+            } else {
+                g_hh.lastDist = d;
+                if (g_hh.actor) {
+                    HeadHideRestore(a ? "view moved to another head" : "view left the head");
+                }
+                if (!a) {
+                    g_hh.cand.reset();
+                    g_hh.candFinds = 0;
+                    g_hh.why = "camera not at a head";
+                } else {
+                    g_hh.candFinds = a.get() == g_hh.cand.get() ? g_hh.candFinds + 1 : 1;
+                    g_hh.cand = a;
+                    g_hh.why = "dwell";
+                    if (g_hh.candFinds >= kDwellFinds) {
+                        g_hh.actor = a;
+                        g_hh.cand.reset();
+                        g_hh.candFinds = 0;
+                        g_hh.lastScan = {};
+                        g_hh.why = "-";
+                        ++g_hh.hides;
+                        g_hh.last = std::format("{:08X} at {:.1f} u (state {})", a->GetFormID(), d, StateName(st));
+                    }
                 }
             }
         }
@@ -2037,9 +2097,19 @@ namespace fo4flatvr::camdir
             const bool first = g_hh.lastScan.time_since_epoch().count() == 0;
             g_hh.lastScan = now;
             const auto before = g_hh.culled.size();
-            HeadHideScan(g_hh.actor.get());
+            const bool face = HeadHideScan(g_hh.actor.get());
+            if (!face) {
+                g_hh.why = "no FaceGen head node (nothing hidden)";
+                if (first) ++g_hh.noFace;
+            }
             if (first) {
-                REX::INFO("camdir: POV head hide: view at the head of {} -> {} head nodes culled", g_hh.last, g_hh.culled.size() - before);
+                if (face) {
+                    REX::INFO("camdir: POV head hide: view at the head of {} -> {} head nodes culled (FaceGen head + head gear)", g_hh.last,
+                        g_hh.culled.size() - before);
+                } else {
+                    REX::INFO("camdir: POV head hide: view at the head of {} but it has no {} node: nothing hidden (whole head or nothing)",
+                        g_hh.last, kFaceNode);
+                }
             }
         }
         for (auto& o : g_hh.culled) {  // keep them culled (a re-equip or another mod may clear the flag)
@@ -2246,13 +2316,13 @@ namespace fo4flatvr::camdir
             " | freeCam={} freeTicks={} sceneYaw={:.2f} freeYawOffset={:.2f} freeSpeed={:.0f} yawCuts={} glideHolds={} glideTimeouts={} "
             "bodyShows={} thirdGraces={} aafThirdPassed={} moveView={}/{} headDelta={} scene={} sceneEntries={} glideLatched={} "
             "thirdReturn={}/{} armed={} queued={} returns={} lastReturn='{}' benchInputReleases={} povHeadHide={} povActor={:08X} "
-            "povDist={:.1f} povNodes={} povHides={} povRestores={} povLast='{}'",
+            "povDist={:.1f} povNodes={} povHides={} povRestores={} povLast='{}' povWhy='{}' povNoFace={}",
             d.freeNote, g_freeTicks.load(), Wrap(d.sceneYaw) * kR2D, d.freeYawOffset * kR2D, d.lastSpeed, d.yawCuts, d.glideHolds,
             d.glideTimeouts, d.bodyShows, d.thirdGraces, d.aafThirdPassed, c.freeMoveView ? 1 : 0, d.moveViewCalls,
             c.freeHeadDelta && d.haveFreeOffBase ? 1 : 0, d.state >= 0 && d.state < kStates && d.sceneSt[d.state] ? 1 : 0,
             d.sceneEntries, d.glideLatched ? 1 : 0, c.thirdReturn ? 1 : 0, c.thirdReturnS, d.thirdArmed ? 1 : 0, d.thirdQueued ? 1 : 0,
             d.thirdReturns, d.lastReturn, g_benchInputReleases, g_hh.on ? 1 : 0, g_hh.actor ? g_hh.actor->GetFormID() : 0, g_hh.lastDist,
-            g_hh.culled.size(), g_hh.hides, g_hh.restores, g_hh.last);
+            g_hh.culled.size(), g_hh.hides, g_hh.restores, g_hh.last, g_hh.why, g_hh.noFace);
         return std::format(
             "installed={} enabled={} note='{}' state={} name={} policy={} eff={} stateMs={:.0f} ticks={} transitions={} "
             "writes=T{}/F{}/L{}/C{} wrote={} alpha={:.3f} target={} fadeActive={} timedOut={} episodes={} timeouts={} "

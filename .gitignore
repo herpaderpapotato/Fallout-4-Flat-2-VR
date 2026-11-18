@@ -10,3 +10,4 @@ __pycache__/
 # backups made by our tools (never deleted, renamed to <name>.old-<stamp>)
 *.old-*
 *.copy-*
+/testdata/
