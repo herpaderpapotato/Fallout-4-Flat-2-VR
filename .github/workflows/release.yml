@@ -1,0 +1,57 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+
+      - name: Configure
+        run: xmake f -p windows -a x64 -m releasedbg -y
+
+      - name: Build
+        run: xmake build -y fo4flatvr
+
+      # Same layout as package_mods.py --default-ini (that script lives outside this repo).
+      - name: Stage MO2 mod folder
+        shell: pwsh
+        run: |
+          $v = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { "dev-$($env:GITHUB_SHA.Substring(0, 7))" }
+          $s = "build/package/fo4flatvr"
+          $bin = "build/windows/x64/releasedbg"
+          New-Item -ItemType Directory -Force build/package | Out-Null
+          Copy-Item dist/Data $s -Recurse
+          Copy-Item src/plugin/stereo_shaders "$s/F4SE/Plugins/fo4flatvr_stereo" -Recurse
+          Copy-Item "$bin/fo4flatvr.dll", "$bin/fo4flatvr.pdb" "$s/F4SE/Plugins"
+          $zip = "fo4flatvr-$v.zip"
+          Compress-Archive -Path "$s/*" -DestinationPath $zip
+          "ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fo4flatvr
+          path: build/package/fo4flatvr
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP }}
+          generate_release_notes: true
