@@ -259,7 +259,25 @@ float4 ps(float4 pos : SV_Position) : SV_Target
             }
             const float yaw = std::atan2(-f.x, -f.z);
             const auto  now = std::chrono::steady_clock::now();
-            if (!g_projValid || !a_smooth || a_cfg.projFollowSeconds <= 0.0f) {
+            // round 7: outside power armour FO4VR's geometry and UprightHmdLagNode behaviour (position = head, yaw held until the
+            // head leaves the lag cone, then dragged along at its edge)
+            const bool  fo4vr = !game::PipboyProjectedInPowerArmor();
+            const float cone = a_cfg.lagConeDeg * 0.0174532925f;
+            if (fo4vr && cone > 0.0f && g_projValid && a_smooth) {
+                float dy = yaw - g_projYaw;
+                while (dy > 3.14159265f) {
+                    dy -= 6.28318531f;
+                }
+                while (dy < -3.14159265f) {
+                    dy += 6.28318531f;
+                }
+                if (dy > cone) {
+                    g_projYaw = yaw - cone;
+                } else if (dy < -cone) {
+                    g_projYaw = yaw + cone;
+                }
+                g_projPos = a_head.position;
+            } else if (!g_projValid || !a_smooth || a_cfg.projFollowSeconds <= 0.0f) {
                 g_projYaw = yaw;
                 g_projPos = a_head.position;
             } else {
@@ -278,7 +296,7 @@ float4 ps(float4 pos : SV_Position) : SV_Target
             }
             g_projLast = now;
             g_projValid = true;
-            const float    h = a_cfg.projHeightMeters, d = a_cfg.projDistanceMeters;
+            const float    h = fo4vr ? a_cfg.floatHeightMeters : a_cfg.projHeightMeters, d = fo4vr ? a_cfg.floatDistanceMeters : a_cfg.projDistanceMeters;
             const xr::Quat qy{ 0.0f, std::sin(g_projYaw * 0.5f), 0.0f, std::cos(g_projYaw * 0.5f) };
             const float    tilt = std::atan2(h, d);
             const xr::Quat qx{ std::sin(tilt * 0.5f), 0.0f, 0.0f, std::cos(tilt * 0.5f) };
@@ -688,7 +706,7 @@ float4 ps(float4 pos : SV_Position) : SV_Target
             g_pose.position = { grip.position.x + wo.x, grip.position.y + wo.y, grip.position.z + wo.z };
         }
         if (proj) {
-            g_quadW = cfg.projWidthMeters;
+            g_quadW = game::PipboyProjectedInPowerArmor() ? cfg.projWidthMeters : cfg.floatWidthMeters;
             g_quadH = src.desc.Width ? g_quadW * static_cast<float>(src.desc.Height) / static_cast<float>(src.desc.Width) : g_quadW * 0.8f;
             g_poseValid = a_began && a_head && ProjectedPose(*a_head, cfg, !projChanged);
         } else {

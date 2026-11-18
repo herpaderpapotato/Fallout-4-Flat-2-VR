@@ -16,6 +16,9 @@
 // is a player-relative flattened bone tree FRIK's arm placement cannot drive; the gun already uses FRIK's glue + per-weapon
 // JSONs) and its controller models are hidden (FRIK's hands instead); FRIK's body arms reach the same grip. [FRIK]
 // bGunStepsAside=1 = the old full step-aside (gun::StepAside). The gun is the FO4VR baseline without the body.
+//   bPausedFrame=1  (16 Nov) FRIK's frame also runs while the game is paused (terminal, Pause, crafting, projected Pip-Boy):
+//               hook at Main::OnIdle C33E62 (FO4VR's FRIK slot), main thread, only when UI::menuMode != 0 and C351F3 did not run
+//               since the previous OnIdle. 0 = no FRIK frame while paused (arms freeze). Pipe: frik paused on|off.
 // Pipe: frik perf (game frame interval + FRIK frame time window), frik cb off|on (skip FRIK's frame; perf A/B).
 // The bridge does not depend on the gun code:
 //   - own per-frame hook: call site C351F3 (PlayerUpdateEvent notify, byte-checked with plugin/CallChain.h, chained with
@@ -46,6 +49,9 @@ namespace fo4flatvr::frikbridge
     // units, world axes); false = none (smoothing off, no FRIK.dll, or FRIK returned none).
     void StepCameraOffset();
     bool CameraOffset(float& a_x, float& a_y, float& a_z);
+
+    // FRIK-flat's body is active (FRIK.dll reported SetFrikActive(1)): its mirror-body selfie is available (Gestures.h)
+    bool BodyActive();
 
     // pipe: frik [status|smooth on|off|reset]
     std::string Command(const std::string& a_arg);

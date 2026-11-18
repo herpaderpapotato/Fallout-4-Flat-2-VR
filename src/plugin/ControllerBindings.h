@@ -6,9 +6,9 @@
 // FO4VR handles most VR input in code, not in the ControlMap, so the defaults are taken from what the game tells the
 // player. Each FO4VR action is expressed as the flat gamepad input that triggers the same game action (flat
 // embedded ControlMap gamepad column), per context:
-//   gameplay  - off stick move, off stick click sprint, primary stick X turn (comfort), up jump, down sneak, click
-//               favorites; primary trigger fire; off trigger Pip-Boy; primary grip tap reload / hold grenade;
-//               primary stick click + primary grip holster; A or X activate; B V.A.T.S.; Y tap pause / hold workshop;
+//   gameplay  - off stick move, off stick click sprint, primary stick X turn (comfort), up jump, down sneak (click =
+//               gesture button, no longer favorites); primary trigger fire; off trigger Pip-Boy; primary grip tap reload / hold grenade;
+//               primary stick click + primary grip holster (the click alone = gesture button, Gestures.h); A or X activate; B V.A.T.S.; Y tap pause / hold workshop;
 //               off grip hold Pip-Boy light
 //   Pip-Boy   - off stick sections/selection; X/Y (A/B left-handed) tabs; off trigger select; grip close;
 //               primary trigger = the wrist pointer click (PipboyLayer); primary stick = right stick
@@ -26,6 +26,7 @@
 namespace xr
 {
     struct ControllerState;
+    struct Pose;
 }
 
 namespace fo4flatvr::bindings
@@ -38,6 +39,8 @@ namespace fo4flatvr::bindings
         bool menuPointerOnQuad{ false }; // the menu pointer is on the cinema quad (its trigger clicks)
         bool menuPointerLeftHand{ false };
         bool leftHanded{ false };
+        const xr::Pose* head{ nullptr };  // this frame's head pose (reference space), null = invalid (gestures)
+        int  camState{ -1 };              // game camera state (0 = first person; gestures / selfie)
     };
 
     // Presenter (main thread), once per XR frame: controller state -> virtual pad (before dialogue / comfort filters).
@@ -45,4 +48,11 @@ namespace fo4flatvr::bindings
 
     // Pipe "bindings [on|off]": context and the last mapping.
     std::string Command(const std::string& a_arg);
+
+    // Extended Dialogue Interface (XDI.dll loaded; analysis/mod-edi-hudframework.md), [Controllers] bDialogueListNav=1:
+    // while DialogueMenu is open the primary stick steps EDI's option list (D-pad pulses = QuickkeyUp/Down/Left/Right,
+    // what its gamepad mode reads), the trigger off the panel accepts (pad A), and the menu pointer targets DialogueMenu
+    // (it has neither kUsesMenuContext nor kUsesCursor while a pad is in use). Any thread; set by the last Map().
+    bool DialogueListNavActive();
+
 }

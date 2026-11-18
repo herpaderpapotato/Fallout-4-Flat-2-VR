@@ -32,6 +32,7 @@ namespace fo4flatvr::game
         float u{ 0.0f }, v{ 0.0f };  // 0..1 over the cinema image (= the back buffer), origin top-left
         bool  down{ false };         // trigger held
         int   wheel{ 0 };            // wheel steps this frame (+ = up)
+        bool  movieUv{ false };      // u/v are already movie uv (world-screen pick, PickWorldScreen): no 3D-screen remap
     };
     // Main thread, every frame while the cinema quad is shown: queues Scaleform MouseEvents (move on change,
     // down/up on the trigger edge, wheel) and drains them in an F4SE UI task into the current target menu's
@@ -46,7 +47,9 @@ namespace fo4flatvr::game
     // menus. Main thread (Present, after the head pose for the next frame is published): if the camera was not updated
     // since the last call (a_fpUpdates = game::FirstPersonUpdates()), run PlayerCharacter::UpdateCamera (1.11 D5A670,
     // prologue byte-checked once) for the next frame. Returns true if it ran. a_active = false resets the tracking.
-    bool DriveCameraWhilePaused(bool a_active, std::uint64_t a_fpUpdates);
+    // Round 8: a_counter = the update counter of the active camera state (game::FirstPersonUpdates in first person,
+    // camdir::Ticks otherwise), read before and again after a driven update.
+    bool DriveCameraWhilePaused(bool a_active, std::uint64_t (*a_counter)());
     std::string PausedCameraReport();
 
     // Menu panels: a view-taking menu that can be shown over the live world view - drawn entirely by the
@@ -55,6 +58,28 @@ namespace fo4flatvr::game
     // renderer (that part would end up head-locked in the world image). Main thread. a_name: a ViewTakingMenu name.
     bool PanelEligible(const char* a_name);
     bool MenuOpen(const char* a_name);  // UI::GetMenuOpen
+
+    // Round 7 (FO4VR terminals, analysis/vr-terminals-pipboy.md): FO4VR shows a furniture terminal on the terminal's own
+    // monitor in the world (TerminalMenu::InitMenu VR BDFBF0: renderer "TerminalMenu" world-attached to the terminal ref's
+    // "Screen:0", exactly as flat 1.11 does; the player stays in first person, no camera zoom), pointed at with the laser.
+    // True for TerminalMenu / TerminalHolotapeMenu while that holds here: the menu is open with custom renderer
+    // "TerminalMenu", the terminal reference (328FC68) has a 3D with "Screen:0", the camera is first person and the switch
+    // ([Menus] bTerminalInWorld) is on. Such a menu is not view-taking. Main thread.
+    bool WorldScreenMenu(const char* a_name);
+    void SetWorldScreenEnabled(bool a_on);
+    bool WorldScreenEnabled();
+    // The aim ray (camera-local metres / unit direction relative to the camera root on screen, as PublishHandRay builds it)
+    // against the terminal's "Screen:0" with the engine's own NiPick (NiPick ctor 16FD560 / PickObjects 16FD660 / dtor 16FD610,
+    // set up as UIUtils::PickScreen 1087930 does, prologues byte-checked once): movie uv of the hit (record +0x24/+0x28) and
+    // the hit distance in game units. Main thread.
+    bool PickWorldScreen(const float a_localPos[3], const float a_localDir[3], float a_unitsPerMeter, float& a_u, float& a_v, float& a_dist);
+    std::string WorldScreenReport();
+    // a_menu is open and its custom renderer is a_renderer (e.g. TerminalMenu on "PipboyMenu" = a holotape terminal on the
+    // Pip-Boy screen). Main thread.
+    bool MenuUsesRenderer(const char* a_menu, const char* a_renderer);
+    // Round 8: a HUD notification (top-left message, SendHUDMessage::ShowHUDMessage A37270, prologue byte-checked), queued as
+    // an F4SE task. Any thread.
+    void HudMessage(const std::string& a_text);
     // Flat VATS: the selected target's screen position (u right, v down, 0..1 over the world NiCamera's frustum; may be
     // outside) from VATSMenu+0xE8 VatsMenuObj (current target index +0x1230 / +0x248 / +0x238 / refs +0x220, as
     // VatsMenuObj::GetCurrentTarget B1D220), projected at chest height. Main thread; false = no VATS target.

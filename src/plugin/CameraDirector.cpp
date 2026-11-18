@@ -2089,6 +2089,12 @@ namespace fo4flatvr::camdir
         }
     }
 
+    std::uint64_t Ticks()
+    {
+        std::scoped_lock l(g_lock);
+        return g_d.ticks;
+    }
+
     float FadeAlpha()
     {
         std::scoped_lock l(g_lock);
@@ -2167,6 +2173,47 @@ namespace fo4flatvr::camdir
             return std::format("gate {} -> furniture={} pa={} animated={} 3rd={} vats={} pipboy={} heading={} ({} deg)", n, c.gateFurniture ? 1 : 0,
                 c.gatePowerArmor ? 1 : 0, c.gateAnimated ? 1 : 0, c.blockThirdPerson ? 1 : 0, c.gateVats ? 1 : 0, c.pipboyStopTick ? 1 : 0,
                 c.headingSnap ? 1 : 0, c.headingSnapDeg);
+        }
+        if (a_arg == "cycle") {
+            // UI round 8 (user: a hotkey to cycle the view mode in a given situation, for testing; [Keys] iCameraCycle):
+            // the current camera state's policy SCENE -> TRACK -> CINEMA -> SCENE (FirstPerson/IronSights: TRACK <-> CINEMA;
+            // Free without the thunk: no SCENE). Runtime only, not saved to the ini.
+            const int st = g_d.state;
+            if (st < 0 || st >= kStates) {
+                return "cycle: no camera state";
+            }
+            const bool sceneOk = st != 0 && st != 4 && (st != kStateFree || g_d.freeHooked);
+            const Policy cur = g_d.sceneSt[st] ? Policy::kScene : c.table[st];
+            Policy next;
+            if (cur == Policy::kScene) next = Policy::kTrack;
+            else if (cur == Policy::kTrack) next = Policy::kCinema;
+            else next = sceneOk ? Policy::kScene : Policy::kTrack;
+            g_d.sceneSt[st] = next == Policy::kScene;
+            c.table[st] = next == Policy::kScene ? Policy::kTrack : next;
+            REX::INFO("camdir: policy {} = {} (cycle key; was {})", kStateNames[st], PolicyName(next), PolicyName(cur));
+            return std::format("camera {}: {}", kStateNames[st], PolicyName(next));
+        }
+        if (a_arg == "pov") {
+            // UI round 8 (user: "a way to cycle in and out of 3rd person in case I get stuck"; [Keys] iPovToggle): first person
+            // -> PlayerCamera::Force3rdPerson (the original, past our own bBlockThirdPerson gate and without arming the
+            // script-third-person return), anything else -> Force1stPerson. Both are direct camera calls, so a mod that
+            // disabled the POV control (AAF) does not stop them. Main thread (task).
+            const CamFn_t third = g_origForce3rd;  // set only when its prologue was byte-checked (Detour)
+            const bool    toThird = g_d.state == 0;
+            if (toThird ? !third : !g_force1st) {
+                return toThird ? "error: Force3rdPerson not resolved" : "error: Force1stPerson not resolved";
+            }
+            if (const auto tasks = F4SE::GetTaskInterface()) {
+                tasks->AddTask([toThird, third]() {
+                    if (auto* pc = RE::PlayerCamera::GetSingleton()) {
+                        if (toThird) third(pc);
+                        else g_force1st(pc);
+                    }
+                });
+                REX::INFO("camdir: pov key -> {}", toThird ? "Force3rdPerson" : "Force1stPerson");
+                return toThird ? "third person" : "first person";
+            }
+            return "error: no task interface";
         }
         if (a_arg == "first") {  // PlayerCamera::Force1stPerson on the main thread (task), as Game.ForceFirstPerson
             if (!g_force1st) {

@@ -77,6 +77,7 @@ namespace fo4flatvr::dlg
     bool FlatExclusive();        // ... and no other FlatScreenModel menu is open (the capture holds only the options)
     bool TakeHapticRequest();    // true once per options-shown edge (bHaptics)
     bool WeaponHidden();         // the first-person weapon is culled by us right now (query for Hands)
+    bool CanPick();              // options shown + enabled + input accepted (last Tick; any thread)
     // Presenter, before comfort::FilterPad: primary stick direction -> pad face button while options can be picked.
     void FilterPad(pad::State& a_p, float a_stickX, float a_stickY);
     std::string GameStatus();

@@ -2,6 +2,7 @@
 #include "plugin/FloatingGun.h"
 #include "plugin/FrikBridge.h"
 #include "plugin/ControllerBindings.h"
+#include "plugin/Gestures.h"
 
 #include "plugin/CameraDirector.h"
 #include "plugin/CameraTweaks.h"
@@ -283,6 +284,9 @@ namespace fo4flatvr::command
                     hud::SetHideCrosshair(arg.back() == '1');
                     return "hud " + arg;
                 }
+                if (arg == "fw") {  // HUDFramework widget guard: matrices, widget stage bounds, layer angles
+                    return game::HudFrameworkStatus();
+                }
                 if (arg == "clear on" || arg == "clear off") {  // [HUD] bClearTargets (lingering HUD elements)
                     hud::SetClearHudTargets(arg == "clear on");
                     return "hud " + arg;
@@ -401,6 +405,9 @@ namespace fo4flatvr::command
             if (verb == "camdir") {
                 // camera step 1: camdir [on|off|table|policy <state> <policy>|fadetest [holdMs]]
                 return camdir::Command(arg);
+            }
+            if (verb == "gesture") {
+                return gestures::Command(arg);  // VR gestures + selfie: gesture [status|reload|on|off|test <R|L> <slot>|selfie on|off]
             }
             if (verb == "bindings") {
                 return bindings::Command(arg);  // FO4VR controller bindings: bindings [on|off] (readout: context + last pad)

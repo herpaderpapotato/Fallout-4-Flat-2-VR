@@ -2,9 +2,12 @@
 #include "plugin/HudLayer.h"
 #include "plugin/Dialogue.h"
 #include "plugin/PipboyLayer.h"
+#include "plugin/Settings.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <format>
 #include <future>
@@ -13,6 +16,10 @@
 
 #include <F4SE/F4SE.h>
 #include <RE/Fallout.h>
+#include <Scaleform/G/GFx_Viewport.h>
+
+#include <Windows.h>
+#undef ERROR
 
 namespace fo4flatvr::game
 {
@@ -431,5 +438,229 @@ namespace fo4flatvr::game
             return "error: main thread did not run the task within 2 s";
         }
         return fut.get();
+    }
+
+    // ---- HUDFramework guard (analysis/mod-edi-hudframework.md; [HUD] bHudFrameworkFix, default 1) ----------------------
+    // HUDFramework (mod 20309) parents its widget container under HUDMenu root1.BottomCenterGroup_mc.CompassWidget_mc.
+    // CompassBar_mc and sets the container matrix ONCE to the inverse of CompassBar_mc's transform.concatenatedMatrix, so
+    // widget x/y (set through globalToLocal) are 1280x720 HUD stage coordinates and widgets draw at their own scale. That
+    // only holds if concatenatedMatrix is the pure display-list chain. Here, once a second on the UI thread, the chain is
+    // rebuilt from each ancestor's transform.matrix (never touched by the viewport). If chain x container is not the
+    // identity, the container gets the true inverse and each widget's x/y is moved so its anchor stays where it landed
+    // (globalToLocal already used the display-list chain): only a wrong scale / rotation is removed. Power armour
+    // (HUDFramework moves the widgets into the crosshair clips) is left alone. Every change of the widget layout is
+    // logged ("hudfw:"): viewport, matrices, each widget's stage bounds and its angle on the HUD layer.
+    namespace
+    {
+        using HValue = Scaleform::GFx::Value;
+        struct M2
+        {
+            double a{ 1 }, b{ 0 }, c{ 0 }, d{ 1 }, tx{ 0 }, ty{ 0 };  // flash.geom.Matrix: x' = a x + c y + tx, y' = b x + d y + ty
+        };
+        M2 Mul(const M2& p, const M2& q)  // q first, then p
+        {
+            return { p.a * q.a + p.c * q.b, p.b * q.a + p.d * q.b, p.a * q.c + p.c * q.d, p.b * q.c + p.d * q.d, p.a * q.tx + p.c * q.ty + p.tx,
+                p.b * q.tx + p.d * q.ty + p.ty };
+        }
+        bool Inv(const M2& m, M2& o)
+        {
+            const double det = m.a * m.d - m.b * m.c;
+            if (std::abs(det) < 1e-12) {
+                return false;
+            }
+            o.a = m.d / det, o.b = -m.b / det, o.c = -m.c / det, o.d = m.a / det;
+            o.tx = -(o.a * m.tx + o.c * m.ty), o.ty = -(o.b * m.tx + o.d * m.ty);
+            return true;
+        }
+        double HNum(const HValue& a_v, double a_def = 0.0)
+        {
+            switch (a_v.GetType()) {
+            case HValue::ValueType::kNumber: return a_v.GetNumber();
+            case HValue::ValueType::kInt: return a_v.GetInt();
+            case HValue::ValueType::kUInt: return a_v.GetUInt();
+            case HValue::ValueType::kBoolean: return a_v.GetBoolean() ? 1.0 : 0.0;
+            default: return a_def;
+            }
+        }
+        double HMem(const HValue& a_o, const char* a_n, double a_def = 0.0)
+        {
+            HValue v;
+            return a_o.IsObject() && a_o.GetMember(a_n, &v) ? HNum(v, a_def) : a_def;
+        }
+        std::string HStr(const HValue& a_o, const char* a_n)
+        {
+            HValue v;
+            return a_o.IsObject() && a_o.GetMember(a_n, &v) && v.IsString() ? std::string(v.GetString()) : std::string("-");
+        }
+        bool MatrixOf(const HValue& a_m, M2& a_out)
+        {
+            if (!a_m.IsObject()) {
+                return false;
+            }
+            a_out = { HMem(a_m, "a", 1), HMem(a_m, "b"), HMem(a_m, "c"), HMem(a_m, "d", 1), HMem(a_m, "tx"), HMem(a_m, "ty") };
+            return true;
+        }
+        bool TransformMatrix(const HValue& a_obj, const char* a_which, M2& a_out)
+        {
+            HValue t, m;
+            return a_obj.IsObject() && a_obj.GetMember("transform", &t) && t.IsObject() && t.GetMember(a_which, &m) && MatrixOf(m, a_out);
+        }
+        // Display-list chain of a_obj up to (not including) the stage: what concatenatedMatrix should be.
+        bool Chain(const HValue& a_obj, M2& a_out)
+        {
+            M2     acc;
+            HValue o = a_obj;
+            for (int i = 0; i < 32; ++i) {
+                HValue p;
+                if (!o.GetMember("parent", &p) || !p.IsObject()) {
+                    a_out = acc;
+                    return true;  // o is the stage
+                }
+                M2 m;
+                if (!TransformMatrix(o, "matrix", m)) {
+                    return false;
+                }
+                acc = Mul(m, acc);
+                o = p;
+            }
+            return false;
+        }
+        std::string MStr(const M2& m) { return std::format("[{:.4f} {:.4f} {:.4f} {:.4f} {:.1f} {:.1f}]", m.a, m.b, m.c, m.d, m.tx, m.ty); }
+        double      LinDev(const M2& m) { return (std::max)({ std::abs(m.a - 1), std::abs(m.d - 1), std::abs(m.b), std::abs(m.c) }); }
+
+        std::atomic<int>                      g_hfOn{ -1 };
+        std::atomic<bool>                     g_hfPending{ false };
+        std::chrono::steady_clock::time_point g_hfNext{};
+        std::atomic<std::uint64_t>            g_hfChecks{ 0 }, g_hfFixes{ 0 };
+        std::string                           g_hfLastLog;  // UI thread
+        std::mutex                            g_hfLock;
+        std::string                           g_hfStatus{ "not checked" };  // under g_hfLock
+
+        void HfCheck()  // F4SE UI task (main thread)
+        {
+            g_hfPending = false;
+            ++g_hfChecks;
+            auto*                         ui = RE::UI::GetSingleton();
+            static const RE::BSFixedString kHud("HUDMenu");
+            Scaleform::Ptr<RE::IMenu>     menu = ui ? ui->GetMenu(kHud) : nullptr;
+            if (!menu || !menu->uiMovie) {
+                return;
+            }
+            auto*  mv = menu->uiMovie.get();
+            HValue hf;
+            if (!mv->GetVariable(&hf, "root1.HUDFramework") || !hf.IsObject()) {
+                std::scoped_lock l(g_hfLock);
+                g_hfStatus = "HUDFramework not in HUDMenu";
+                return;
+            }
+            HValue pa;
+            if (hf.GetMember("_isInPA", &pa) && pa.IsBoolean() && pa.GetBoolean()) {
+                std::scoped_lock l(g_hfLock);
+                g_hfStatus = "power armour (widgets on the crosshair clips; not checked)";
+                return;
+            }
+            HValue bar, cont;
+            if (!mv->GetVariable(&bar, "root1.BottomCenterGroup_mc.CompassWidget_mc.CompassBar_mc") || !bar.IsObject()) {
+                return;
+            }
+            if (!hf.GetMember("widgetContainer", &cont) || !cont.IsObject()) {  // not reachable by name: CompassBar_mc's last child
+                const int n = static_cast<int>(HMem(bar, "numChildren"));
+                HValue    idx(n - 1);
+                if (n <= 0 || !bar.Invoke("getChildAt", &cont, &idx, 1) || !cont.IsObject()) {
+                    return;
+                }
+            }
+            M2 S, C, K;
+            if (!Chain(bar, S) || !TransformMatrix(cont, "matrix", C)) {
+                return;
+            }
+            const bool hasK = TransformMatrix(bar, "concatenatedMatrix", K);
+            const M2   P = Mul(S, C);  // container -> HUD stage
+            const bool off = LinDev(P) > 0.002 || std::abs(P.tx) > 0.5 || std::abs(P.ty) > 0.5;
+            bool       fixed = false;
+            M2         Cn;
+            if (off && g_hfOn.load() == 1 && Inv(S, Cn)) {
+                HValue args[6] = { HValue(Cn.a), HValue(Cn.b), HValue(Cn.c), HValue(Cn.d), HValue(Cn.tx), HValue(Cn.ty) };
+                HValue nm, t;
+                mv->CreateObject(&nm, "flash.geom.Matrix", args, 6);
+                if (nm.IsObject() && cont.GetMember("transform", &t) && t.IsObject() && t.SetMember("matrix", nm)) {
+                    const int n = static_cast<int>(HMem(cont, "numChildren"));
+                    for (int i = 0; i < n && i < 64; ++i) {  // keep each anchor where it landed: new local = P * old local
+                        HValue w, idx(i);
+                        if (!cont.Invoke("getChildAt", &w, &idx, 1) || !w.IsObject()) {
+                            continue;
+                        }
+                        const double x = HMem(w, "x"), y = HMem(w, "y");
+                        w.SetMember("x", HValue(P.a * x + P.c * y + P.tx));
+                        w.SetMember("y", HValue(P.b * x + P.d * y + P.ty));
+                    }
+                    fixed = true;
+                    ++g_hfFixes;
+                }
+            }
+            // layout line: viewport, matrices, each widget's stage bounds and its angle on the HUD layer
+            Scaleform::GFx::Viewport vp{};
+            mv->GetViewport(&vp);
+            HValue root;
+            mv->GetVariable(&root, "root1");
+            const auto&  hc = hud::GetConfig();
+            const double bw = vp.bufferWidth > 0 ? vp.bufferWidth : vp.width, bh = vp.bufferHeight > 0 ? vp.bufferHeight : vp.height;
+            const double qw = hc.widthMeters, qh = bw > 0 ? qw * bh / bw : qw * 9.0 / 16.0, qd = hc.distanceMeters > 0.05f ? hc.distanceMeters : 1.0;
+            std::string  s = std::format("viewport buf {}x{} rect {},{} {}x{} | chain {} container {} -> stage {}{}{}", vp.bufferWidth, vp.bufferHeight,
+                 vp.left, vp.top, vp.width, vp.height, MStr(S), MStr(C), MStr(P), hasK ? " concatenated " + MStr(K) : std::string{},
+                 fixed ? " | FIXED: container set to the chain inverse" : off ? " | off (bHudFrameworkFix=0 or not invertible)" : " | ok");
+            const int n = static_cast<int>(HMem(cont, "numChildren"));
+            s += std::format(" | widgets={}", n);
+            for (int i = 0; i < n && i < 24; ++i) {
+                HValue w, idx(i), r;
+                if (!cont.Invoke("getChildAt", &w, &idx, 1) || !w.IsObject()) {
+                    continue;
+                }
+                double bx = 0, by = 0, bwid = 0, bhei = 0;
+                if (root.IsObject() && w.Invoke("getBounds", &r, &root, 1) && r.IsObject()) {
+                    bx = HMem(r, "x"), by = HMem(r, "y"), bwid = HMem(r, "width"), bhei = HMem(r, "height");
+                }
+                // ExactFit HUD (HUDMenu LoadMovie scale mode 2): HUD stage 1280x720 -> the whole layer quad
+                const double u = (bx + bwid * 0.5) / 1280.0, v = (by + bhei * 0.5) / 720.0;
+                const double yaw = std::atan2((u - 0.5) * qw, qd) * 57.29578, pitch = std::atan2(hc.heightMeters + (0.5 - v) * qh, qd) * 57.29578;
+                s += std::format(" | #{} '{}' x={:.0f} y={:.0f} scale={:.2f}x{:.2f} vis={} stage bounds {:.0f},{:.0f} {:.0f}x{:.0f} -> layer {:+.1f}/{:+.1f} deg",
+                    i, HStr(w, "name"), HMem(w, "x"), HMem(w, "y"), HMem(w, "scaleX", 1), HMem(w, "scaleY", 1), HMem(w, "visible", 1) != 0 ? 1 : 0, bx, by,
+                    bwid, bhei, yaw, pitch);
+            }
+            {
+                std::scoped_lock l(g_hfLock);
+                g_hfStatus = s;
+            }
+            if (s != g_hfLastLog) {  // log on change only
+                g_hfLastLog = s;
+                REX::INFO("hudfw: {}", s);
+            }
+        }
+    }
+
+    void HudFrameworkTick()
+    {
+        int on = g_hfOn.load();
+        if (on < 0) {
+            on = ::GetPrivateProfileIntA("HUD", "bHudFrameworkFix", 1, Settings::Path().c_str()) != 0 ? 1 : 0;
+            g_hfOn = on;
+            REX::INFO("hudfw: HUDFramework widget guard {} ([HUD] bHudFrameworkFix; the layout is logged either way)", on ? "on" : "off");
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now < g_hfNext || g_hfPending.exchange(true)) {
+            return;
+        }
+        g_hfNext = now + std::chrono::seconds(1);
+        if (const auto tasks = F4SE::GetTaskInterface()) {
+            tasks->AddUITask([]() { HfCheck(); });
+        } else {
+            g_hfPending = false;
+        }
+    }
+
+    std::string HudFrameworkStatus()
+    {
+        std::scoped_lock l(g_hfLock);
+        return std::format("hudfw on={} checks={} fixes={} | {}", g_hfOn.load(), g_hfChecks.load(), g_hfFixes.load(), g_hfStatus);
     }
 }

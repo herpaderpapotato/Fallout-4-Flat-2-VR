@@ -2,6 +2,7 @@
 // edge, primary stick -> option button.
 #include "plugin/Dialogue.h"
 
+#include "plugin/ControllerBindings.h"
 #include "plugin/Settings.h"
 #include "plugin/VirtualPad.h"
 
@@ -336,11 +337,13 @@ namespace fo4flatvr::dlg
     bool FlatExclusive() { return g_flatExclusive.load(std::memory_order_relaxed); }
     bool TakeHapticRequest() { return g_hapticReq.exchange(false); }
     bool WeaponHidden() { return g_weaponHidden.load(std::memory_order_relaxed); }
+    bool CanPick() { return g_canPick.load(std::memory_order_relaxed); }
 
     void FilterPad(pad::State& a_p, float a_x, float a_y)
     {
         Game& g = g_g;
-        if (!g_stick.load() || !g_open.load()) {
+        // EDI list navigation owns the primary stick (ControllerBindings: D-pad steps); no stick -> option button then
+        if (!g_stick.load() || !g_open.load() || bindings::DialogueListNavActive()) {
             g.stickBtn = -1;
             return;
         }

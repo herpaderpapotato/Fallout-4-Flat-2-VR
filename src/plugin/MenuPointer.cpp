@@ -2,6 +2,7 @@
 #include <REX/LOG.h>
 
 #include "plugin/MenuPointer.h"
+#include "plugin/ControllerBindings.h"
 #include "plugin/GameMenuPointer.h"
 #include "plugin/VirtualPad.h"
 #include "xr/XrRuntime.h"
@@ -41,6 +42,17 @@ namespace fo4flatvr::menuptr
         std::atomic<std::uint64_t> g_frames{ 0 }, g_hits{ 0 }, g_clicks{ 0 }, g_wheels{ 0 }, g_cursorFrames{ 0 };
         std::string   g_target{ "-" };
         std::string   g_quadLine{ "none" }, g_aimLine{ "none" }, g_hitLine{ "none" };
+        // world-screen terminal (SetWorldScreen)
+        struct WorldScreen
+        {
+            bool        active{ false };
+            std::string menu;
+            float       pos[3]{}, dir[3]{};
+            float       upm{ 70.0f };
+        };
+        WorldScreen   g_ws;
+        bool          g_onWorld = false;
+        std::atomic<std::uint64_t> g_worldHits{ 0 };
 
         // Cursor copy of the back buffer
         ComPtr<ID3D11Texture2D>        g_disp;
@@ -93,6 +105,20 @@ namespace fo4flatvr::menuptr
         g_panel = a_panel;
     }
 
+    void SetWorldScreen(bool a_active, const char* a_menu, const float a_lp[3], const float a_ld[3], float a_upm)
+    {
+        g_ws.active = a_active && a_menu && a_lp && a_ld;
+        if (g_ws.active) {
+            g_ws.menu = a_menu;
+            for (int i = 0; i < 3; ++i) {
+                g_ws.pos[i] = a_lp[i], g_ws.dir[i] = a_ld[i];
+            }
+            g_ws.upm = a_upm;
+        }
+    }
+
+    bool WorldScreenOn() { return g_onWorld; }
+
     bool PanelCursor(float& a_u, float& a_v, bool& a_down)
     {
         if (!g_onPanel) {
@@ -106,14 +132,18 @@ namespace fo4flatvr::menuptr
     {
         ++g_frames;
         const bool panel = g_panel.valid && !a_cinema;  // dialogue option panel (world quad) instead of the cinema quad
-        const bool on = g_enabled.load() && (a_cinema || panel) && a_began;
+        const bool world = g_ws.active && !a_cinema && !panel;  // round 7: terminal monitor in the game world
+        const bool on = g_enabled.load() && (a_cinema || panel || world) && a_began;
         game::MenuPointerTarget target;
         if (on) {
             if (panel) {
                 target.valid = true;
                 target.name = g_panel.menu;
+            } else if (world) {
+                target.valid = true;
+                target.name = g_ws.menu;
             } else {
-                game::FindPointerMenu(target);
+                game::FindPointerMenu(target);  // incl. the any-menu pass (DialogueMenu / EDI in pad mode, mod menus)
             }
         }
         g_active = on && target.valid;
@@ -134,7 +164,15 @@ namespace fo4flatvr::menuptr
             a_rt.CinemaQuadPose(quad, qw, qh);
         }
         bool hit = false;
-        if (g_active && aimOk && qw > 0.0f && qh > 0.0f) {
+        if (world) {
+            float u = 0.0f, v = 0.0f, dist = 0.0f;
+            if (g_active && game::PickWorldScreen(g_ws.pos, g_ws.dir, g_ws.upm, u, v, dist)) {
+                hit = true;
+                g_u = std::clamp(u, 0.0f, 1.0f), g_v = std::clamp(v, 0.0f, 1.0f), g_dist = dist / (g_ws.upm > 0.0f ? g_ws.upm : 70.0f);
+                ++g_hits;
+                ++g_worldHits;
+            }
+        } else if (g_active && aimOk && qw > 0.0f && qh > 0.0f) {
             const xr::Vec3 d = Rot(aim.orientation, { 0.0f, 0.0f, -1.0f });
             const xr::Vec3 n = Rot(quad.orientation, { 0.0f, 0.0f, 1.0f });
             const float    den = Dot(d, n);
@@ -152,7 +190,7 @@ namespace fo4flatvr::menuptr
                 }
             }
         }
-        g_onQuad = hit && !panel;  // PrepareCinema draws the dot only on the cinema image
+        g_onQuad = hit && !panel && !world;  // PrepareCinema draws the dot only on the cinema image
         g_onPanel = hit && panel;
         // Trigger with hysteresis; a click must start on the quad.
         const bool wasDown = g_trigDown;
@@ -169,7 +207,8 @@ namespace fo4flatvr::menuptr
         int        wheel = 0;
         const auto now = std::chrono::steady_clock::now();
         const int  dir = stickY > 0.5f ? 1 : stickY < -0.5f ? -1 : 0;
-        if (hit && !panel && dir != 0 && (dir != g_wheelDir || now >= g_nextWheel)) {
+        // (not while the EDI dialogue list owns the stick: its steps are D-pad pulses, ControllerBindings)
+        if (hit && !panel && dir != 0 && !bindings::DialogueListNavActive() && (dir != g_wheelDir || now >= g_nextWheel)) {
             wheel = dir;
             g_nextWheel = now + std::chrono::milliseconds(150);
             ++g_wheels;
@@ -182,7 +221,9 @@ namespace fo4flatvr::menuptr
         in.v = panel ? g_panel.v0 + g_v * (g_panel.v1 - g_panel.v0) : g_v;
         in.down = g_trigDown;
         in.wheel = wheel;
-        game::SetMenuPointer(in, g_active, panel ? g_panel.menu.c_str() : nullptr);
+        in.movieUv = world;
+        game::SetMenuPointer(in, g_active, panel ? g_panel.menu.c_str() : world ? g_ws.menu.c_str() : nullptr);
+        g_onWorld = world && g_active && (hit || g_trigDown);
 
         {
             std::scoped_lock l(g_lock);
@@ -266,7 +307,8 @@ namespace fo4flatvr::menuptr
         }
         const auto pad = pad::Last();  // what the virtual pad got last (trigger suppression check)
         return std::format("enabled={} active={} target='{}' onQuad={} u={:.4f} v={:.4f} down={} leftHanded={} frames={} hits={} clicks={} wheels={} cursorFrames={} padLT={:.2f} padRT={:.2f} | quad {} | aim {} | pointer {} | game {}",
-            g_enabled.load() ? 1 : 0, g_active ? 1 : 0, target, g_onQuad ? 1 : 0, g_u, g_v, g_trigDown ? 1 : 0, g_cfg.leftHanded ? 1 : 0, g_frames.load(),
-            g_hits.load(), g_clicks.load(), g_wheels.load(), g_cursorFrames.load(), pad.lt, pad.rt, quad, aim, hit, game::MenuPointerGameReport());
+                   g_enabled.load() ? 1 : 0, g_active ? 1 : 0, target, g_onQuad ? 1 : 0, g_u, g_v, g_trigDown ? 1 : 0, g_cfg.leftHanded ? 1 : 0, g_frames.load(),
+                   g_hits.load(), g_clicks.load(), g_wheels.load(), g_cursorFrames.load(), pad.lt, pad.rt, quad, aim, hit, game::MenuPointerGameReport()) +
+               std::format(" | world active={} on={} hits={} {}", g_ws.active ? 1 : 0, g_onWorld ? 1 : 0, g_worldHits.load(), game::WorldScreenReport());
     }
 }

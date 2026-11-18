@@ -1,6 +1,8 @@
 #include "plugin/GameMenuPointer.h"
+#include "plugin/CameraDirector.h"
 #include "plugin/GameBridge.h"
 #include "plugin/HudLayer.h"
+#include "plugin/Settings.h"
 
 #include <algorithm>
 #include <atomic>
@@ -17,6 +19,9 @@
 #include <F4SE/F4SE.h>
 #include <RE/Fallout.h>
 #include <Scaleform/G/GFx_Viewport.h>
+
+#include <Windows.h>
+#undef ERROR
 
 namespace fo4flatvr::game
 {
@@ -46,6 +51,56 @@ namespace fo4flatvr::game
                 }
             }
             return false;
+        }
+
+        // ---- any-menu pass ([Menus] bPointerAnyMenu, default 1) ----------------------------------------------------
+        // An interactive menu the stack walk below cannot see by kUsesMenuContext / kUsesCursor (gamepad mode). Taken:
+        // a menu that can own a cursor or the input even with a pad (kAssignCursorToRenderer 0x10000, kUpdateUsesCursor
+        // 0x400, kModal 0x10, kPausesGame 0x1), or a mod / F4SE menu (IMenu vtable outside Fallout4.exe) with
+        // kCustomRendering. Never: HUD-only and non-interactive overlays (HUDMenu, FaderMenu, VignetteMenu, LoadingMenu,
+        // PromptMenu) and VATSMenu (its own window / hand targeting; a mouse click would pick limbs and the trigger
+        // fires), plus Excluded() above.
+        std::atomic<int> g_anyMenu{ -1 };
+        std::mutex       g_anyLock;
+        std::string      g_anySeen;  // under g_anyLock: |name| list, logged once each
+
+        bool AnyMenuPass()
+        {
+            int e = g_anyMenu.load();
+            if (e < 0) {
+                e = ::GetPrivateProfileIntA("Menus", "bPointerAnyMenu", 1, Settings::Path().c_str()) != 0 ? 1 : 0;
+                g_anyMenu = e;
+                REX::INFO("pointer: any-menu pass {} ([Menus] bPointerAnyMenu)", e ? "on" : "off");
+            }
+            return e != 0;
+        }
+
+        bool OutsideExe(const void* a_menu)
+        {
+            static std::uintptr_t lo = 0, hi = 0;
+            if (!lo) {
+                const auto  base = reinterpret_cast<std::uintptr_t>(::GetModuleHandleW(nullptr));
+                const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+                const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+                lo = base, hi = base + nt->OptionalHeader.SizeOfImage;
+            }
+            const auto vt = *reinterpret_cast<const std::uintptr_t*>(a_menu);
+            return vt < lo || vt >= hi;
+        }
+
+        bool AnyMenuInteractive(const void* a_menu, const char* a_name, std::uint32_t a_flags)
+        {
+            static constexpr const char* kNot[] = { "HUDMenu", "FaderMenu", "VignetteMenu", "LoadingMenu", "PromptMenu", "VATSMenu" };
+            for (const char* n : kNot) {
+                if (_stricmp(a_name, n) == 0) {
+                    return false;
+                }
+            }
+            if (Excluded(a_name)) {
+                return false;
+            }
+            constexpr std::uint32_t kOwnsInput = 0x10000 | 0x400 | 0x10 | 0x1;  // AssignCursorToRenderer, UpdateUsesCursor, Modal, PausesGame
+            return (a_flags & kOwnsInput) != 0 || ((a_flags & 0x8000) && OutsideExe(a_menu));
         }
 
         // Caller holds no lock. Returns the target menu (AddRef'd via Ptr) or null.
@@ -100,7 +155,49 @@ namespace fo4flatvr::game
                     break;
                 }
             }
+            // Third pass (analysis/mod-edi-hudframework.md section 4): in gamepad mode some interactive menus carry
+            // neither flag, e.g. DialogueMenu 0x18800 (kUsesCursor only without a pad, UpdateInputContext 1043FE0).
+            std::string anyNew;
+            if (!found && AnyMenuPass()) {
+                for (std::uint32_t i = stack.size(); i-- > 0;) {
+                    const auto& m = stack[i];
+                    if (!m) {
+                        continue;
+                    }
+                    const auto* raw = reinterpret_cast<const std::uint8_t*>(m.get());
+                    const int   depth = raw[0x64];
+                    if (depth >= kTopMenuDepthLimit) {
+                        continue;
+                    }
+                    const std::uint32_t flags = m->menuFlags.underlying();
+                    const char*         name = m->menuName.c_str();
+                    if (!name) {
+                        name = "";
+                    }
+                    if (m->uiMovie && AnyMenuInteractive(m.get(), name, flags)) {
+                        found = m;
+                        if (a_info) {
+                            a_info->valid = true;
+                            a_info->name = name;
+                            a_info->flags = flags;
+                            a_info->depth = depth;
+                        }
+                        std::scoped_lock l(g_anyLock);
+                        if (g_anySeen.find(std::format("|{}|", name)) == std::string::npos) {
+                            g_anySeen += std::format("|{}|", name);
+                            anyNew = std::format("'{}' flags=0x{:X} depth={}", name, flags, depth);
+                        }
+                        break;
+                    }
+                    if (flags & kModal) {
+                        break;
+                    }
+                }
+            }
             lock.unlock_read();
+            if (!anyNew.empty()) {
+                REX::INFO("pointer: {} targeted by the any-menu pass (no kUsesMenuContext/kUsesCursor; [Menus] bPointerAnyMenu)", anyNew);
+            }
             return found;
         }
 
@@ -220,7 +317,9 @@ namespace fo4flatvr::game
         {
             std::uint32_t type;
             float         u, v, wheel;
+            bool          movieUv{ false };  // world-screen pick: already movie uv
         };
+        bool g_queueMovieUv = false;  // main thread: movieUv of the events SetMenuPointer queues now
 
         std::mutex                 g_lock;  // g_events, g_downMenu, report strings
         std::deque<QueuedEvent>    g_events;
@@ -538,7 +637,7 @@ namespace fo4flatvr::game
                 const float bw = static_cast<float>(vp.bufferWidth > 0 ? vp.bufferWidth : vp.width);
                 const float bh = static_cast<float>(vp.bufferHeight > 0 ? vp.bufferHeight : vp.height);
                 float mu = e.u, mv = e.v;
-                if (_stricmp(dstName.c_str(), "TerminalMenu") == 0) {
+                if (_stricmp(dstName.c_str(), "TerminalMenu") == 0 && !e.movieUv) {
                     float pu = 0.0f, pv = 0.0f;
                     const bool hit = PickTerminalScreen(e.u, e.v, pu, pv);
                     {
@@ -584,7 +683,7 @@ namespace fo4flatvr::game
                 g_events.pop_front();
                 ++g_dropped;
             }
-            g_events.push_back({ a_type, a_u, a_v, a_wheel });
+            g_events.push_back({ a_type, a_u, a_v, a_wheel, g_queueMovieUv });
         }
     }
 
@@ -597,8 +696,9 @@ namespace fo4flatvr::game
         std::atomic<std::uint64_t> g_pucCalls{ 0 }, g_pucFrames{ 0 };
     }
 
-    bool DriveCameraWhilePaused(bool a_active, std::uint64_t a_fpUpdates)
+    bool DriveCameraWhilePaused(bool a_active, std::uint64_t (*a_counter)())
     {
+        const std::uint64_t a_fpUpdates = a_counter ? a_counter() : 0;
         if (!a_active) {
             g_pucTracking = false;
             return false;
@@ -628,7 +728,7 @@ namespace fo4flatvr::game
             ++g_pucCalls;
             ran = true;
         }
-        g_pucLastFp = ran ? game::FirstPersonUpdates() : a_fpUpdates;
+        g_pucLastFp = ran && a_counter ? a_counter() : a_fpUpdates;
         return ran;
     }
 
@@ -770,7 +870,9 @@ namespace fo4flatvr::game
         // Examine/Cooking/Workbench "WorkbenchItem3D"/"ExamineMenuItem3D", Workshop, PowerArmorMod, Lockpicking, Book) are
         // panels too: the preview renderer is captured onto the panel (hud::CaptureMenuPreview); [Menus] bPanelPreview=0
         // keeps them on the flat fallback.
-        static constexpr const char* kNo[] = { "MainMenu", "LoadingMenu", "CreditsMenu", "LooksMenu", "ScopeMenu", "PipboyMenu",
+        // round 8: LooksMenu (character creation / face camera) is a panel over the SCENE view of the game's camera now
+        // ("camera takeover yes", user 16 Nov); the flat window stays for no-world menus, the scope zoom and VATS
+        static constexpr const char* kNo[] = { "MainMenu", "LoadingMenu", "CreditsMenu", "ScopeMenu", "PipboyMenu",
             "PipboyHolotapeMenu", "TerminalMenu", "TerminalHolotapeMenu",
             "VATSMenu" };  // VATS: head-locked overlay over the live world with the camera gate (Presenter), else flat fallback
         static constexpr const char* kPreview[] = { "ContainerMenu", "BarterMenu", "ExamineMenu", "WorkshopMenu", "CookingMenu",
@@ -799,6 +901,175 @@ namespace fo4flatvr::game
         return (m->menuFlags.underlying() & 0x8000) && r && _stricmp(r, "FlatScreenModel") == 0;
     }
 
+    // ---- Round 7: terminals on their own monitor in the world (FO4VR) ------------------------------------------------
+    namespace
+    {
+        constexpr std::uintptr_t kNiPickCtor = 0x16FD560;     // NiPick::NiPick(NiPick*, u16 initialSize, u16 growBy)
+        constexpr std::uintptr_t kNiPickObjects = 0x16FD660;  // NiPick::PickObjects(NiPick*, const NiPoint3& o, const NiPoint3& d, bool append)
+        constexpr std::uintptr_t kNiPickDtor = 0x16FD610;     // NiPick::~NiPick(NiPick*)
+        std::atomic<bool>          g_worldScreenOn{ true };
+        int                        g_niPickOk = -1;
+        std::atomic<std::uint64_t> g_wsPicks{ 0 }, g_wsHits{ 0 };
+        std::string                g_wsLast{ "none" };  // under g_lock
+
+        bool NiPickOk()
+        {
+            if (g_niPickOk < 0) {
+                const auto* b = reinterpret_cast<const std::uint8_t*>(Base());
+                static constexpr std::uint8_t kCtor[] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x33, 0xFF };
+                static constexpr std::uint8_t kPick[] = { 0x48, 0x89, 0x5C, 0x24, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x33, 0xFF };
+                static constexpr std::uint8_t kDtor[] = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9, 0x48, 0x83, 0xC1, 0x20 };
+                const bool ok = std::memcmp(b + kNiPickCtor, kCtor, sizeof(kCtor)) == 0 && std::memcmp(b + kNiPickObjects, kPick, sizeof(kPick)) == 0 &&
+                                std::memcmp(b + kNiPickDtor, kDtor, sizeof(kDtor)) == 0 && PickCodeOk();
+                g_niPickOk = ok ? 1 : 0;
+                if (ok) {
+                    REX::INFO("terminal in world: NiPick ctor/PickObjects/dtor verified (hand-ray pick on the terminal screen)");
+                } else {
+                    REX::ERROR("terminal in world: NiPick bytes differ; no pointer on the terminal monitor");
+                }
+            }
+            return g_niPickOk == 1;
+        }
+
+        RE::NiAVObject* TerminalScreen()
+        {
+            const auto base = Base();
+            auto*      term = *reinterpret_cast<RE::TESObjectREFR**>(base + kTerminalRef);
+            RE::NiAVObject* root = term ? term->GetCurrent3D() : nullptr;
+            if (!root) {
+                return nullptr;
+            }
+            static const RE::BSFixedString kScreen("Screen:0");
+            return reinterpret_cast<GetObjectByName_t>(base + kGetObjectByName)(root, kScreen, true, false);
+        }
+    }
+
+    bool MenuUsesRenderer(const char* a_menu, const char* a_renderer)
+    {
+        auto* ui = RE::UI::GetSingleton();
+        if (!ui || !a_menu || !a_renderer || !ui->GetMenuOpen(a_menu)) {
+            return false;
+        }
+        Scaleform::Ptr<RE::IMenu> m = ui->GetMenu(RE::BSFixedString(a_menu));
+        const char*               r = m ? m->customRendererName.c_str() : nullptr;
+        return r && _stricmp(r, a_renderer) == 0;
+    }
+
+    void HudMessage(const std::string& a_text)
+    {
+        constexpr std::uintptr_t kShowHudMessage = 0xA37270;  // SendHUDMessage::ShowHUDMessage(msg, sound, throttle, warning)
+        static const bool ok = [] {
+            static constexpr std::uint8_t kPro[] = { 0x48, 0x83, 0xEC, 0x58, 0xC6, 0x44, 0x24, 0x28, 0x00 };
+            const bool m = std::memcmp(reinterpret_cast<const void*>(Base() + kShowHudMessage), kPro, sizeof(kPro)) == 0;
+            if (!m) REX::ERROR("HUD message: ShowHUDMessage bytes differ; no notifications");
+            return m;
+        }();
+        const auto tasks = F4SE::GetTaskInterface();
+        if (!ok || !tasks) {
+            return;
+        }
+        tasks->AddTask([t = a_text]() {
+            using Fn = void (*)(const char*, const char*, bool, bool);
+            reinterpret_cast<Fn>(Base() + kShowHudMessage)(t.c_str(), "", false, false);
+        });
+    }
+
+    void SetWorldScreenEnabled(bool a_on) { g_worldScreenOn = a_on; }
+    bool WorldScreenEnabled() { return g_worldScreenOn.load(); }
+
+    bool WorldScreenMenu(const char* a_name)
+    {
+        if (!a_name || !g_worldScreenOn.load() || (_stricmp(a_name, "TerminalMenu") != 0 && _stricmp(a_name, "TerminalHolotapeMenu") != 0)) {
+            return false;
+        }
+        // round 8 (camera takeover generalised): any camera state whose policy is a live world view (TRACK / LOCK, SCENE reports
+        // TRACK) - with the game's terminal camera (furniture gate off) the monitor is seen through that camera + the head;
+        // FADE_SNAP (fading to black) and CINEMA keep the flat window
+        if (const auto pol = camdir::ViewPolicy(CurrentCameraState()); (pol != camdir::Policy::kTrack && pol != camdir::Policy::kLock) || !PickCodeOk()) {
+            return false;
+        }
+        auto* ui = RE::UI::GetSingleton();
+        if (!ui || !ui->GetMenuOpen(a_name)) {
+            return false;
+        }
+        Scaleform::Ptr<RE::IMenu> m = ui->GetMenu(RE::BSFixedString(a_name));
+        const char* r = m ? m->customRendererName.c_str() : nullptr;
+        // no terminal ref (a holotape terminal from the Pip-Boy): the movie is on the Pip-Boy renderer instead
+        return r && _stricmp(r, "TerminalMenu") == 0 && TerminalScreen() != nullptr;
+    }
+
+    bool PickWorldScreen(const float a_lp[3], const float a_ld[3], float a_upm, float& a_u, float& a_v, float& a_dist)
+    {
+        if (!NiPickOk()) {
+            return false;
+        }
+        RE::NiAVObject* screen = TerminalScreen();
+        auto*           cam = RE::PlayerCamera::GetSingleton();
+        auto*           root = cam ? cam->cameraRoot.get() : nullptr;
+        if (!screen || !root) {
+            return false;
+        }
+        // camera-local (X right, Y forward, Z up; rows of the root's world rotation = world images of the local axes)
+        const auto& m = root->world.rotate;
+        auto        toWorld = [&](const float* l) {
+            return RE::NiPoint3{ l[0] * m.entry[0].x + l[1] * m.entry[1].x + l[2] * m.entry[2].x,
+                l[0] * m.entry[0].y + l[1] * m.entry[1].y + l[2] * m.entry[2].y, l[0] * m.entry[0].z + l[1] * m.entry[1].z + l[2] * m.entry[2].z };
+        };
+        const RE::NiPoint3 off = toWorld(a_lp);
+        RE::NiPoint3       d = toWorld(a_ld);
+        const float        len = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+        if (!(len > 0.5f)) {
+            return false;
+        }
+        d = { d.x / len, d.y / len, d.z / len };
+        const RE::NiPoint3 o{ root->world.translate.x + off.x * a_upm, root->world.translate.y + off.y * a_upm, root->world.translate.z + off.z * a_upm };
+        // NiPick as UIUtils::PickScreen sets it up: ctor(0, 8); +4 = 0; +8 = 1 (u64); target +0x18 (NiPointer); +0x48 = 0x101
+        alignas(16) std::uint8_t pick[0x80]{};
+        using Ctor_t = void* (*)(void*, std::uint16_t, std::uint16_t);
+        using Pick_t = bool (*)(void*, const RE::NiPoint3&, const RE::NiPoint3&, bool);
+        using Dtor_t = void (*)(void*);
+        const auto base = Base();
+        reinterpret_cast<Ctor_t>(base + kNiPickCtor)(pick, 0, 8);
+        *reinterpret_cast<std::uint32_t*>(pick + 4) = 0;
+        *reinterpret_cast<std::uint64_t*>(pick + 8) = 1;
+        screen->IncRefCount();  // released by the dtor
+        *reinterpret_cast<RE::NiAVObject**>(pick + 0x18) = screen;
+        *reinterpret_cast<std::uint32_t*>(pick + 0x48) = 0x101;
+        const bool    ok = reinterpret_cast<Pick_t>(base + kNiPickObjects)(pick, o, d, false);
+        const auto    n = *reinterpret_cast<const std::uint32_t*>(pick + 0x38);
+        const auto*   recs = *reinterpret_cast<std::uint8_t* const* const*>(pick + 0x28);
+        bool          hit = false;
+        if (ok && n > 0 && recs && recs[0]) {
+            a_u = *reinterpret_cast<const float*>(recs[0] + 0x24);
+            a_v = *reinterpret_cast<const float*>(recs[0] + 0x28);
+            a_dist = *reinterpret_cast<const float*>(recs[0] + 0x20);
+            hit = std::isfinite(a_u) && std::isfinite(a_v) && a_u >= -0.01f && a_u <= 1.01f && a_v >= -0.01f && a_v <= 1.01f;
+        }
+        reinterpret_cast<Dtor_t>(base + kNiPickDtor)(pick);
+        ++g_wsPicks;
+        if (hit) {
+            ++g_wsHits;
+        }
+        {
+            std::scoped_lock l(g_lock);
+            g_wsLast = hit ? std::format("hit uv {:.4f},{:.4f} dist {:.1f} u from ({:.1f},{:.1f},{:.1f}) dir ({:.3f},{:.3f},{:.3f})", a_u, a_v, a_dist, o.x, o.y,
+                                 o.z, d.x, d.y, d.z)
+                           : std::format("miss (results {}) from ({:.1f},{:.1f},{:.1f}) dir ({:.3f},{:.3f},{:.3f})", n, o.x, o.y, o.z, d.x, d.y, d.z);
+        }
+        return hit;
+    }
+
+    std::string WorldScreenReport()
+    {
+        std::string last;
+        {
+            std::scoped_lock l(g_lock);
+            last = g_wsLast;
+        }
+        return std::format("terminalInWorld on={} nipick={} picks={} hits={} last {}", g_worldScreenOn.load() ? 1 : 0, g_niPickOk, g_wsPicks.load(),
+            g_wsHits.load(), last);
+    }
+
     std::string PausedCameraReport()
     {
         return std::format("pausedCamera ok={} calls={} frames={}", g_pucOk, g_pucCalls.load(), g_pucFrames.load());
@@ -816,6 +1087,7 @@ namespace fo4flatvr::game
             std::scoped_lock l(g_lock);
             g_forced = a_forceMenu ? a_forceMenu : "";
         }
+        g_queueMovieUv = a_active ? a_in.movieUv : g_last.movieUv;  // a release after the pointer left keeps the last mode
         bool queued = false;
         if (!a_active) {
             if (g_down) {  // release a held button when the pointer goes away (cinema hidden, switch off)

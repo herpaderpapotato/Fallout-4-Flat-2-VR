@@ -52,6 +52,13 @@ namespace fo4flatvr::menuptr
         std::string menu;
     };
     void SetPanel(const Panel& a_panel);
+    // Round 7: a terminal shown on its own monitor in the world (game::WorldScreenMenu). While active and neither the cinema
+    // quad nor a panel is up, UpdateFrame casts the aim ray at the terminal's "Screen:0" in the game world (game::
+    // PickWorldScreen) and sends the events to `menu` in movie uv. a_localPos / a_localDir: the aim hand relative to the head
+    // pose the current camera root was rendered with, game camera-local basis (X right, Y forward, Z up), metres. Main thread,
+    // every frame before UpdateFrame (a_active = false clears it).
+    void SetWorldScreen(bool a_active, const char* a_menu, const float a_localPos[3], const float a_localDir[3], float a_unitsPerMeter);
+    bool WorldScreenOn();  // last UpdateFrame: the ray is on the terminal screen (or a click is held)
     // Pointer on the panel at the last UpdateFrame: quad uv and trigger state. False when not on the panel.
     bool PanelCursor(float& a_u, float& a_v, bool& a_down);
 

@@ -2,6 +2,8 @@
 
 #include <Windows.h>  // NOMINMAX / WIN32_LEAN_AND_MEAN come from xrcore's public defines
 
+#include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 
@@ -72,6 +74,8 @@ namespace fo4flatvr
         s.quadHeightMeters = ReadFloat(p, "Cinema", "fHeightMeters", s.quadHeightMeters);
         s.recenterKey = ReadInt(p, "Keys", "iRecenter", s.recenterKey);
         s.toggleKey = ReadInt(p, "Keys", "iToggle", s.toggleKey);
+        s.cameraCycleKey = ReadInt(p, "Keys", "iCameraCycle", s.cameraCycleKey);
+        s.povToggleKey = ReadInt(p, "Keys", "iPovToggle", s.povToggleKey);
         s.aimWithController = ReadInt(p, "Controllers", "bAimWithController", s.aimWithController ? 1 : 0) != 0;
         s.noSpread = ReadInt(p, "Weapon", "bNoSpread", s.noSpread ? 1 : 0) != 0;
         s.noSpreadPellets = ReadInt(p, "Weapon", "bNoSpreadPellets", s.noSpreadPellets ? 1 : 0) != 0;
@@ -127,6 +131,41 @@ namespace fo4flatvr
         s.menuVatsLabelScale = ReadFloat(p, "Menus", "fVatsLabelScale", s.menuVatsLabelScale);
         s.menuVatsNoVignette = ReadInt(p, "Menus", "bVatsNoVignette", s.menuVatsNoVignette ? 1 : 0) != 0;
         s.pipboyFloating = ReadInt(p, "Pipboy", "bFloating", s.pipboyFloating ? 1 : 0) != 0;
+        s.pipboyProjected = ReadInt(p, "Pipboy", "bProjected", s.pipboyProjected ? 1 : 0) != 0;
+        s.pipboyProjWidthMeters = ReadFloat(p, "Pipboy", "fProjectedWidthMeters", s.pipboyProjWidthMeters);
+        s.pipboyProjDistanceMeters = ReadFloat(p, "Pipboy", "fProjectedDistanceMeters", s.pipboyProjDistanceMeters);
+        s.pipboyProjHeightMeters = ReadFloat(p, "Pipboy", "fProjectedHeightMeters", s.pipboyProjHeightMeters);
+        s.pipboyProjLagConeDeg = ReadFloat(p, "Pipboy", "fProjectedLagConeDeg", s.pipboyProjLagConeDeg);
+        s.pipboyProjNoScanlines = ReadInt(p, "Pipboy", "bProjectedNoScanlines", s.pipboyProjNoScanlines ? 1 : 0) != 0;
+        s.menuTerminalInWorld = ReadInt(p, "Menus", "bTerminalInWorld", s.menuTerminalInWorld ? 1 : 0) != 0;
+        s.menuPanelFO4VR = ReadInt(p, "Menus", "bPanelGeometryFO4VR", s.menuPanelFO4VR ? 1 : 0) != 0;
+        s.menuPauseWidthMeters = ReadFloat(p, "Menus", "fPauseWidthMeters", s.menuPauseWidthMeters);
+        s.menuPauseDistanceMeters = ReadFloat(p, "Menus", "fPauseDistanceMeters", s.menuPauseDistanceMeters);
+        s.menuPauseHeightMeters = ReadFloat(p, "Menus", "fPauseHeightMeters", s.menuPauseHeightMeters);
+        s.menuWindowMenus = ReadString(p, "Menus", "sWindowMenus", "");
+        {
+            // [MenuGeometry] <MenuName>=width,distance,height
+            std::string buf(32768, '\0');
+            const DWORD n = ::GetPrivateProfileSectionA("MenuGeometry", buf.data(), static_cast<DWORD>(buf.size()), p.c_str());
+            for (std::size_t i = 0; i < n && buf[i];) {
+                const std::string line(buf.c_str() + i);
+                i += line.size() + 1;
+                const auto eq = line.find('=');
+                if (eq == std::string::npos || line[0] == ';') {
+                    continue;
+                }
+                std::string key = line.substr(0, eq);
+                while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
+                for (auto& ch : key) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                float v[3]{};
+                if (std::sscanf(line.c_str() + eq + 1, " %f , %f , %f", &v[0], &v[1], &v[2]) == 3 && v[0] > 0.01f && v[1] > 0.01f) {
+                    s.menuGeometry[key] = { v[0], v[1], v[2] };
+                }
+            }
+            if (const auto it = s.menuGeometry.find("dialoguemenu"); it != s.menuGeometry.end()) {
+                s.menuDialogueWidthMeters = it->second[0], s.menuDialogueDistanceMeters = it->second[1], s.menuDialogueHeightMeters = it->second[2];
+            }
+        }
         s.stereoMode = ReadInt(p, "Stereo", "iMode", s.stereoMode);
         s.stereoInstallHooks = ReadInt(p, "Stereo", "bInstallHooks", s.stereoInstallHooks ? 1 : 0) != 0;
         s.stereoSkipUnconverted = ReadInt(p, "Stereo", "bSkipUnconverted", s.stereoSkipUnconverted ? 1 : 0) != 0;

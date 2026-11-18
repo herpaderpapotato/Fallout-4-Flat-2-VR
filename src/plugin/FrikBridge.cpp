@@ -1,9 +1,12 @@
-// FRIK-flat bridge: see FrikBridge.h / FrikBridgeApi.h. No RE types here (REL only, for the C351F3 hook).
+// FRIK-flat bridge: see FrikBridge.h / FrikBridgeApi.h. RE: only RE::UI::menuMode (paused-frame test).
 #include <F4SE/F4SE.h>  // CommonLib before any Windows header
+#include <RE/Fallout.h>
 
 #include "plugin/FloatingGun.h"
 #include "plugin/FrikBridge.h"
 #include "plugin/FrikBridgeApi.h"
+#include "plugin/Gestures.h"
+#include "plugin/Haptics.h"
 #include "plugin/Settings.h"
 #include "xr/XrRuntime.h"
 
@@ -46,6 +49,25 @@ namespace fo4flatvr::frikbridge
         std::atomic<FO4FlatVR_FrameCallback>    g_frameCb{ nullptr };
         std::atomic<void*>                      g_frameCtx{ nullptr };
         std::atomic<std::uint64_t>              g_frameCalls{ 0 };
+
+        // ---- 16 Nov (user: at a terminal "the hands end up freezing in the air"): pause-time frame ----
+        // Main::OnIdle (C339D0) runs every frame; the player update (OnIdle_UpdatePlayer -> C351F3) only runs on the job threads it
+        // starts when UI::menuMode (+0x1E0) is 0 (OnIdle copies it to Main+0x1D0 at entry and then skips StartThreads), so with a
+        // pausing menu (terminal, Pause, crafting, projected Pip-Boy) FRIK-flat got no frame. FO4VR runs FRIK from OnIdle +0x27E
+        // (VR D8405E = flat C33E62, call BGSDynamicPersistenceManager::DemoteQueuedActors 338630), paused or not. Here that call
+        // site runs FRIK's frame only while paused: main thread, before this frame's StartThreads and after the previous
+        // frame's WaitForThreads (no job thread can be in FRIK's C351F3 frame), never in a frame whose player update runs
+        // (menuMode != 0 at that point = no StartThreads in this OnIdle) and only if C351F3 did not run since the last check.
+        // [FRIK] bPausedFrame=0 = old behaviour (no FRIK frame while paused).
+        constexpr std::uintptr_t   kIdleCallSite = 0xC33E62;
+        constexpr std::uintptr_t   kDemoteQueuedActors = 0x338630;
+        using Demote_t = void (*)(void*);
+        Demote_t                   g_origDemote = nullptr;
+        bool                       g_idleHooked = false;
+        std::string                g_idleWhy = "not installed";
+        std::atomic<bool>          g_pausedFrame{ true };
+        std::atomic<std::uint64_t> g_pausedCalls{ 0 }, g_pausedSkipStall{ 0 };
+        std::uint64_t              g_lastSeenFrameCalls = 0;  // main thread only
 
         // ---- v3: camera offset (FRIK smooth movement) ----
         std::atomic<FO4FlatVR_CameraOffsetCallback> g_camCb{ nullptr };
@@ -116,6 +138,33 @@ namespace fo4flatvr::frikbridge
                 }
             }
             return r;
+        }
+
+        void HkIdleDemote(void* a_mgr)
+        {
+            g_origDemote(a_mgr);
+            const std::uint64_t calls = g_frameCalls.load(std::memory_order_acquire);
+            const bool          stalled = calls == g_lastSeenFrameCalls;  // no C351F3 frame since the previous OnIdle
+            g_lastSeenFrameCalls = calls;
+            if (!g_pausedFrame.load(std::memory_order_relaxed) || g_cbSkip.load(std::memory_order_relaxed)) {
+                return;
+            }
+            const auto cb = g_frameCb.load(std::memory_order_acquire);
+            auto* ui = cb ? RE::UI::GetSingleton() : nullptr;
+            if (!ui || ui->menuMode == 0) {
+                return;  // not paused: this frame's player update calls FRIK at C351F3
+            }
+            if (!stalled) {
+                ++g_pausedSkipStall;  // first paused frame: the previous OnIdle still ran the player update
+                return;
+            }
+            // not while a game loads (the player's 3D is rebuilt then; FRIK never ran there on flat) or at the main menu
+            static const RE::BSFixedString s_loading("LoadingMenu"), s_main("MainMenu");
+            if (ui->GetMenuOpen(s_loading) || ui->GetMenuOpen(s_main)) {
+                return;
+            }
+            ++g_pausedCalls;
+            cb(g_frameCtx.load(std::memory_order_relaxed));  // FRIK-flat's frame (it catches its own exceptions)
         }
 
         // window report + reset: frames, interval mean/p50/p95/max ms, callback mean/max us
@@ -224,10 +273,26 @@ namespace fo4flatvr::frikbridge
             return 1;
         }
 
-        void Vibrate(std::int32_t, float, float)
+        void Vibrate(std::int32_t a_hand, float a_amplitude, float a_seconds)
         {
-            // First build: no path from here to xr::Runtime::Vibrate (the runtime lives in Presenter). Counted only.
+            // 16 Nov: played through the haptics queue (Haptics.h; the Presenter drains it on the XR thread)
             ++g_vibrateRequests;
+            haptics::RequestFrik(a_hand, a_amplitude, a_seconds);
+        }
+
+        // v4: VRIK-style selfie request from the gestures (Gestures.h)
+        std::uint8_t GetSelfie(FO4FlatVR_Selfie* a_out)
+        {
+            if (!a_out || a_out->size < sizeof(FO4FlatVR_Selfie)) return 0;
+            const auto s = gestures::SelfieState();
+            a_out->size = sizeof(FO4FlatVR_Selfie);
+            a_out->seq = s.seq;
+            a_out->active = s.active ? 1 : 0;
+            a_out->follow = s.follow ? 1 : 0;
+            a_out->pad[0] = a_out->pad[1] = 0;
+            a_out->distanceM = s.distanceM;
+            a_out->yawRad = s.yawRad;
+            return 1;
         }
 
         // What the floating gun does while FRIK-flat's body is active (15 Nov, measured): on flat the first-person rig is a
@@ -287,8 +352,10 @@ namespace fo4flatvr::frikbridge
         }
 
         constexpr FO4FlatVR_FrikBridge kBridge{ FO4FLATVR_FRIK_BRIDGE_VERSION, 0, &GetFrame, &Vibrate, &SetFrikActive, &IniPathC, &SetFrameCallback,
-            &BodyEnabled, &SetCameraOffsetCallback };
+            &BodyEnabled, &SetCameraOffsetCallback, &GetSelfie };
     }
+
+    bool BodyActive() { return g_frikActive.load(); }
 
     void Install()
     {
@@ -308,12 +375,25 @@ namespace fo4flatvr::frikbridge
             } else {
                 REX::ERROR("[FRIK] C351F3 not hookable: {} - FRIK-flat would get no frame", g_hookWhy);
             }
+            // pause-time frame (FO4VR's OnIdle slot): the same callback while the game is paused
+            g_pausedFrame = ::GetPrivateProfileIntA("FRIK", "bPausedFrame", 1, IniPath().c_str()) != 0;
+            if (!g_pausedFrame.load()) {
+                g_idleWhy = "bPausedFrame=0";
+            } else if (callchain::Hookable(base + kIdleCallSite, base + kDemoteQueuedActors, g_idleWhy)) {
+                auto& tramp = REL::GetTrampoline();
+                if (tramp.empty()) tramp.create(64);
+                g_origDemote = reinterpret_cast<Demote_t>(tramp.write_call<5>(base + kIdleCallSite, &HkIdleDemote));
+                g_idleHooked = true;
+            } else {
+                REX::ERROR("[FRIK] C33E62 not hookable: {} - FRIK-flat gets no frame while the game is paused", g_idleWhy);
+            }
         } else {
             g_hookWhy = en ? "bBody=0 (smooth movement only)" : "bEnable=0";
         }
         REX::INFO("[FRIK] bridge v{}: bEnable={} bBody={} bSmoothMovement={} bSmoothHorizontal={} (FRIK.dll {}), unitsPerMeter={}, frame hook C351F3 {} ({})",
             FO4FLATVR_FRIK_BRIDGE_VERSION, en ? 1 : 0, g_body.load() ? 1 : 0, g_smooth.load() ? 1 : 0, g_smoothXY.load() ? 1 : 0,
             ::GetModuleHandleW(L"FRIK.dll") ? "loaded" : "not loaded", g_unitsPerMeter, g_hooked ? "ok" : "not installed", g_hookWhy);
+        REX::INFO("[FRIK] paused frame (C33E62, FO4VR's OnIdle slot; [FRIK] bPausedFrame): {} ({})", g_idleHooked ? "on" : "off", g_idleWhy);
         if (g_frikActive.load()) {
             ApplyGunRole(true);
         }
@@ -406,23 +486,29 @@ namespace fo4flatvr::frikbridge
         } else if (a_arg == "cb off" || a_arg == "cb on") {
             g_cbSkip = a_arg == "cb off";
             REX::INFO("[FRIK] pipe: FRIK.dll frame callback {}", g_cbSkip.load() ? "skipped (body frozen; perf A/B)" : "running");
+        } else if (a_arg == "paused on" || a_arg == "paused off") {
+            g_pausedFrame = a_arg == "paused on";
+            REX::INFO("[FRIK] pipe: paused frame {}", g_pausedFrame.load() ? "on" : "off");
         } else if (!a_arg.empty() && a_arg != "status") {
-            return "error: frik [status|smooth on|off|smooth xy on|off|reset|perf|cb on|off]";
+            return "error: frik [status|smooth on|off|smooth xy on|off|reset|perf|cb on|off|paused on|off]";
         }
         return std::format("frik v={} enable={} body={} smooth={} xy={} frikdll={} camcb={} steps={} valid={} off=({:.3f},{:.3f},{:.3f}) maxz={:.3f} "
-                           "maxxy={:.3f} framecb={} frames={} active={}",
+                           "maxxy={:.3f} framecb={} frames={} active={} paused={}/{} pausedFrames={} pausedSkipFirst={}",
             FO4FLATVR_FRIK_BRIDGE_VERSION, Enabled() ? 1 : 0, g_body.load() ? 1 : 0, g_smooth.load() ? 1 : 0, g_smoothXY.load() ? 1 : 0,
             ::GetModuleHandleW(L"FRIK.dll") ? 1 : 0, g_camCb.load() ? 1 : 0, g_camSteps.load(), g_camValidSteps.load(),
             g_camX.load(), g_camY.load(), g_camZ.load(), g_camMaxAbsZ.load(), g_camMaxAbsXY.load(), g_frameCb.load() ? 1 : 0,
-            g_frameCalls.load(), g_frikActive.load() ? 1 : 0);
+            g_frameCalls.load(), g_frikActive.load() ? 1 : 0, g_idleHooked ? 1 : 0, g_pausedFrame.load() ? 1 : 0, g_pausedCalls.load(),
+            g_pausedSkipStall.load());
     }
 }
 
 extern "C" __declspec(dllexport) const FO4FlatVR_FrikBridge* FO4FLATVR_GetFrikBridge(std::uint32_t a_version)
 {
     using namespace fo4flatvr::frikbridge;
-    if (a_version != FO4FLATVR_FRIK_BRIDGE_VERSION) {
-        REX::WARN("[FRIK] FRIK.dll asked for bridge v{}, have v{}: FRIK-flat stays dormant", a_version, FO4FLATVR_FRIK_BRIDGE_VERSION);
+    // v4 appends GetSelfie: a v3 FRIK.dll gets the same table (it never reads past v3's fields)
+    if (a_version < FO4FLATVR_FRIK_BRIDGE_MIN_VERSION || a_version > FO4FLATVR_FRIK_BRIDGE_VERSION) {
+        REX::WARN("[FRIK] FRIK.dll asked for bridge v{}, have v{}..v{}: FRIK-flat stays dormant", a_version, FO4FLATVR_FRIK_BRIDGE_MIN_VERSION,
+            FO4FLATVR_FRIK_BRIDGE_VERSION);
         return nullptr;
     }
     if (!Enabled()) {

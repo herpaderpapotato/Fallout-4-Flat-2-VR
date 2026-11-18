@@ -8,6 +8,7 @@
 #include "plugin/Dialogue.h"
 #include "plugin/GameBridge.h"
 #include "plugin/GameHud.h"
+#include "plugin/GameMenuPointer.h"
 #include "plugin/GamePipboy.h"
 #include "plugin/PipboyLayer.h"
 #include "plugin/HudLayer.h"
@@ -197,6 +198,10 @@ namespace fo4flatvr
             hud::SetMenuPreviewEnabled(g_settings.menuPanelPreview);  // crafting / container menus: 3D preview onto the panel
             hud::SetClearMenuTargets(g_settings.menuClearTargets);  // pause-menu decal on the HUD layer
             hud::SetClearHudTargets(g_settings.hudClearTargets);    // lingering HUD elements (pickup text, HIDDEN)
+            // round 7: bWristPipboy=0 + [Pipboy] bProjected=1 = FO4VR's projected Pip-Boy (same capture/hooks as bFloating)
+            if (!g_settings.wristPipboy && g_settings.pipboyProjected) {
+                g_settings.pipboyFloating = true;
+            }
             if (g_settings.separateHud || g_settings.wristPipboy || g_settings.paProjectedPipboy || dlg::GetConfig().panel ||
                 g_settings.menuPanel || g_settings.pipboyFloating) {
                 // H1 is shared with the wrist Pip-Boy; with bSeparateHud=0 the HUD hooks only pass through.
@@ -224,13 +229,24 @@ namespace fo4flatvr
             pc.projHeightMeters = g_settings.paPipboyHeightMeters;
             pc.projWidthMeters = g_settings.paPipboyWidthMeters;
             pc.projFollowSeconds = g_settings.paPipboyFollowSeconds;
-            pc.floating = g_settings.pipboyFloating;  // [Pipboy] bFloating: FO4VR projected Pip-Boy outside power armour too
+            pc.floating = g_settings.pipboyFloating;  // [Pipboy] bFloating, or bWristPipboy=0 + bProjected=1 (round 7)
+            pc.floatWidthMeters = g_settings.pipboyProjWidthMeters;
+            pc.floatDistanceMeters = g_settings.pipboyProjDistanceMeters;
+            pc.floatHeightMeters = g_settings.pipboyProjHeightMeters;
+            pc.lagConeDeg = g_settings.pipboyProjLagConeDeg;
+            pc.noScanlines = g_settings.pipboyProjNoScanlines;
             pipboy::Configure(pc);
             if (g_settings.wristPipboy || g_settings.paProjectedPipboy || g_settings.pipboyFloating) {
                 game::InstallPipboyHooks();
+                REX::INFO("Pip-Boy: {} (bWristPipboy={} bProjected={} bFloating effective={})",
+                    g_settings.pipboyFloating ? "FO4VR projected screen in front of you" : "wrist", g_settings.wristPipboy ? 1 : 0,
+                    g_settings.pipboyProjected ? 1 : 0, g_settings.pipboyFloating ? 1 : 0);
             } else {
-                REX::INFO("wrist Pip-Boy off (bWristPipboy=0): no Pip-Boy hooks installed");
+                REX::INFO("Pip-Boy: the game's own (bWristPipboy=0, bProjected=0): no Pip-Boy hooks installed");
             }
+            game::SetWorldScreenEnabled(g_settings.menuTerminalInWorld);
+            REX::INFO("terminals: {}", g_settings.menuTerminalInWorld ? "on their own monitor in the live world (FO4VR; [Menus] bTerminalInWorld=1)"
+                                                                       : "flat window ([Menus] bTerminalInWorld=0)");
         }
 
         // Menu laser pointer (D2): no code patches (Scaleform events from an F4SE UI task); off-switch = inactive.

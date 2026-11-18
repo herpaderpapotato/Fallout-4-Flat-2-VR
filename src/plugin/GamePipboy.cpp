@@ -1,6 +1,7 @@
 #include "plugin/GamePipboy.h"
 #include "plugin/GameBridge.h"
 #include "plugin/GameHud.h"
+#include "plugin/GameMenuPointer.h"
 #include "plugin/PipboyLayer.h"
 
 #include <atomic>
@@ -38,6 +39,8 @@ namespace fo4flatvr::game
         constexpr std::uintptr_t kRenderEffect = 0x2185610;
         constexpr std::uintptr_t kPageIndex = 0x3287638;          // PipboyMenu current page (0 STAT .. 4 RADIO)
         constexpr std::uintptr_t kTabPerPage = 0x3287640;         // u32[5]: current tab per page
+        constexpr std::uintptr_t kRendererGetByName = 0xA3A770;   // Interface3D::Renderer::GetByName(const BSFixedString&)
+        bool                     g_getByNameOk = false;
 
         // PipboyManager fields (flat 1.11.240; same as 1.10 decompiles)
         constexpr std::size_t kMenuToOpen = 0x190, kOpenAnimEvent = 0x198, kCloseAnimEvent = 0x1A0;
@@ -175,6 +178,16 @@ namespace fo4flatvr::game
             if (pipboy::GetConfig().stopImod) {
                 Fn<ImodStop_t>(kImodStop)(reinterpret_cast<const void*>(Base() + kStrImodPipboy));
             }
+            // round 7: FO4VR's projected screen has no scanlines (VR EnablePipboyShader C34EC0: QPipboyEffectControl()+0x40 = 0
+            // when projected; flat B51F00 sets it = !inPowerArmor). Renderer "PipboyMenu" +0xBC = effect control (1.11 A3B420).
+            if (projected && !g_projectedPa && pipboy::GetConfig().noScanlines && g_getByNameOk) {
+                using GetByName_t = std::uint8_t* (*)(const RE::BSFixedString&);
+                static const RE::BSFixedString kPip("PipboyMenu");
+                if (auto* r = Fn<GetByName_t>(kRendererGetByName)(kPip)) {
+                    r[0xBC + 0x40] = 0;
+                    REX::INFO("pipboy: projected screen without scanlines (FO4VR)");
+                }
+            }
             ++g_directOpens;
             if (projected) {
                 ++g_projectedOpens;
@@ -273,7 +286,10 @@ namespace fo4flatvr::game
             if (!ui || evs.empty()) {
                 return;
             }
-            const auto menu = ui->GetMenu("PipboyMenu");
+            // round 7: a terminal without a terminal ref (holotape terminal) is drawn on the Pip-Boy screen (TerminalMenu::InitMenu
+            // renderer = PipboyManager::Get3DRendererName; FO4VR VR_ShowTerminalOnPipboy C33C60): the pointer goes to it then
+            const bool toTerminal = MenuUsesRenderer("TerminalMenu", "PipboyMenu");
+            const auto menu = ui->GetMenu(toTerminal ? "TerminalMenu" : "PipboyMenu");
             if (!menu || !menu->uiMovie) {
                 g_dropped += evs.size();
                 return;
@@ -377,6 +393,10 @@ namespace fo4flatvr::game
         bool calledOk = true;
         for (const auto& c : kCalled) {
             calledOk = BytesMatch(c.rva, c.b, sizeof(c.b), c.what) && calledOk;
+        }
+        {
+            static constexpr std::uint8_t kGbn[] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x30 };
+            g_getByNameOk = BytesMatch(kRendererGetByName, kGbn, sizeof(kGbn), "Interface3D::Renderer::GetByName");  // projected: no scanlines
         }
         if (!calledOk && (g_o1 || g_o2)) {
             // Should not happen with matching prologues; the hooks would call into unknown code. Leave them

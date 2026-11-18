@@ -44,4 +44,10 @@ namespace fo4flatvr::game
 
     // Diagnostics: H1/H2/C1 call counts.
     std::string HudHookStats();
+
+    // HUDFramework widget guard (analysis/mod-edi-hudframework.md, [HUD] bHudFrameworkFix=1): every Present (hud::OnPresent),
+    // at most once a second queues a UI task that checks HUDFramework's widget container maps to the HUD stage, corrects it
+    // if not, and logs the widget layout on change ("hudfw:"). No-op without HUDFramework. Status: pipe "hud fw".
+    void        HudFrameworkTick();
+    std::string HudFrameworkStatus();
 }

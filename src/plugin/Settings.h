@@ -1,6 +1,8 @@
 #pragma once
 // Data/F4SE/Plugins/fo4flatvr.ini. Plain Win32 profile API: no extra dependency, re-readable.
 
+#include <array>
+#include <map>
 #include <string>
 
 namespace fo4flatvr
@@ -34,8 +36,13 @@ namespace fo4flatvr
         float       quadWidthMeters{ 3.0f };
         float       quadDistanceMeters{ 2.5f };
         float       quadHeightMeters{ 0.0f };
-        int         recenterKey{ 0x78 };    // VK_F9
+        int         recenterKey{ 0x77 };    // VK_F8 (round 8: was F9 = the game's Quickload)
         int         toggleKey{ 0x79 };      // VK_F10: pause/resume VR submission
+        // Round 8 hotkeys (keyboard only; only while the game window has focus). Checked free against Fallout 4's ControlMap
+        // (F5 Quicksave, F9 Quickload, F1/F4/F6/F12 in debug/menu contexts), Steam (F12), AAF (Home/Delete/End/PgUp/PgDn,
+        // F11 quickscene), OCBP/LPCE (F7), SAM (;), MCM keybinds in this MO2 setup (numpad, ;, \, ').
+        int         cameraCycleKey{ 0x71 };  // [Keys] iCameraCycle (VK_F2): cycle this camera state's policy SCENE/TRACK/CINEMA
+        int         povToggleKey{ 0x72 };    // [Keys] iPovToggle (VK_F3): first <-> third person (Force1st/3rdPerson)
         bool        aimWithController{ true };  // [Controllers] fire + activation ray from the aim-hand controller
         bool        leftHanded{ false };        // [Controllers] aim hand = left controller
         bool        handLineOfFire{ true };       // [Controllers] bHandLineOfFire: gun lowering / iron-sight tests from the hand
@@ -96,6 +103,36 @@ namespace fo4flatvr
         float       menuVatsLabelScale{ 2.0f }; // [Menus] fVatsLabelScale: VATS overlay magnified about the selected target (1 = off)
         bool        menuVatsNoVignette{ true }; // [Menus] bVatsNoVignette: no flat VATS VignetteMenu over the live world
         bool        pipboyFloating{ false };    // [Pipboy] bFloating: FO4VR projected Pip-Boy in front of the head instead of the wrist
+        // Round 7 (analysis/vr-terminals-pipboy.md): FO4VR's projected Pip-Boy (bAlwaysUseProjectedPipboy:VR) is what
+        // bWristPipboy=0 gives now: the PA-dash screen mesh (Interface/Objects/PADashPipboyScreen.nif + world_projectedPipBoyScreen.nif
+        // backdrop) on UprightHmdLagNode, 0.575 m wide, 0.65 m ahead, centre 0.07 m below the eyes, yaw dragged along only past a
+        // 45 deg cone (fHmdRotationLagMaxDistance:VRUI), no scanlines. 0 = the game's own flat Pip-Boy (flat window).
+        bool        pipboyProjected{ true };           // [Pipboy] bProjected
+        float       pipboyProjWidthMeters{ 0.575f };   // [Pipboy] fProjectedWidthMeters
+        float       pipboyProjDistanceMeters{ 0.65f }; // [Pipboy] fProjectedDistanceMeters
+        float       pipboyProjHeightMeters{ -0.07f };  // [Pipboy] fProjectedHeightMeters
+        float       pipboyProjLagConeDeg{ 45.0f };     // [Pipboy] fProjectedLagConeDeg (0 = old smooth follow, [PowerArmor] fPipboyFollowSeconds)
+        bool        pipboyProjNoScanlines{ true };     // [Pipboy] bProjectedNoScanlines (FO4VR: EffectControl+0x40 = 0 when projected)
+        // Round 7: terminals on their own monitor in the live world (FO4VR TerminalMenu::InitMenu), pointer via the engine pick.
+        bool        menuTerminalInWorld{ true };       // [Menus] bTerminalInWorld (0 = the flat window with the panorama)
+        // Round 7: every panel menu on its FO4VR world-space model's geometry (Pause, Container/Barter, LevelUp, Lockpicking,
+        // SleepWait, SPECIAL, Book); 0 = only the crafting menus (bWorkbenchPanelFO4VR), the rest on [Cinema].
+        bool        menuPanelFO4VR{ true };            // [Menus] bPanelGeometryFO4VR
+        float       menuPauseWidthMeters{ 1.48f };     // [Menus] fPauseWidthMeters (world_projected_MainPause.nif arc)
+        float       menuPauseDistanceMeters{ 0.78f };  // [Menus] fPauseDistanceMeters
+        float       menuPauseHeightMeters{ -0.045f };  // [Menus] fPauseHeightMeters
+        // Round 8: per-menu panel geometry override, [MenuGeometry] <MenuName>=width,distance,height (metres; height = centre
+        // offset from eye level). Wins over every built-in geometry (FO4VR models, [Cinema]). Keys are menu names as the log
+        // prints them (PauseMenu, DialogueMenu, ContainerMenu, LooksMenu, ...); lower-cased here.
+        std::map<std::string, std::array<float, 3>> menuGeometry;
+        // Round 8: the dialogue options panel (DialogueMenu, EDI) on FO4VR's dialogue band scale (world_Dialogue.nif on
+        // UprightHmdLagNode shows the options strip u 0.18..0.83, v 0.69..0.83 of the movie on a 0.85 m arc 0.55 m ahead,
+        // 0.18 m below the eyes -> the whole 16:9 movie 1.32 m wide at 0.55 m, centred at eye level).
+        float       menuDialogueWidthMeters{ 1.32f };    // [MenuGeometry] DialogueMenu (code default)
+        float       menuDialogueDistanceMeters{ 0.55f };
+        float       menuDialogueHeightMeters{ 0.0f };
+        // Round 8: menus forced onto the flat window (explicit opt-in), comma list, e.g. "LooksMenu,TerminalMenu".
+        std::string menuWindowMenus;                     // [Menus] sWindowMenus
         // [Stereo] single-pass stereo PoC (StereoPoC.h; analysis/stereo-poc-plan.md). iMode: 0 off, 1 census,
         // 2 debug-PS stereo, 3 faithful stereo, 4 identity (diagnostic). Hooks are installed iff iMode != 0
         // or bInstallHooks=1 (lets the pipe switch modes at runtime).

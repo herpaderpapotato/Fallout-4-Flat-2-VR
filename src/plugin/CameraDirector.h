@@ -23,6 +23,7 @@
 // then TRACK with translation = the free camera's + head offset, rotation = Rz(free-camera yaw) x head (pitch dropped),
 // blinks on position/yaw cuts, a black hold over game-driven glides, and a fade grace for the brief third-person state.
 
+#include <cstdint>
 #include <string>
 
 namespace fo4flatvr::camdir
@@ -68,6 +69,9 @@ namespace fo4flatvr::camdir
     // While set, FADE_SNAP counts as CINEMA (no black hold behind / over the window; any running fade episode ends at
     // once). Round 4: the workbench camera's Transition/Animated states held 5 s of black over the cooking menu.
     void SetMenuWindow(bool a_on);
+    // Director post-ticks so far (every TESCamera::Update of the player camera, any state). UI round 8: the paused-camera
+    // driver's stall test outside first person (a game-pausing menu over a SCENE / third-person / furniture camera).
+    std::uint64_t Ticks();
 
     // Pipe "camdir [on|off|policy <state> <policy>|fadetest [holdMs]|table]".
     std::string Command(const std::string& a_arg);

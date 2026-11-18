@@ -41,6 +41,15 @@ namespace fo4flatvr::pipboy
         // FO4VR bAlwaysUseProjectedPipboy:VR (VR_UseProjectedPipboy C325E0): the projected screen outside power armour too.
         bool  floating{ false };            // [Pipboy] bFloating: open directly, screen floating in front of the head (projected
                                             //   placement above); the game pauses as with the flat PipboyMenu (kPausesGame)
+        // Round 7: the projected screen outside power armour on FO4VR's geometry (PADashPipboyScreen.nif "Screen:0" on
+        // UprightHmdLagNode, fProjected_Pipboy_* = 0 / scale 1: 40.25 u x 31.1 u, 39.3..45.8 u ahead, centre -4.8 u).
+        float floatWidthMeters{ 0.575f };    // [Pipboy] fProjectedWidthMeters
+        float floatDistanceMeters{ 0.65f };  // [Pipboy] fProjectedDistanceMeters
+        float floatHeightMeters{ -0.07f };   // [Pipboy] fProjectedHeightMeters
+        // UprightHmdLagNode (PlayerCharacter::UpdateVRUI EF7180): position = the HMD, yaw dragged along only when the head
+        // turns further than fHmdRotationLagMaxDistance:VRUI (45 deg) from it (with a Pip-Boy open FO4VR never re-centres it).
+        float lagConeDeg{ 45.0f };           // [Pipboy] fProjectedLagConeDeg (0 = smooth follow with projFollowSeconds)
+        bool  noScanlines{ true };           // [Pipboy] bProjectedNoScanlines (FO4VR EnablePipboyShader C34EC0: EffectControl+0x40 = 0)
     };
 
     void          Configure(const Config& a_cfg);

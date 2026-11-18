@@ -3,7 +3,9 @@
 #include <RE/Fallout.h>
 
 #include "plugin/ControllerBindings.h"
+#include "plugin/Dialogue.h"
 #include "plugin/GameBridge.h"
+#include "plugin/Gestures.h"
 #include "plugin/Settings.h"
 #include "xr/XrRuntime.h"
 
@@ -237,6 +239,7 @@ namespace fo4flatvr::bindings
             unsigned          actByHand[2]{}, actWaitTimeouts{ 0 };
             double            actLastWaitMs{ 0 };
             Pulse    reload, pause, light, sneak, favorites;
+            QlNav    dlgY, dlgX;  // EDI dialogue list: primary stick Y -> D-pad up/down, X -> D-pad right/left
             bool     clickUsedForHolster{ false };
             bool     holster{ false };
             StickDir up, down;
@@ -274,6 +277,35 @@ namespace fo4flatvr::bindings
                 g_dlgFace = e;
                 REX::INFO("bindings: dialogue face buttons {}", e ? "A/B/X/Y -> pad A/B/X/Y (the 4 options as labelled)"
                                                                    : "off ([Controllers] bDialogueFaceButtons=0: A/X -> A, grip -> B)");
+            }
+            return e != 0;
+        }
+
+        // [Controllers] bDialogueListNav (default 1), only while Extended Dialogue Interface (XDI.dll) is loaded: EDI
+        // replaces DialogueMenu.swf with a scrolling option list. Its gamepad mode (DialogueMenu.ProcessUserEvent) moves
+        // the highlight on QuickkeyUp/Down (pad D-pad up/down; QuickkeyLeft/Right step value entries) and picks the
+        // highlighted option on MultiActivateA release; B/X/Y are not options there. See analysis/mod-edi-hudframework.md.
+        std::atomic<int>  g_dlgListNav{ -1 };
+        std::atomic<int>  g_edi{ -1 };  // XDI.dll loaded (-1 = not checked yet)
+        std::atomic<bool> g_dlgListNavActive{ false };
+        bool DialogueListNavOn()
+        {
+            int e = g_dlgListNav.load();
+            if (e < 0) {
+                e = ::GetPrivateProfileIntA("Controllers", "bDialogueListNav", 1, Settings::Path().c_str()) != 0 ? 1 : 0;
+                g_dlgListNav = e;
+            }
+            return e != 0;
+        }
+        bool EdiLoaded()
+        {
+            int e = g_edi.load();
+            if (e < 0) {  // F4SE plugins are loaded before the first conversation; checked once, on the first one
+                e = ::GetModuleHandleW(L"XDI.dll") ? 1 : 0;
+                g_edi = e;
+                REX::INFO("bindings: Extended Dialogue Interface (XDI.dll) {}; dialogue list navigation {}", e ? "loaded" : "not loaded",
+                    !e ? "not used" : DialogueListNavOn() ? "on (primary stick -> D-pad steps, trigger off the panel = A, pointer targets DialogueMenu)"
+                                                          : "off ([Controllers] bDialogueListNav=0)");
             }
             return e != 0;
         }
@@ -317,6 +349,9 @@ namespace fo4flatvr::bindings
 
     void Map(const xr::ControllerState& c, const Context& a, pad::State& p)
     {
+        // VR gestures (Gestures.h, 16 Nov): stick click + hand motion / both hands up, before the sticks are mapped
+        const bool gestureWorld = Enabled() ? InWorld(Detect(a)) : a.worldView;
+        gestures::Update({ &c, a.head, gestureWorld, a.camState, a.leftHanded });
         if (!Enabled()) {
             MapGeneric(c, a, p);
             return;
@@ -326,9 +361,10 @@ namespace fo4flatvr::bindings
         // roles: primary (weapon) hand P, off hand O; lower face button (A/X) and upper (B/Y) per hand
         const float pTrig = L ? c.leftTrigger : c.rightTrigger, oTrig = L ? c.rightTrigger : c.leftTrigger;
         const float pGripV = L ? c.leftGrip : c.rightGrip, oGripV = L ? c.rightGrip : c.leftGrip;
-        const float psx = L ? c.leftStickX : c.rightStickX, psy = L ? c.leftStickY : c.rightStickY;
-        const float osx = L ? c.rightStickX : c.leftStickX, osy = L ? c.rightStickY : c.leftStickY;
-        const bool  psClick = L ? c.leftStickClick : c.rightStickClick, osClick = L ? c.rightStickClick : c.leftStickClick;
+        float       psx = L ? c.leftStickX : c.rightStickX, psy = L ? c.leftStickY : c.rightStickY;
+        float       osx = L ? c.rightStickX : c.leftStickX, osy = L ? c.rightStickY : c.leftStickY;
+        const bool  psClick = L ? c.leftStickClick : c.rightStickClick;
+        bool        osClick = L ? c.rightStickClick : c.leftStickClick;
         const bool  pLower = L ? c.x : c.a, pUpper = L ? c.y : c.b;  // A, B (right-handed)
         const bool  oLower = L ? c.a : c.x, oUpper = L ? c.b : c.y;  // X, Y (right-handed)
         const bool  trigOn = pTrig > 0.6f, oTrigOn = oTrig > 0.6f;
@@ -337,6 +373,14 @@ namespace fo4flatvr::bindings
         State&     s = g_s;
         QcEnsureSink(now);
         const Ctx  ctx = Detect(a);
+        if (InWorld(ctx)) {
+            // gestures: a gesture stick's own jobs (turn / jump / sneak, move) are held while its click is down and until it
+            // is back in the dead zone; the off hand's click (sprint) reaches the game only after the VRIK button delay
+            const int pPhys = L ? 0 : 1, oPhys = 1 - pPhys;
+            if (gestures::StickHeld(pPhys)) psx = psy = 0.0f;
+            if (gestures::StickHeld(oPhys)) osx = osy = 0.0f;
+            osClick = gestures::ClickToGame(oPhys, osClick);
+        }
         const bool ctxChanged = ctx != s.ctx && !(InWorld(ctx) && InWorld(s.ctx));  // gameplay <-> quick loot keeps tap/hold state
         if (ctx == Ctx::QuickLoot && s.ctx != Ctx::QuickLoot) ++s.qlEntries;
         s.ctx = ctx;
@@ -354,6 +398,15 @@ namespace fo4flatvr::bindings
             s.holster = false;
         }
         p.start = c.menu;  // Touch left menu button (FO4VR: SteamVR dashboard) -> pause, as before
+        const bool listNav = ctx == Ctx::Dialogue && DialogueListNavOn() && EdiLoaded();
+        if (!listNav) {
+            s.dlgY.Update(false, 0.0f, 0.0f, now);
+            s.dlgX.Update(false, 0.0f, 0.0f, now);
+        }
+        if (listNav != g_dlgListNavActive.load()) {
+            g_dlgListNavActive = listNav;
+            REX::INFO("bindings: EDI dialogue list navigation {}", listNav ? "active" : "inactive");
+        }
 
         switch (ctx) {
         case Ctx::Gameplay:
@@ -427,13 +480,13 @@ namespace fo4flatvr::bindings
             }
             p.dpadDown = s.ql.Down(now);                    // quick-loot list down / up
             const bool qlUp = s.ql.Up(now);
-            // primary stick click + primary grip = holster (hold X); stick click alone = favorites (D-pad)
-            // (favorites fires on the click's release unless the grip was pressed during it)
+            // primary stick click + primary grip = holster (hold X). 16 Nov (user): the stick click alone no longer opens
+            // FavoritesMenu (D-pad up); the click is the gesture button now (Gestures.h)
             if (pClickPressed) s.clickUsedForHolster = false;
             if (pGripPressed && s.pStickClick.down) s.holster = true, s.clickUsedForHolster = true;
             if (s.holster) s.pGrip.heldFired = true;  // the grip release after a holster is not a reload
             if (!s.pGrip.down) s.holster = false;
-            if (pClickReleased && !s.clickUsedForHolster) s.favorites.Fire(now, 150);
+            (void)pClickReleased;
             p.x = s.holster || s.transfer.On(now);
             p.dpadUp = s.favorites.On(now) || qlUp;
             // primary grip: tap = reload (X tap), hold >= 350 ms = grenade (RB held until release)
@@ -516,6 +569,21 @@ namespace fo4flatvr::bindings
                 p.a = pLower || oLower;
                 p.b = s.pGrip.down || s.oGrip.down;
             }
+            if (listNav) {
+                // EDI: the primary stick steps the option list (one D-pad pulse per push, repeat while held) instead of
+                // looking around; the trigger accepts the highlighted option when the pointer is not on the panel (on
+                // the panel it is the pointer's click: hover highlights, click picks). Steps only while the options are
+                // up: between lines EDI hides its list and re-enables favorites, where the D-pad would be a quick key.
+                const bool pick = dlg::CanPick();
+                s.dlgY.Update(pick, psy, psx, now);
+                s.dlgX.Update(pick, psx, psy, now);
+                p.dpadUp = s.dlgY.Up(now);
+                p.dpadDown = s.dlgY.Down(now);
+                p.dpadRight = s.dlgX.Up(now);
+                p.dpadLeft = s.dlgX.Down(now);
+                p.rx = p.ry = 0.0f;
+                p.a = p.a || (trigOn && !a.menuPointerOnQuad);
+            }
             break;
         }
         case Ctx::Menu:
@@ -566,6 +634,8 @@ namespace fo4flatvr::bindings
         }
     }
 
+    bool DialogueListNavActive() { return g_dlgListNavActive.load(std::memory_order_relaxed) && dlg::Open(); }
+
     std::string Command(const std::string& a_arg)
     {
         std::istringstream is(a_arg);
@@ -588,6 +658,8 @@ namespace fo4flatvr::bindings
                            "| activate hand={} pressesPrimary={} pressesOff={} pending={} lastWaitMs={:.1f} waitTimeouts={} {}",
             Enabled() ? 1 : 0, g_s.lastText, n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7], n[8], n[9], n[10], n[11], n[12], n[13], n[14], n[15],
             g_s.actHand == 1 ? "off" : "primary", g_s.actByHand[0], g_s.actByHand[1], g_s.actPending ? 1 : 0, g_s.actLastWaitMs, g_s.actWaitTimeouts,
-            QuickLootText());
+            QuickLootText()) +
+               std::format(" | dialogue edi={} listNavSwitch={} listNav={} steps up={} down={} right={} left={}", g_edi.load(), g_dlgListNav.load(),
+                   g_dlgListNavActive.load() ? 1 : 0, g_s.dlgY.up, g_s.dlgY.down, g_s.dlgX.up, g_s.dlgX.down);
     }
 }

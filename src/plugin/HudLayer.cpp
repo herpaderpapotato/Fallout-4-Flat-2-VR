@@ -857,6 +857,7 @@ float4 ps(float4 pos : SV_Position) : SV_Target
         g_menuCompValid = false;
         g_pvB.fresh = g_pvW.fresh = false;
         g_layerActive = a_layerNext && g_enabled.load() && game::HudHooksInstalled();
+        game::HudFrameworkTick();  // HUDFramework widget guard / layout log (no-op without HUDFramework)
     }
 
     void ConfigurePowerArmor(bool a_hudOnLayer, bool a_hideRain)

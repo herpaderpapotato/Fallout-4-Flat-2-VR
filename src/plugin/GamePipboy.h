@@ -21,8 +21,9 @@
 //      offscreen 0x3D that H1 (GameHud.cpp) copies for renderer "PipboyMenu".
 //  O3  detour PipboyManager::PlayPipboyLoadHolotapeAnim (B4FB60): while a wrist Pip-Boy is open, a holotape
 //      load uses the game's own immediate branch (bool = 1: OnPipboyOpenAnim now) instead of waiting for the
-//      ActionPipboyLoadHolotape arm animation, which never plays with the arm down. The holotape menus
-//      themselves (PipboyHolotapeMenu, TerminalMenu) stay on the flat-screen fallback.
+//      ActionPipboyLoadHolotape arm animation, which never plays with the arm down. Round 7: the holotape menus
+//      themselves (PipboyHolotapeMenu; TerminalMenu without a terminal ref) draw into the Pip-Boy renderer, so they
+//      show on the wrist / projected quad (Presenter InWorldMenu); the Pip-Boy pointer then targets TerminalMenu.
 // PlayPipboyOpenTerminalAnim (B4FA70) and PlayPipboyGenericOpenAnim (B4FE10, GenericMenu) are not patched:
 // they keep the original (animated) flow.
 

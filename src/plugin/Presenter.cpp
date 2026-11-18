@@ -20,6 +20,8 @@
 #include "plugin/VatsWindow.h"
 #include "plugin/FloatingGun.h"
 #include "plugin/FrikBridge.h"
+#include "plugin/Gestures.h"
+#include "plugin/Haptics.h"
 #include "xr/XrRuntime.h"
 
 #include <Windows.h>
@@ -29,6 +31,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -59,6 +62,8 @@ namespace fo4flatvr::present
             bool        submitting{ true };
             bool        recenterDown{ false };
             bool        toggleDown{ false };
+            bool        cameraCycleDown{ false };  // round 8 hotkeys
+            bool        povToggleDown{ false };
 
             std::atomic<std::uint64_t> frames{ 0 };
             std::atomic<std::uint64_t> xrFrames{ 0 };
@@ -89,6 +94,10 @@ namespace fo4flatvr::present
             bool          workbenchGeometry{ false };  // round 6: the last anchor used FO4VR's workbench panel geometry
             bool          workshopOnHand{ false };     // round 6: the WorkshopMenu panel follows the off-hand grip this frame
             std::uint64_t workshopHandFrames{ 0 };
+            // round 7: a terminal on its own monitor in the live world (FO4VR), "" = none; panel geometry source of the last anchor
+            std::string   worldScreen;
+            std::uint64_t worldScreenFrames{ 0 };
+            const char*   panelGeometry{ "cinema" };
             double   periodMs{ 0.0 };
             bool     frameOpen{ false };          // an XR frame was begun at the previous Present
             bool     hudLayer{ false };           // D1: the next frame's HUD goes to its own layer
@@ -433,9 +442,21 @@ namespace fo4flatvr::present
         // UprightHmdLagNode, world still rendered behind). Their FlatScreenModel output is copied (GameHud H1) and left
         // out of the world image (H2). Eligible = drawn entirely by FlatScreenModel, camera not taken, world behind, no
         // screen-space 3D preview (game::PanelEligible). Any other view-taking menu keeps the flat-screen fallback.
+        // Round 8: [Menus] sWindowMenus - menus the user opts into the flat window (",name,name," lower-case; set in VrFrame)
+        std::string g_windowList;
+        bool WindowOptIn(const char* a_name)
+        {
+            if (!a_name || g_windowList.size() < 3) {
+                return false;
+            }
+            std::string k = "," + std::string(a_name) + ",";
+            for (auto& ch : k) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            return g_windowList.find(k) != std::string::npos;
+        }
+
         bool IsPanelMenu(const char* a_name)
         {
-            return game::PanelEligible(a_name);
+            return !WindowOptIn(a_name) && game::PanelEligible(a_name);
         }
 
         // Crafting menus (WorkbenchMenuBase family; FO4VR renders them all through WSWorkbenchModel) + their exit prompt.
@@ -443,6 +464,85 @@ namespace fo4flatvr::present
         {
             return a_name == "CookingMenu" || a_name == "ExamineMenu" || a_name == "PowerArmorModMenu" || a_name == "RobotModMenu" ||
                    a_name == "ExamineConfirmMenu";
+        }
+
+        // Round 7 (analysis/vr-terminals-pipboy.md): view-taking menus that FO4VR shows in the live world and so do we, without
+        // the flat window: a furniture terminal on its own monitor (game::WorldScreenMenu; FO4VR TerminalMenu::InitMenu BDFBF0),
+        // and Pip-Boy screen content while the Pip-Boy is open directly (wrist / projected): holotape games draw into the
+        // Pip-Boy renderer (PipboyManager::AddMenuToPipboy), a terminal without a terminal ref too (InitMenu: renderer
+        // PipboyManager::Get3DRendererName), so they are on the Pip-Boy quad.
+        bool InWorldMenu(const char* a_name)
+        {
+            if (!a_name || WindowOptIn(a_name)) {
+                return false;
+            }
+            if (game::WorldScreenMenu(a_name)) {
+                return true;
+            }
+            if (game::PipboyWristOpen()) {
+                if (_stricmp(a_name, "PipboyHolotapeMenu") == 0) {
+                    return true;
+                }
+                if (_stricmp(a_name, "TerminalMenu") == 0 && game::MenuUsesRenderer("TerminalMenu", "PipboyMenu")) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        bool PanelOrWorldMenu(const char* a_name)
+        {
+            return IsPanelMenu(a_name) || InWorldMenu(a_name);
+        }
+
+        // FO4VR's world-space menu model per menu (WS*Model ctors read in Ghidra, meshes measured; analysis/vr-terminals-pipboy.md
+        // section 3), as the flat stand-in quad: width = arc length, distance from the head, centre height (m). All these models
+        // hang on UprightHmdLagNode with identity placement settings (f<Menu>X/Y/Z/Pitch = 0, scale 1; LevelUp scale 2).
+        // false = the [Cinema] geometry.
+        bool Fo4vrPanelGeometry(const State& s, const std::string& a_name, float& a_w, float& a_d, float& a_h, const char*& a_src)
+        {
+            const float ww = s.settings.menuWorkbenchWidthMeters, wd = s.settings.menuWorkbenchDistanceMeters, wh = s.settings.menuWorkbenchHeightMeters;
+            {
+                // round 8: [MenuGeometry] <MenuName>=width,distance,height wins over everything
+                std::string key = a_name;
+                for (auto& ch : key) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                if (const auto it = s.settings.menuGeometry.find(key); it != s.settings.menuGeometry.end()) {
+                    a_w = it->second[0], a_d = it->second[1], a_h = it->second[2], a_src = "[MenuGeometry]";
+                    return true;
+                }
+            }
+            if (a_name == "DialogueMenu" && s.settings.menuPanelFO4VR) {  // round 8: FO4VR dialogue band scale (world_Dialogue.nif)
+                a_w = s.settings.menuDialogueWidthMeters, a_d = s.settings.menuDialogueDistanceMeters, a_h = s.settings.menuDialogueHeightMeters;
+                a_src = "dialogue (world_Dialogue.nif scale)";
+                return true;
+            }
+            if (s.settings.menuWorkbenchPanel && IsCraftingMenu(a_name)) {  // round 6: WSWorkbenchModel / WSExamineMenuModel
+                a_w = ww, a_d = wd, a_h = wh, a_src = "workbench (world_projectedMenu.nif)";
+                return true;
+            }
+            if (!s.settings.menuPanelFO4VR) {
+                return false;
+            }
+            // WSContainerModel (Container + Barter), WSLockpickingModel, WSSleepWaitModel, WSSPECIALModel: world_projectedMenu.nif
+            if (a_name == "ContainerMenu" || a_name == "BarterMenu" || a_name == "LockpickingMenu" || a_name == "SleepWaitMenu" ||
+                a_name == "SPECIALMenu") {
+                a_w = ww, a_d = wd, a_h = wh, a_src = "world_projectedMenu.nif";
+                return true;
+            }
+            if (a_name == "LevelUpMenu") {  // WSLevelUpMenuModel: world_projectedMenu.nif at fLevelUpMenuScale:VRUI = 2
+                a_w = 2.0f * ww, a_d = 2.0f * wd, a_h = 2.0f * wh, a_src = "world_projectedMenu.nif x2";
+                return true;
+            }
+            if (a_name == "PauseMenu") {  // WSPauseMenuModel: world_projected_MainPause.nif (curved, 109 deg, r ~0.78 m, -0.045 m)
+                a_w = s.settings.menuPauseWidthMeters, a_d = s.settings.menuPauseDistanceMeters, a_h = s.settings.menuPauseHeightMeters;
+                a_src = "world_projected_MainPause.nif";
+                return true;
+            }
+            if (a_name == "BookMenu") {  // WSBookMenuModel: world_projectedMenu_Flat.nif (flat 1.00 m at 0.584 m, -0.051 m)
+                a_w = 1.0f, a_d = 0.584f, a_h = -0.051f, a_src = "world_projectedMenu_Flat.nif";
+                return true;
+            }
+            return false;
         }
 
         // Reference space -> game-world orientation for the panorama: the owned heading as a yaw (camera = Rz(ownYaw) x head;
@@ -496,8 +596,19 @@ namespace fo4flatvr::present
             // Camera state and view-taking menus are tracked (and logged) even without XR so tests can
             // see transitions. World view only in first person with no such menu open.
             // Wrist Pip-Boy (D3): a directly opened PipboyMenu keeps the world view (its screen is on the hand quad).
+            if (g_windowList.empty()) {  // round 8: [Menus] sWindowMenus (once)
+                g_windowList = ",";
+                for (char ch : s.settings.menuWindowMenus) {
+                    if (ch != ' ' && ch != '\t') g_windowList += static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                }
+                g_windowList += ",";
+                if (g_windowList.size() > 2) {
+                    REX::INFO("menus opted into the flat window ([Menus] sWindowMenus): {}", s.settings.menuWindowMenus);
+                }
+            }
             const char* pipIgnore = game::PipboyWristOpen() ? "PipboyMenu" : nullptr;
-            const char* menu = game::ViewTakingMenu(pipIgnore);
+            // round 7: a terminal on its monitor / holotape content on a directly opened Pip-Boy stay in the world (InWorldMenu)
+            const char* menu = game::ViewTakingMenu(pipIgnore, &InWorldMenu);
             // Menu panel: a flat 2D menu over the live world view (only when every open view-taking menu is a panel
             // menu, the camera policy is a world view and the panel switch is on).
             const char* panel = nullptr;
@@ -507,11 +618,23 @@ namespace fo4flatvr::present
             const camdir::Policy panelPol = camdir::ViewPolicy(game::CurrentCameraState());
             if (menu && IsPanelMenu(menu) && s.mono && hud::MenuPanelEnabled() &&
                 (panelPol == camdir::Policy::kTrack || panelPol == camdir::Policy::kLock) &&
-                !game::ViewTakingMenu(pipIgnore, &IsPanelMenu)) {
+                !game::ViewTakingMenu(pipIgnore, &PanelOrWorldMenu)) {
                 panel = menu;
                 menu = nullptr;
             }
             camdir::SetMenuWindow(menu != nullptr);
+            {
+                // round 7: terminal on its own monitor in the live world (pointer target: TerminalMenu)
+                std::string ws = (!menu && !panel && s.mono && game::WorldScreenMenu("TerminalMenu")) ? "TerminalMenu" : "";
+                if (ws.empty() && !menu && !panel && s.mono && game::WorldScreenMenu("TerminalHolotapeMenu")) {
+                    ws = "TerminalHolotapeMenu";
+                }
+                if (ws != s.worldScreen) {
+                    REX::INFO("terminal in world (FO4VR: on its own monitor, live world, pointer on the screen) {} -> {}",
+                        s.worldScreen.empty() ? "-" : s.worldScreen, ws.empty() ? "-" : ws);
+                    s.worldScreen = ws;
+                }
+            }
             // Dialogue options (DialogueMenu, FlatScreenModel; not view-taking: first-person dialogue stays head-tracked) on
             // the same panel: otherwise the game draws them at the bottom centre of the double-wide stereo frame = the seam
             // between the eyes ("in my nose"). [Menus] bDialoguePanel; the [Dialogue] crop panel takes precedence if on.
@@ -569,7 +692,21 @@ namespace fo4flatvr::present
             if (KeyPressed(s.settings.recenterKey, s.recenterDown)) {
                 s.runtime.Recenter();
                 head::Recenter();
+                gestures::NoteRecentre();
                 REX::INFO("recentred");
+            }
+            {
+                // round 8 hotkeys (keyboard only, game window focused): cycle the camera state's view policy / first <-> third
+                DWORD fgPid = 0;
+                ::GetWindowThreadProcessId(::GetForegroundWindow(), &fgPid);
+                const bool focused = fgPid == ::GetCurrentProcessId();
+                const bool cyc = KeyPressed(s.settings.cameraCycleKey, s.cameraCycleDown) && focused;
+                const bool pov = KeyPressed(s.settings.povToggleKey, s.povToggleDown) && focused;
+                if (cyc || pov) {
+                    const std::string r = camdir::Command(cyc ? "cycle" : "pov");
+                    REX::INFO("hotkey {}: {}", cyc ? "camera cycle" : "pov toggle", r);
+                    game::HudMessage("VR: " + r);
+                }
             }
 
             ID3D11Texture2D* backBuffer = nullptr;
@@ -630,23 +767,27 @@ namespace fo4flatvr::present
                 if (anchor && canAnchor) {
                     // round 6: crafting menus on FO4VR's workbench panel geometry (WSWorkbenchModel = world_projectedMenu.nif
                     // on UprightHmdLagNode, analysis/vr-workbenches.md); everything else on the [Cinema] geometry
-                    const bool craft = s.settings.menuWorkbenchPanel && panelNow && IsCraftingMenu(s.lastPanel);
+                    // round 7: every panel menu on its own FO4VR model's geometry (Fo4vrPanelGeometry; [Menus] bPanelGeometryFO4VR)
+                    float      gw = 0.0f, gd = 0.0f, gh = 0.0f;
+                    const char* gsrc = "cinema";
+                    const bool craft = panelNow && Fo4vrPanelGeometry(s, s.lastPanel, gw, gd, gh, gsrc);
                     if (craft) {
-                        s.runtime.SetCinemaQuadGeometry(s.settings.menuWorkbenchWidthMeters, s.settings.menuWorkbenchDistanceMeters,
-                            s.settings.menuWorkbenchHeightMeters);
+                        s.runtime.SetCinemaQuadGeometry(gw, gd, gh);
                     } else {
                         s.runtime.SetCinemaQuadGeometry(s.settings.quadWidthMeters, s.settings.quadDistanceMeters, 0.0f);
+                        gsrc = "cinema";
                     }
                     s.workbenchGeometry = craft;
+                    s.panelGeometry = gsrc;
                     s.runtime.AnchorCinemaQuad(s.pubHead);
                     s.anchorYaw = yawOk ? headYaw : 0.0f;
                     ++s.anchors;
                     xr::Pose qp;
                     float    qw = 0.0f, qh = 0.0f;
                     s.runtime.CinemaQuadPose(qp, qw, qh);
-                    REX::INFO("menu quad anchored ({}: '{}'): head yaw {:.1f} deg pos {:.3f},{:.3f},{:.3f} -> quad centre {:.3f},{:.3f},{:.3f} {:.2f}x{:.2f} m",
+                    REX::INFO("menu quad anchored ({}: '{}'): head yaw {:.1f} deg pos {:.3f},{:.3f},{:.3f} -> quad centre {:.3f},{:.3f},{:.3f} {:.2f}x{:.2f} m geometry {}",
                         why, key, headYaw * 57.2957795f, s.pubHead.position.x, s.pubHead.position.y, s.pubHead.position.z, qp.position.x,
-                        qp.position.y, qp.position.z, qw, qh);
+                        qp.position.y, qp.position.z, qw, qh, s.panelGeometry);
                 }
                 // no head pose yet (session starting): try again next frame
                 s.quadEpisode = quadShown && (s.quadEpisode || canAnchor || !s.settings.menuAnchor);
@@ -953,8 +1094,33 @@ namespace fo4flatvr::present
             const bool pipPointer = pipboy::UpdateFrame(s.runtime, began, began && fi.headValid ? &fi.head : nullptr);  // head: projected PA Pip-Boy
             // Menu laser pointer (D2): aim ray onto the cinema quad, which shows the next frame when not in world view.
             // Menu panels use the same (anchored) cinema quad.
+            // round 7: terminal on its monitor in the world - the aim ray in the camera-local frame of the camera root on screen
+            // (relative to s.pubHead, as PublishHandRay) for the engine pick on the terminal's Screen:0
+            const bool worldScreenNow = worldView && !panelNow && !vatsWin && !s.worldScreen.empty() && s.lastMenu.empty();
+            {
+                const auto& c = s.runtime.Controllers();
+                const bool  left = s.settings.leftHanded;
+                const bool  ok = worldScreenNow && began && c.active && (left ? c.leftAimValid : c.rightAimValid) && s.pubHeadValid;
+                float       lp[3]{}, ld[3]{};
+                if (ok) {
+                    const xr::Pose& hand = left ? c.leftAim : c.rightAim;
+                    const auto&     hq = s.pubHead.orientation;
+                    const xr::Quat  inv{ -hq.x, -hq.y, -hq.z, hq.w };
+                    const xr::Vec3  p = RotXr(inv, { hand.position.x - s.pubHead.position.x, hand.position.y - s.pubHead.position.y,
+                                                        hand.position.z - s.pubHead.position.z });
+                    const xr::Vec3  d = RotXr(inv, RotXr(hand.orientation, { 0.0f, 0.0f, -1.0f }));
+                    lp[0] = p.x, lp[1] = -p.z, lp[2] = p.y;  // OpenXR -> game camera-local (X right, Y forward, Z up)
+                    ld[0] = d.x, ld[1] = -d.z, ld[2] = d.y;
+                    ++s.worldScreenFrames;
+                }
+                // the pointer targets TerminalMenu (a holotape game on the terminal takes the pad only)
+                menuptr::SetWorldScreen(ok && s.worldScreen == "TerminalMenu", "TerminalMenu", lp, ld, s.settings.unitsPerMeter);
+            }
             const bool menuPointer = menuptr::UpdateFrame(s.runtime, began, (!inputWorld || panelNow || vatsWin) && s.submitting && s.runtime.running());
             dlg::UpdateXr(s.runtime, began);  // dialogue: haptic pulse when the options appear
+            if (began) {
+                haptics::Drain(s.runtime);  // gesture pulses + FRIK-flat's Vibrate (Haptics.h)
+            }
             {
                 // VR controllers -> the game's gamepad (Fallout 4 Xbox layout). Inactive (session not
                 // focused, e.g. Quest system menu) maps to a neutral pad.
@@ -964,7 +1130,17 @@ namespace fo4flatvr::present
                 if (p.active) {
                     // FO4VR default bindings per context (ControllerBindings.h; [Controllers] bFO4VRBindings=0 = old Xbox layout)
                     // a menu panel is a menu context (pad navigation, A accept, B back), not gameplay
-                    bindings::Map(c, { inputWorld && !panelNow, game::PipboyWristOpen(), pipPointer, menuPointer, menuptr::LeftHand(), s.settings.leftHanded }, p);
+                    // round 7: a terminal on its monitor is a menu context too (stick/A/B navigate the terminal)
+                    // gestures (Gestures.h) run inside Map: they need this frame's head pose and the camera state
+                    bindings::Map(c, { inputWorld && !panelNow && !worldScreenNow, game::PipboyWristOpen(), pipPointer, menuPointer, menuptr::LeftHand(),
+                                         s.settings.leftHanded, began && fi.headValid ? &fi.head : nullptr, s.lastCamState },
+                        p);
+                    if (gestures::TakeRecentre() && s.xrOk) {
+                        s.runtime.Recenter();
+                        head::Recenter();
+                        gestures::NoteRecentre();
+                        REX::INFO("recentred (gesture)");
+                    }
                     // C8 comfort: snap/smooth turn (rx -> rs::UserTurn, rx zeroed while owned), stick direction
                     // (head / off-hand aim / body), vignette target. Off hand = left unless bLeftHanded.
                     // VR dialogue: primary stick direction -> option face button (stick zeroed while DialogueMenu is open)
@@ -974,7 +1150,7 @@ namespace fo4flatvr::present
                     cf.ly = p.ly;
                     cf.rx = p.rx;
                     // (workshop mode is walked around in: turning / stick direction stay on with its panel)
-                    cf.worldView = inputWorld && (!panelNow || s.lastPanel == "WorkshopMenu") && !s.vatsOverlay && !game::PipboyWristOpen();
+                    cf.worldView = inputWorld && (!panelNow || s.lastPanel == "WorkshopMenu") && !s.vatsOverlay && !game::PipboyWristOpen() && !worldScreenNow;
                     const bool      offLeft = !s.settings.leftHanded;
                     const xr::Pose& off = offLeft ? c.leftAim : c.rightAim;
                     float           handYaw = 0.0f, headYaw = 0.0f;
@@ -1089,7 +1265,11 @@ namespace fo4flatvr::present
             hud::SetMenuPanelNext((panelNow || vatsNow) && s.submitting && s.runtime.running());
             // a game-pausing panel menu (PauseMenu) stops the camera update: drive it for the next frame (head published above)
             // (first person only: the stall test counts FirstPersonState updates, which no other camera state makes)
-            game::DriveCameraWhilePaused((panelNow || vatsNow) && s.runtime.running() && s.lastCamState == 0, game::FirstPersonUpdates());
+            // (round 7: also a terminal on its monitor - TerminalMenu pauses the game, kPausesGame in flat and FO4VR)
+            // round 8: any camera state (camera takeover menus as panels over the SCENE / third-person / furniture camera): the
+            // stall test counts the director's ticks there (FirstPersonState updates only happen in first person)
+            game::DriveCameraWhilePaused((panelNow || vatsNow || worldScreenNow) && s.runtime.running() && s.lastCamState >= 0,
+                s.lastCamState == 0 ? &game::FirstPersonUpdates : &camdir::Ticks);
             // no screen-fixed blurred menu background behind a panel / VATS over the live world (it would move with the head)
             game::HoldMenuBlur(s.settings.menuNoBlur && (panelNow || vatsNow) && s.runtime.running());
             game::ApplyTargetFov();
@@ -1115,9 +1295,9 @@ namespace fo4flatvr::present
                     if (s.xrOk) {
                         s.runtime.CinemaQuadPose(qp, qw, qh);
                     }
-                    return std::format(" wbGeom={} wsHand={} wsHandFrames={} quadPos={:.3f},{:.3f},{:.3f} quadSize={:.2f}x{:.2f}",
+                    return std::format(" wbGeom={} wsHand={} wsHandFrames={} quadPos={:.3f},{:.3f},{:.3f} quadSize={:.2f}x{:.2f} panelGeom='{}' worldScreen='{}' worldScreenFrames={}",
                         s.workbenchGeometry ? 1 : 0, s.workshopOnHand ? 1 : 0, s.workshopHandFrames, qp.position.x, qp.position.y,
-                        qp.position.z, qw, qh);
+                        qp.position.z, qw, qh, s.panelGeometry, s.worldScreen, s.worldScreenFrames);
                 }() +
                 std::format(" panoShown={} panoFailed={} {}", s.panoShown, s.panoFailed, s.xrOk ? s.runtime.PanoramaReport() : std::string{});
             std::scoped_lock l(g_reqLock);
@@ -1182,6 +1362,7 @@ namespace fo4flatvr::present
                 if (recenter && s->xrOk) {
                     s->runtime.Recenter();
                     head::Recenter();
+                    gestures::NoteRecentre();
                     REX::INFO("recentred (command)");
                 }
                 VrFrame(*s);
