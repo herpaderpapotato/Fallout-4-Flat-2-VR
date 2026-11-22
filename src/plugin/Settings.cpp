@@ -191,6 +191,14 @@ namespace fo4flatvr
         s.menuWorkshopHandPitchDeg = ReadFloat(p, "Menus", "fWorkshopHandPitchDeg", s.menuWorkshopHandPitchDeg);
         s.menuWorkshopHandCrop = ReadInt(p, "Menus", "bWorkshopHandCrop", s.menuWorkshopHandCrop ? 1 : 0) != 0;
         s.menuWorkshopCropTop = ReadFloat(p, "Menus", "fWorkshopCropTop", s.menuWorkshopCropTop);
+        {  // 22 Nov: the grip -> FO4VR wand calibration the floating gun / FRIK-flat use ([Weapon], else the retired [Hands])
+            const char* rk[3] = { "fGripRotXDeg", "fGripRotYDeg", "fGripRotZDeg" };
+            const char* ok[3] = { "fGripOffsetX", "fGripOffsetY", "fGripOffsetZ" };
+            for (int i = 0; i < 3; ++i) {
+                s.wandGripRotDeg[i] = ReadFloat(p, "Weapon", rk[i], ReadFloat(p, "Hands", rk[i], s.wandGripRotDeg[i]));
+                s.wandGripOffsetCm[i] = ReadFloat(p, "Weapon", ok[i], ReadFloat(p, "Hands", ok[i], s.wandGripOffsetCm[i]));
+            }
+        }
         s.menuVatsLabelScale = ReadFloat(p, "Menus", "fVatsLabelScale", s.menuVatsLabelScale);
         s.menuVatsNoVignette = ReadInt(p, "Menus", "bVatsNoVignette", s.menuVatsNoVignette ? 1 : 0) != 0;
         s.pipboyFloating = ReadInt(p, "Pipboy", "bFloating", s.pipboyFloating ? 1 : 0) != 0;

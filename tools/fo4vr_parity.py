@@ -11,7 +11,7 @@ fo4vr_parity_round2.py.
     python -I plugin/tools/fo4vr_parity.py check         # environment + the user's config per item, no launch
     python -I plugin/tools/fo4vr_parity.py history [n]   # the last n runs side by side
     python -I plugin/tools/fo4vr_parity.py selftest      # offline: the suite's own logic
-    python -I plugin/tools/fo4vr_parity.py prove <item> [--attach] [--keep]  # build-time proof: break the feature in this session
+    python -I plugin/tools/fo4vr_parity.py prove <item> [--attach] [--keep] [--no-break]  # build-time proof: break the feature in this session
                                                           # (pipe switch, never the user's files) and show the test fails
 
 Result per item and per check:
@@ -818,6 +818,383 @@ def test_menus(s, ctx):
     return checks
 
 
+
+# --- vats: VATS playback shows the whole player, head included, animated by the game (evidence/vats-playback.md; user 22 Nov
+#     05:36 "First vats test I did, nora had no head"). Render-level probe: fo4flatvr `facediag skin` (BSSkin::Instance +0xBC =
+#     the frame its bone matrices were last built, set by CalculateBoneMatrices 182E190 only when that piece is drawn; skin
+#     entries vs the live bones). FRIK-flat C39 hides the head in first person; C35/C39/C45 show it outside first person.
+LVL_BLOATFLY = "0003320A"   # NPC_ LvlBloatfly (round-2 target; not used since 22 Nov 14:20)
+CODSWORTH = "179FF"         # NPC_ Codsworth (Fallout4.esm 000179FF): essential, does not fight back - the user's VATS target
+
+
+def codsworth_here(s):
+    """The user's test target: Codsworth's reference (pointer findref on his base) moved to the player. No spawning."""
+    ref = kv(s.cmd(f"pointer findref {CODSWORTH}")).get("ref") or "1CA7D"
+    s.cmd(f"console {ref.lstrip('0') or ref}.moveto player")
+    return ref
+FRIK_LOG = os.path.expandvars(r"%USERPROFILE%\Documents\My Games\Fallout4\F4SE\FRIK.log")
+SKIN_ENTRY = re.compile(r"\| (F:)?'([^']*)' cull (\d)(\^?) drawn \d+ \(([-+]\d+)\) bones \d+/\d+ notLive (\d+) far (\d+)")
+
+
+def _log_mark(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _log_since(path, mark):
+    try:
+        with open(path, "rb") as f:
+            f.seek(mark)
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def skin_sample(s):
+    """One `facediag skin` line (next Present) -> {"body": [...], "face": [...]} with (name, cull, ancestorCulled, drawnDelta,
+    notLive) per skinned piece of the player's third-person 3D; None when no line came."""
+    m = _log_mark(fo4test.LOG)
+    s.cmd("facediag skin")
+    line = None
+    for _ in range(10):
+        time.sleep(0.1)
+        line = next((l for l in _log_since(fo4test.LOG, m).splitlines() if "facediag skin:" in l), None)
+        if line:
+            break
+    if not line:
+        return None
+    out = {"body": [], "face": [], "extra": line.split("||", 1)[1].strip() if "||" in line else ""}
+    for face, name, cull, anc, d, nl, _far in SKIN_ENTRY.findall(line):
+        out["face" if face else "body"].append((name, int(cull), anc == "^", int(d), int(nl)))
+    return out
+
+
+def head_drawn(smp):
+    """(ok, text): the head's pieces are drawn in the same frame as the body: no culled FaceGen node above them, at least one
+    head piece not culled, and its last-drawn frame within 2 of the body's."""
+    if not smp or not smp["face"] or not smp["body"]:
+        return False, "no sample / no FaceGen head"
+    body_d = max(b[3] for b in smp["body"])
+    vis = [f for f in smp["face"] if f[1] == 0 and not f[2]]
+    if not vis:
+        anc = any(f[2] for f in smp["face"])
+        return False, "FaceGen head node culled" if anc else "every head piece culled"
+    face_d = max(f[3] for f in vis)
+    return face_d >= body_d - 2, f"head drawn {face_d:+d} vs body {body_d:+d} frames"
+
+
+VATS_ROUNDS = int(os.environ.get("VATS_ROUNDS", "1"))   # load cycles (each: one playback right after the load, one well after)
+SWAP_RE = re.compile(r"facegen: customization textures rendered \(UpdatePendingCustomizationTextures\)")
+
+
+def _tod(line):
+    m = re.search(r"(\d\d):(\d\d):(\d\d)\.(\d{3})", line)
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)) + int(m.group(4)) / 1000 if m else None
+
+
+def _now_tod():
+    t = time.localtime()
+    return t.tm_hour * 3600 + t.tm_min * 60 + t.tm_sec + (time.time() % 1)
+
+
+def fast_arm(s):
+    """Real play: the gun is out. After a (re)load: 10mm added, equipped and drawn with Touch R trigger, polled fast."""
+    s.cmd(f"console player.additem {PISTOL_10MM} 1")
+    s.cmd(f"console player.additem {AMMO_10MM} 50")
+    s.cmd(f"aim equip0 {PISTOL_10MM}")
+    t0 = time.time()
+    while time.time() - t0 < 5.0:
+        if kv(s.cmd("gun")).get("ws") == "3":
+            return True
+        vremu("/press?dev=right&btn=trigger&ms=100")
+        time.sleep(0.4)
+    return kv(s.cmd("gun")).get("ws") == "3"
+
+
+def fast_playback(s, ctx, tag, t_load):
+    """One V.A.T.S. at player speed, Touch only: B in; R trigger x3 (pad RT = queue a shot) and L trigger (pad A = execute),
+    0.2 s apart, once the game's zoom-in accepts input (taps from 0.5 s, one repeat if nothing starts); render samples through
+    the playback; the shots counted from fo4flatvr's `vats shot #` lines (22 Nov 14:20: RT queues, A executes - every earlier
+    playback started on the first A after an RT)."""
+    r = {"tag": tag, "samples": [], "taps": 0}
+    pre = skin_sample(s)
+    r["pre"] = pre.get("extra", "")[:900] if pre else ""
+    m_frik, m_ours = _log_mark(FRIK_LOG), _log_mark(fo4test.LOG)
+    t0 = time.time()
+    vremu("/press?dev=right&btn=b&ms=100")             # V.A.T.S. (gameplay: primary upper button)
+    while time.time() - t0 < 2.0 and "VATSMenu" not in menus(s):
+        time.sleep(0.05)
+    r["via"] = "Touch B"
+    if "VATSMenu" not in menus(s):
+        s.cmd("pad lb=1 ms=100")
+        r["via"] = "pipe pad LB"
+        while time.time() - t0 < 3.5 and "VATSMenu" not in menus(s):
+            time.sleep(0.05)
+    r["opened"] = "VATSMenu" in menus(s)
+    r["t_open"] = round(time.time() - t0, 2)
+    played = False
+    if r["opened"]:
+        time.sleep(0.5)
+        for _ in range(2):
+            for dev in ("right", "right", "right", "left"):
+                vremu(f"/press?dev={dev}&btn=trigger&ms=90")
+                r["taps"] += 1
+                time.sleep(0.2)
+            t1 = time.time()
+            while time.time() - t1 < 1.5 and not played:
+                played = "show first person 0" in _log_since(FRIK_LOG, m_frik)
+                time.sleep(0.05)
+            if played or "VATSMenu" not in menus(s):
+                break
+    r["played"] = played
+    r["t_play"] = round(time.time() - t0, 2)
+    r["since_load"] = round(time.time() - t_load, 1)
+    if played:
+        inject(ctx, "playback")                        # prove only: hide the head as an unknown hider would
+        while len(r["samples"]) < 4 and "VATSMenu" in menus(s):
+            smp = skin_sample(s)
+            if smp:
+                r["samples"].append(smp)
+    wait_menu(s, "VATSMenu", False, 10.0)
+    ours, frik = _log_since(fo4test.LOG, m_ours), _log_since(FRIK_LOG, m_frik)
+    r["shots"] = len(re.findall(r"vats shot #", ours))
+    r["lines"] = [l[:260] for l in frik.splitlines() if re.search(r"C39: |C45: |C23 skin restore", l)][:8]
+    return r
+
+
+def test_vats(s, ctx):
+    checks = []
+    if skin_sample(s) is None:
+        return [check("render probe (fo4flatvr `facediag skin`)", SETUP, "no facediag skin line", "a line per call",
+                      "fo4flatvr.dll older than 22 Nov 13:13")]
+    save = fo4test.latest_save()
+    runs = []
+    for rnd in range(VATS_ROUNDS):
+        close_all(s)
+        m_ours = _log_mark(fo4test.LOG)
+        s.cmd(f"console load {save}")                   # a fresh load each round: the head swap comes ~5 s after it
+        t1 = time.time()
+        while time.time() - t1 < 8 and s.g.ready().get("loading") != "1":    # the load starting
+            time.sleep(0.05)
+        while time.time() - t1 < 60 and not (s.g.ready().get("ingame") == "1" and s.g.ready().get("loading") == "0"):
+            time.sleep(0.1)
+        t_load = time.time()
+        s.no_autosave()
+        codsworth_here(s)
+        armed = fast_arm(s)
+        early = fast_playback(s, ctx, f"round {rnd + 1}: right after the load", t_load) if armed else \
+            {"tag": f"round {rnd + 1}: right after the load (gun not drawn)", "played": False, "samples": []}
+        while time.time() - t_load < 20.0:             # well after the head swap (~5 s after the load)
+            time.sleep(0.5)
+        close_all(s)
+        codsworth_here(s)
+        time.sleep(0.3)
+        late = fast_playback(s, ctx, f"round {rnd + 1}: 20 s after the load", t_load)
+        extra = []
+        if os.environ.get("VATS_AB") == "1":   # diagnosis: the same playback with FRIK-flat C39 (first-person head cull) off
+            s.cmd("cfgui set FRIK bHeadlessFirstPerson 0")
+            time.sleep(2.0)
+            codsworth_here(s)
+            time.sleep(0.3)
+            extra.append(fast_playback(s, ctx, f"round {rnd + 1}: C39 off (bHeadlessFirstPerson 0)", t_load))
+            s.cmd("cfgui reset FRIK bHeadlessFirstPerson")
+            time.sleep(2.0)
+            codsworth_here(s)
+            time.sleep(0.3)
+            extra.append(fast_playback(s, ctx, f"round {rnd + 1}: C39 back on", t_load))
+        load_tod = _now_tod() - (time.time() - t_load)
+        swaps = [_tod(l) for l in _log_since(fo4test.LOG, m_ours).splitlines() if SWAP_RE.search(l)]
+        for r in [early, late] + extra:
+            r["swaps_s_after_load"] = [round(t - load_tod, 1) for t in swaps if t]
+            runs.append(r)
+    ctx["vats_runs"] = [dict({k: v for k, v in r.items() if k != "samples"}, heads=[head_drawn(x)[1] for x in r.get("samples", [])],
+                             bounds=[x.get("extra", "")[:900] for x in r.get("samples", [])[:1]])
+                        for r in runs]
+    played = [r for r in runs if r.get("played")]
+    checks.append(check("V.A.T.S. on Codsworth at player speed fires real shots (Touch B, R trigger x3 queue, L trigger execute)",
+                        PASS if len(played) == len(runs) and all(r.get("shots") for r in played) else SETUP,
+                        [f"{r['tag']}: open {r.get('t_open')} s, playback {r.get('t_play')} s, {r.get('since_load')} s after load, "
+                         f"shots {r.get('shots')}" for r in runs], "every playback runs"))
+    if not played:
+        return checks
+    sampled = False
+    for r in played:
+        if not r["samples"]:
+            checks.append(check(f"head visible during playback ({r['tag']})", SETUP, "playback ended before a render sample", ">= 1"))
+            continue
+        sampled = True
+        res = [head_drawn(x) for x in r["samples"]]
+        checks.append(check(f"the player's head is drawn during the playback ({r['tag']}; head swap at {r['swaps_s_after_load']} s)",
+                            judge(all(x[0] for x in res), True), "; ".join(x[1] for x in res), "drawn every sample"))
+        stale = [max([b[4] for b in x["body"]] + [f[4] for f in x["face"]]) for x in r["samples"]]
+        checks.append(check(f"body and head skinned from the live animated bones ({r['tag']})", judge(all(v == 0 for v in stale), True),
+                            f"entries off their live bone per sample {stale}", "0"))
+    if sampled and cfg("FRIK", "bHeadlessFirstPerson")[0] in (None, "1"):
+        close_all(s)
+        time.sleep(1.0)
+        after = skin_sample(s)
+        hid = bool(after and after["face"] and all(f[1] or f[2] for f in after["face"]))
+        checks.append(check("back in first person the head is hidden again (FRIK-flat C39)", judge(hid, True),
+                            "hidden" if hid else "shown", "hidden"))
+    return checks
+
+
+# --- dialogue: a primary-stick flick picks the response by FO4VR's fixed directions (evidence/dialogue.md: DialogueMenu
+#     thumbstick slot VR 12ED530 -> MenuTopicManager::OnMenuButtonPress CEA480 / flat BAF7C0; direction rule VR 1BBFDD0)
+DLG_DIRS = [("up", (0.0, 1.0), 3, "Question"), ("right", (1.0, 0.0), 1, "Negative"), ("down", (0.0, -1.0), 0, "Positive"),
+            ("left", (-1.0, 0.0), 2, "Neutral")]
+DLG_NPC = "00002CC0"   # Myrna (Fallout4.esm ACHR, Diamond City market; her greeting offers all 4 responses). The player is
+                       # moved next to her (console; never saved). Codsworth 0001CA7D does not talk in the TestNora save.
+
+
+def dlg(s):
+    return kv(s.cmd("dlg status"))
+
+
+def xdi_slots(st):
+    """XDI rows -> {optionID: row} from the status line (xdi='rows=N alpha=.. sel=.. [0:3"text" 1:0"text" ...]')."""
+    return {int(i): int(r) for r, i in re.findall(r'(\d+):(-?\d+)"', st.get("xdi", ""))}
+
+
+def dlg_wait_pickable(s, timeout):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        st = dlg(s)
+        if st.get("canPick") == "1" and (st.get("xdiMode") in ("none", "slots", "long")):
+            return st
+        if st.get("open") != "1" and time.time() - t0 > 3.0:
+            return None
+        time.sleep(0.05)
+    return None
+
+
+def dlg_where(s, npc):
+    """(distance, bearing, dz) of the NPC from the player (`dlg npcs`), or None when it is not in the player's cell."""
+    m = re.search(rf"{npc}/\w+ '[^']*' ([\d.]+) b=([-\d.]+) dz=([-\d.]+)", s.cmd("dlg npcs"))
+    return (float(m.group(1)), float(m.group(2)), float(m.group(3))) if m else None
+
+
+def dlg_bring(s, npc):
+    """The player next to the fixed NPC (console move when she is not close; never saved). Returns dlg_where()."""
+    w = dlg_where(s, npc)
+    if w and w[0] < 400:
+        return w
+    s.console(f"player.moveto {npc}", 3.0)
+    t0 = time.time()
+    while time.time() - t0 < 30:   # cell load
+        w = dlg_where(s, npc)
+        if w:
+            break
+        time.sleep(1.0)
+    time.sleep(1.5)
+    return dlg_where(s, npc)
+
+
+def dlg_talk(s, npc):
+    """Start a conversation with the fixed NPC the way a player does: point the right hand at her, Touch A."""
+    if dlg(s).get("open") == "1":
+        return True
+    w = dlg_bring(s, npc)
+    if not w:
+        return False
+    hdg = fnum(aim(s), "hdgCam", 0.0)
+    yaw = angdiff(w[1], hdg)
+    pitch = math.degrees(math.atan2(w[2] - 30.0, max(w[0], 1.0)))   # chest height vs the eye (about 30 units)
+    for dp in (0, -8, 8, -16):
+        aim_hand("right", yaw, pitch + dp, wait=0.25)
+        if aim(s).get("pick") == npc:
+            press("right", "a", 150, 0.2)
+            ok = wait_menu(s, "DialogueMenu", True, 4.0)
+            aim_hand("right", 0, -30, wait=0.05)
+            return ok
+    return False
+
+
+def dlg_leave(s, npc):
+    """End the conversation the way a player does: walk away (the player is moved 1500 units; never DialogueMenu hide,
+    which leaves the scene half-open)."""
+    if dlg(s).get("open") != "1":
+        return True
+    p, _ = player_frame(s)
+    if p:
+        s.console(f"player.setpos x {p[0] + 1500:.1f}", 2.5)
+    t0 = time.time()
+    while time.time() - t0 < 8 and dlg(s).get("open") == "1":
+        time.sleep(0.25)
+    return dlg(s).get("open") != "1"
+
+
+def test_dialogue(s, ctx):
+    checks = []
+    npc = ctx.get("dlg_npc") or DLG_NPC
+    if "responses=" not in s.cmd("dlg status"):
+        return [check("fo4flatvr dialogue stick probe (`dlg status` responses / engine picks)", SETUP, "missing", "present",
+                      "fo4flatvr.dll older than 22 Nov 14:16")]
+    if dlg(s).get("open") != "1":
+        close_all(s)
+        neutral()
+        if not dlg_bring(s, npc):
+            return [check("fixed NPC reachable (test data)", SETUP, f"{npc} not found after player.moveto", "in the cell")]
+    xdi = dlg(s).get("xdiDll") == "1"
+    todo = list(DLG_DIRS)
+    results, haptic, talks, t_end = {}, None, 0, time.time() + 90
+    while todo and time.time() < t_end:
+        if dlg(s).get("open") != "1":
+            if talks >= 5:
+                break
+            talks += 1
+            h0 = haptics()["right"]
+            if not dlg_talk(s, npc):
+                continue
+            st = dlg_wait_pickable(s, 15.0)
+            if st is not None and haptic is None:
+                haptic = haptics()["right"] > h0
+        else:
+            st = dlg_wait_pickable(s, 15.0)
+        if st is None:
+            continue
+        # the next direction whose response this option set offers (XDI shows its rows; vanilla always has the 4 buttons)
+        offered = xdi_slots(st) if st.get("xdiMode") == "slots" else None
+        pick = next((d for d in todo if offered is None or d[2] in offered), None)
+        if pick is None:
+            dlg_leave(s, npc)
+            continue
+        name, (jx, jy), want, label = pick
+        picks0 = int(st.get("picks", 0))
+        m = _log_mark(fo4test.LOG)
+        t0 = time.time()
+        vremu(f"/input?dev=right&joy={jx:.2f},{jy:.2f}&ms=120")       # a real-speed flick: 120 ms out and back
+        got = None
+        while time.time() - t0 < 2.0:
+            st2 = dlg(s)
+            if int(st2.get("picks", 0)) > picks0:
+                got = int(st2.get("lastType", -1))
+                break
+            time.sleep(0.03)
+        ms = round((time.time() - t0) * 1000)
+        log = _log_since(fo4test.LOG, m)
+        mrow = re.search(r"XDI row (\d+) picked", log)
+        via = f"XDI row {mrow.group(1)} (optionID {want})" if mrow else "OnMenuButtonPress" if got is not None else "-"
+        results[name] = (got, f"engine got {got} via {via} after {ms} ms; options were {st.get('xdi', 'vanilla')[:120]}")
+        todo.remove(pick)
+    dlg_leave(s, npc)
+    for name, _j, want, label in DLG_DIRS:
+        if name not in results:
+            checks.append(check(f"R stick {name} -> {label} ({want})", SETUP, f"no option set offered {label} ({talks} conversations)",
+                                f"{label} ({want})"))
+            continue
+        got, note = results[name]
+        checks.append(check(f"R stick {name} picks the {label} response (OnMenuButtonPress type {want})", judge(got == want, True),
+                            note, f"type {want}"))
+    if haptic is not None:
+        checks.append(check("a haptic pulse on the right controller when the options appear", judge(haptic, True),
+                            "pulse" if haptic else "none", "pulse (FO4VR 0.1 for 0.5 s)"))
+    ctx["dialogue_detail"] = {"npc": npc, "xdi": xdi, "talks": talks, "results": results}
+    return checks
+
+
 # =========================================================================================== registry
 # switches: (section, key, on value) of OUR feature; any off -> OFF. mods: MO2 mods the item needs.
 # break: pipe commands that switch the feature off inside the session (prove), restore: switch it back.
@@ -842,17 +1219,22 @@ ITEMS = {
               "switches": [("Controllers", "bFO4VRBindings", 1), ("General", "bEnabled", 1)], "mods": ["fo4flatvr"],
               "break": ["bindings off"], "restore": ["bindings on"]},
     # proposed (evidence done, test designed in the evidence file, not built yet)
-    "vats": {"title": "VATS playback: body animated, head visible", "feature": "vats", "evidence": "vats-playback.md", "test": None,
-             "mods": ["fo4flatvr", "FRIK-flat"]},
+    "vats": {"title": "VATS playback: body animated, head visible", "feature": "vats", "evidence": "vats-playback.md", "test": test_vats,
+             "switches": [("General", "bEnabled", 1)], "mods": ["fo4flatvr", "FRIK-flat"],
+             # prove: the head hide back on the direct cull bit (the 22 Nov cause: no engine "changed" mark -> head not drawn)
+             "break": ["cfgui set FRIK bEngineCullFlag 0"], "restore": ["cfgui reset FRIK bEngineCullFlag"]},
     "favorites": {"title": "Favorites quick-select on the stick, with a haptic per sector", "feature": "favorites",
                   "evidence": "favorites.md", "test": None},
     "quickloot": {"title": "Quick loot at the hand, with a haptic when the container changes", "feature": "quickloot",
                   "evidence": "quickloot.md", "test": None},
     "wandhud": {"title": "Ammo counter / status on the gun hand, offset per weapon", "feature": "hud", "evidence": "wand-hud.md", "test": None},
-    "dialogue": {"title": "Dialogue options at the wand, with a haptic when they appear", "feature": "dialogue",
-                 "evidence": "dialogue.md", "test": None},
+    # 22 Nov (dialogue agent): FO4VR right-stick responses (+ the options haptic); under XDI its row for the slot
+    "dialogue": {"title": "Dialogue: a right-stick flick picks the response by FO4VR's fixed directions; haptic on options",
+                 "feature": "dialogue", "evidence": "dialogue.md", "test": test_dialogue,
+                 "switches": [("Dialogue", "bStickResponses", 1), ("General", "bEnabled", 1)], "mods": ["fo4flatvr"],
+                 "break": ["dlg stick off"], "restore": ["dlg stick on"]},
 }
-ORDER = ["aim", "firehaptics", "activation", "scope", "menus"]
+ORDER = ["aim", "firehaptics", "activation", "scope", "menus", "vats", "dialogue"]
 
 
 def aggregate(checks):
@@ -895,11 +1277,19 @@ def summary_text(res):
     return "\n".join(lines)
 
 
-def run(names, attach=False, keep=False, prove=None):
+def run(names, attach=False, keep=False, prove=None, no_break=False):
     os.makedirs(RUNS, exist_ok=True)
     res = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "save": fo4test.latest_save(), "runtime": "SteamVR + vremu", "items": {}, "prove": prove}
     if os.path.exists(fo4test.HOLD):
         raise SystemExit(f"{fo4test.HOLD} exists - not running")
+    pid = game_pid()   # 22 Nov: refuse before any result file is written (an aborted run overwrote latest.json / summary.txt)
+    if pid:
+        try:
+            own = int(open(PIDF).read().strip())
+        except (OSError, ValueError):
+            own = None
+        if pid != own:
+            raise SystemExit(f"Fallout4 pid {pid} is running and is not this suite's session - not touching it")
     todo = []
     for n in names:
         it = ITEMS[n]
@@ -929,7 +1319,7 @@ def run(names, attach=False, keep=False, prove=None):
                 say(f"--- {n}")
                 broke = []
                 if prove == n:
-                    for c in it.get("break", []):
+                    for c in ([] if no_break else it.get("break", [])):
                         broke.append((c, sess.cmd(c)))
                     if it.get("inject"):
                         ctx["inject"] = it["inject"]
@@ -940,7 +1330,7 @@ def run(names, attach=False, keep=False, prove=None):
                 except Exception as e:  # noqa: BLE001
                     r = {"state": ERROR, "why": f"{type(e).__name__}: {e}", "checks": []}
                 finally:
-                    for c in it.get("restore", []) if prove == n else []:
+                    for c in it.get("restore", []) if (prove == n and not no_break) else []:
                         sess.cmd(c)
                     if ctx.pop("inject", None):
                         r["injected"] = ctx.pop("inject_log", [])
@@ -958,6 +1348,10 @@ def run(names, attach=False, keep=False, prove=None):
                     say(f"    {c['state']:<12} {c['check']}: {c['measured']} (FO4VR: {c['expected']})")
             if "menus_detail" in ctx:
                 res["menus_detail"] = ctx["menus_detail"]
+            if "vats_runs" in ctx:
+                res["vats_runs"] = ctx["vats_runs"]
+            if "dialogue_detail" in ctx:
+                res["dialogue_detail"] = ctx["dialogue_detail"]
             if "aim_shots" in ctx:
                 res["aim_shots"] = ctx["aim_shots"]
     finally:
@@ -982,7 +1376,7 @@ def run(names, attach=False, keep=False, prove=None):
         stamp = time.strftime("%Y%m%d-%H%M%S")
         dest = PROOFS if prove else RUNS
         os.makedirs(dest, exist_ok=True)
-        path = os.path.join(dest, f"{('prove-' + prove + '-') if prove else ''}{stamp}.json")
+        path = os.path.join(dest, f"{('prove-' + prove + ('-nobreak' if no_break else '') + '-') if prove else ''}{stamp}.json")
         res["path"] = os.path.relpath(path, ROOT)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(res, f, indent=1, default=str)
@@ -1048,6 +1442,14 @@ def selftest():
     k = kv("weapon | form=0005BBA4 name='Hunting Rifle' instance=1 flags=0x00720100 hasScope=1 zoom=000AF2A9 | weapons=1 scopeMenu=0")
     ok.append(("kv: aim weapon readout", k.get("hasScope") == "1" and k.get("name") == "Hunting Rifle" and k.get("scopeMenu") == "0"))
     ok.append(("angdiff wraps", abs(angdiff(359.0, 1.0) + 2.0) < 1e-9))
+    sk = {"body": [], "face": []}
+    for face, name, cull, anc, dd, nl, _f in SKIN_ENTRY.findall(
+            "facediag skin: frame 9 | root cull 0 | 'CBBE' cull 0 drawn 9 (+0) bones 66/66 notLive 0 far 0 | F:'FemaleHeadHuman' cull 0^ "
+            "drawn 7 (-2) bones 10/10 notLive 0 far 0 | F:'HairFemale01' cull 0^ drawn 7 (-2) bones 11/11 notLive 0 far 0"):
+        sk["face" if face else "body"].append((name, int(cull), anc == "^", int(dd), int(nl)))
+    ok.append(("vats: a culled FaceGen node is 'not drawn'", head_drawn(sk)[0] is False and len(sk["face"]) == 2))
+    sk["face"] = [(n, c, False, d, nl) for n, c, _a, d, nl in sk["face"]]
+    ok.append(("vats: head drawn 2 frames behind the body counts as drawn", head_drawn(sk)[0] is True))
     ok.append(("every item has an evidence file", all(os.path.exists(os.path.join(EVID, it["evidence"])) for it in ITEMS.values())))
     ok.append(("every built item has a config switch list", all("switches" in it for it in ITEMS.values() if it.get("test"))))
     for n, v in ok:
@@ -1076,7 +1478,7 @@ def main():
     elif cmd == "prove":
         if len(names) != 1:
             raise SystemExit("prove <item>")
-        run(names, attach="--attach" in a, keep="--keep" in a, prove=names[0])
+        run(names, attach="--attach" in a, keep="--keep" in a, prove=names[0], no_break="--no-break" in a)
     else:
         raise SystemExit(__doc__)
 

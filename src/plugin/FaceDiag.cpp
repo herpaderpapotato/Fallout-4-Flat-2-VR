@@ -6,6 +6,8 @@
 #include "plugin/ConfigStore.h"
 #include "plugin/Settings.h"
 #include "plugin/StereoPoC.h"
+#include "plugin/ThreadQueues.h"
+#include "plugin/EngineCull.h"
 
 #include <REX/LOG.h>
 #include <F4SE/F4SE.h>
@@ -20,6 +22,7 @@
 #include "plugin/CallChain.h"
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <chrono>
 #include <thread>
@@ -259,11 +262,121 @@ namespace fo4flatvr::facediag
             }
         }
 
+        // 22 Nov (VATS head agent): `facediag skin` - is each skinned piece of the player's third-person body actually drawn,
+        // and with which bones. Per geometry: own / ancestor app-cull, the frame its bone matrices were last built
+        // (BSSkin::Instance +0xBC, set by BSGraphics::Utility::CalculateBoneMatrices 182E190 only when the piece is rendered;
+        // compared with the render frame counter 3D87238), and how many worldTransforms entries (+0x28/+0x38) do not point at
+        // their live bone's world (+0x10 bones; NiAVObject::world +0x70), e.g. FRIK-flat C23's stable copy.
+        void SkinDump(bool a_firstPerson = false)
+        {
+            auto* pc = RE::PlayerCharacter::GetSingleton();
+            auto* root = pc ? static_cast<RE::TESObjectREFR*>(pc)->Get3D(a_firstPerson) : nullptr;
+            if (!root) {
+                REX::INFO("facediag skin: no {} 3D", a_firstPerson ? "first-person" : "third-person");
+                return;
+            }
+            const auto now = *reinterpret_cast<const std::uint32_t*>(REL::Offset(0x3D87238).address());
+            std::string out = std::format("facediag skin{}: frame {} | root cull {}", a_firstPerson ? "1p" : "", now, (root->flags.flags & 1) ? 1 : 0);
+            int         n = 0, nRigid = 0;
+            auto walk = [&](auto&& self, RE::NiAVObject* o, bool culledAbove, bool inFace, int depth) -> void {
+                if (!o || depth > 30) return;
+                const bool own = (o->flags.flags & 1) != 0;
+                const char* nm = o->name.c_str() ? o->name.c_str() : "";
+                const bool face = inFace || std::strcmp(nm, "BSFaceGenNiNodeSkinned") == 0;
+                if (auto* g = o->IsGeometry()) {
+                    auto* si = reinterpret_cast<const std::uint8_t*>(g->skinInstance.get());
+                    if (!si) {  // rigid piece (first-person weapon etc.): its own / ancestor cull and the engine's changed mark
+                        if (nRigid++ < 48) {
+                            out += std::format(" | R:'{}' cull {}{} mark {}", nm, own ? 1 : 0, culledAbove ? "^" : "", (o->flags.flags >> 29) & 1);
+                        }
+                        return;
+                    }
+                    if (n >= 24) return;
+                    ++n;
+                    const auto drawn = *reinterpret_cast<const std::uint32_t*>(si + 0xBC);
+                    auto* const* bones = *reinterpret_cast<RE::NiAVObject* const* const*>(si + 0x10);
+                    const auto nb = *reinterpret_cast<const std::uint32_t*>(si + 0x20);
+                    auto* const* wt = *reinterpret_cast<const std::uint8_t* const* const*>(si + 0x28);
+                    const auto nw = *reinterpret_cast<const std::uint32_t*>(si + 0x38);
+                    int notLive = 0;
+                    float farU = 0.0f;
+                    for (std::uint32_t i = 0; bones && wt && i < nb && i < nw; ++i) {
+                        if (!bones[i] || !wt[i]) continue;
+                        const auto* live = reinterpret_cast<const std::uint8_t*>(bones[i]) + 0x70;
+                        if (wt[i] != live) {
+                            ++notLive;
+                            const auto* a = reinterpret_cast<const float*>(wt[i] + 0x30);  // NiTransform translate
+                            const auto* b = reinterpret_cast<const float*>(live + 0x30);
+                            farU = (std::max)(farU, std::sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2])));
+                        }
+                    }
+                    out += std::format(" | {}'{}' cull {}{} drawn {} ({:+d}) bones {}/{} notLive {} far {:.0f}", face ? "F:" : "", nm, own ? 1 : 0,
+                        culledAbove ? "^" : "", drawn, static_cast<int>(drawn - now), nb, nw, notLive, farU);
+                    return;
+                }
+                if (auto* nd = o->IsNode()) {
+                    for (auto& c : nd->children) {
+                        if (c) self(self, c.get(), culledAbove || own, face, depth + 1);
+                    }
+                }
+            };
+            walk(walk, root, false, false, 0);
+            // 22 Nov 14:25: why an un-culled head is not drawn - its bound vs the render camera, and whether the actor's
+            // flattened geometry list (BSFadeNode +0x168 geomArray, what the renderer walks) holds the head pieces
+            if (auto* face = root->GetObjectByName(RE::BSFixedString("BSFaceGenNiNodeSkinned"))) {
+                const auto& fb = face->worldBound;
+                out += std::format(" || face bound ({:.0f},{:.0f},{:.0f}) r {:.1f} | root bound ({:.0f},{:.0f},{:.0f}) r {:.1f}", fb.center.x,
+                    fb.center.y, fb.center.z, fb.fRadius, root->worldBound.center.x, root->worldBound.center.y, root->worldBound.center.z,
+                    root->worldBound.fRadius);
+                if (auto* cam = RE::Main::WorldRootCamera()) {
+                    const auto& c = cam->world.translate;
+                    out += std::format(" | camera ({:.0f},{:.0f},{:.0f}) to face bound {:.1f}", c.x, c.y, c.z,
+                        std::sqrt((c.x - fb.center.x) * (c.x - fb.center.x) + (c.y - fb.center.y) * (c.y - fb.center.y) +
+                                  (c.z - fb.center.z) * (c.z - fb.center.z)));
+                }
+                const auto* rrt = root->GetRTTI();
+                if (auto* fade = (rrt && std::strcmp(rrt->GetName(), "BSFadeNode") == 0) ? static_cast<RE::BSFadeNode*>(root) : nullptr) {
+                    int inList = 0, faceGeoms = 0;
+                    auto* fn = face->IsNode();
+                    for (std::uint32_t ci = 0; fn && ci < fn->children.size(); ++ci) {
+                        auto* c = fn->children[ci].get();
+                        auto* g = c ? c->IsGeometry() : nullptr;
+                        if (!g) continue;
+                        ++faceGeoms;
+                        for (auto& e : fade->geomArray) {
+                            if (e.geometry.get() == g) {
+                                ++inList;
+                                if (faceGeoms <= 2) {
+                                    out += std::format(" | head '{}' entryFlags 0x{:X} objFlags 0x{:X}", g->name.c_str() ? g->name.c_str() : "", e.flags,
+                                        g->flags.flags);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    for (auto& e : fade->geomArray) {  // one body piece for comparison
+                        auto* g = e.geometry.get();
+                        if (g && g->parent != fn) {
+                            out += std::format(" | body '{}' entryFlags 0x{:X} objFlags 0x{:X}", g->name.c_str() ? g->name.c_str() : "", e.flags, g->flags.flags);
+                            break;
+                        }
+                    }
+                    out += std::format(" | faceNode objFlags 0x{:X} root objFlags 0x{:X}", face->flags.flags, root->flags.flags);
+                    out += std::format(" | geomArray {} entries, head pieces in it {}/{}", fade->geomArray.size(), inList, faceGeoms);
+                }
+            }
+            REX::INFO("{}", out);
+        }
+
         void Run(std::string a_arg)
         {
             auto* pc = RE::PlayerCharacter::GetSingleton();
             if (!pc) {
                 REX::INFO("facediag: no player");
+                return;
+            }
+            if (a_arg == "skin" || a_arg == "skin1p") {
+                SkinDump(a_arg == "skin1p");
                 return;
             }
             DumpActor(pc, static_cast<RE::TESObjectREFR*>(pc)->Get3D(false), "player");
@@ -389,6 +502,21 @@ namespace fo4flatvr::facediag
         }
         if (a_arg == "status") {
             return stereo::EngineOffscreenStatus();
+        }
+        if (a_arg == "cull") {
+            return enginecull::Status();  // 22 Nov: fo4flatvr hides / shows through the engine (EngineCull.h)
+        }
+        if (a_arg == "cullhead") {
+            // 22 Nov, test injection only (parity `prove vats`): app-cull the player's FaceGen head node, as an unknown hider
+            // would. FRIK-flat C45 ([FRIK] bShowHeadOutsideFirstPerson) shows it again outside first person.
+            tq::RunOnMain([] {
+                auto* pc = RE::PlayerCharacter::GetSingleton();
+                auto* root = pc ? static_cast<RE::TESObjectREFR*>(pc)->Get3D(false) : nullptr;
+                auto* face = root ? root->GetObjectByName(RE::BSFixedString("BSFaceGenNiNodeSkinned")) : nullptr;
+                if (face) face->flags.flags |= 1;
+                REX::INFO("facediag cullhead: player FaceGen node {} culled (test injection)", static_cast<void*>(face));
+            });
+            return "player FaceGen node cull queued on the main thread (test injection)";
         }
         std::scoped_lock l(g_qLock);
         g_queue.push_back(a_arg);

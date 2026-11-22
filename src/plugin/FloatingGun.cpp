@@ -5,6 +5,7 @@
 #include "plugin/FloatingGun.h"
 #include "plugin/FloatingGunInternal.h"
 #include "plugin/ConfigStore.h"
+#include "plugin/EngineCull.h"  // 22 Nov: hides / shows through the engine's SetAppCulled
 #include "plugin/GameBridge.h"
 #include "plugin/HeadPose.h"
 #include "plugin/Settings.h"
@@ -743,12 +744,12 @@ namespace fo4flatvr::gun
                                 ++g_newParts;    // a part we had not seen (new equipment / rebuilt biped)
                                 if (g_diagLog) REX::INFO("arms diag: new skinned part '{}' (frame {})", o->name.c_str() ? o->name.c_str() : "", g_hookCount.load());
                             }
-                            o->flags.flags |= 1;
+                            enginecull::Set(o, true);
                             if (!ours) g_culled.push_back(o);
                         }
                         ++a_culled;
                     } else if (ours) {
-                        o->flags.flags &= ~std::uint64_t{ 1 };
+                        enginecull::Set(o, false);
                     }
                 }
             };
@@ -765,12 +766,12 @@ namespace fo4flatvr::gun
                     const bool ours = std::find(g_culled.begin(), g_culled.end(), o) != g_culled.end();
                     if (a_hide) {
                         if (!o->GetAppCulled()) {
-                            o->flags.flags |= 1;
+                            enginecull::Set(o, true);
                             if (!ours) g_culled.push_back(o);
                         }
                         ++a_culled;
                     } else if (ours) {
-                        o->flags.flags &= ~std::uint64_t{ 1 };
+                        enginecull::Set(o, false);
                     }
                 }
             }
@@ -883,7 +884,7 @@ namespace fo4flatvr::gun
                 REX::ERROR("gun: controller model {} '{}': {}", a_i == 0 ? "right" : "left", path, m.status);
                 return;
             }
-            n->flags.flags |= 1;  // hidden until placed
+            enginecull::Set(n.get(), true);  // hidden until placed
             m.node = n;
             m.status = "loaded";
             REX::INFO("gun: controller model {} '{}' loaded (bound radius {:.1f})", a_i == 0 ? "right" : "left", path, n->worldBound.fRadius);
@@ -911,7 +912,7 @@ namespace fo4flatvr::gun
                 r.root->AttachChild(n, true);
             }
             if (!a_show || !a_h.valid) {
-                n->flags.flags |= 1;
+                enginecull::Set(n, true);
                 m.shown = false;
                 return;
             }
@@ -920,7 +921,7 @@ namespace fo4flatvr::gun
             Xf       local = Mul(Inv(FromNi(r.root->world)), tgt);
             local.R = Ortho(local.R);
             ToNi(local, n->local);
-            n->flags.flags &= ~std::uint64_t{ 1 };
+            enginecull::Set(n, false);
             const float ft = *reinterpret_cast<const float*>(Base() + kFrameTime);
             reinterpret_cast<UpdateNode_t>(Base() + kUpdateNode)(ft, n, reinterpret_cast<QCam_t>(Base() + kQ1stPersonCamera)(), false);
             m.shown = true;
@@ -1171,7 +1172,7 @@ namespace fo4flatvr::gun
                 PlaceCtrl(oi, rig, base, camC, snap.oNew, cfg);
             } else {
                 for (auto& m : g_ctrl) {
-                    if (m.node) m.node->flags.flags |= 1, m.shown = false;
+                    if (m.node) enginecull::Set(m.node.get(), true), m.shown = false;
                 }
             }
             const double t1 = QpcUs();

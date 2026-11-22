@@ -6051,6 +6051,33 @@
           }
         },
         {
+          "id": "bEngineCullFlag:FRIK",
+          "text": "Head hide through the engine",
+          "type": "switcher",
+          "help": "Every FRIK-flat / fo4flatvr hide and show also uses the game's own hide call (main thread), so things shown again are drawn - e.g. the head in VATS playback (off: it stayed invisible). Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bShowHeadOutsideFirstPerson:FRIK",
+          "text": "Head always shown outside first person",
+          "type": "switcher",
+          "help": "VATS playback, third person and other game cameras (not the free camera) never show the player without a head, whatever hid it. Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bSkinRestoreLiveBones:FRIK",
+          "text": "Body skin back on the live bones",
+          "type": "switcher",
+          "help": "Leaving first person, every body / head / outfit piece is skinned from the animated bones again (none left on FRIK's last first-person pose). Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
           "id": "bAnimatedLegs:FRIK",
           "text": "VRIK-style legs",
           "type": "switcher",

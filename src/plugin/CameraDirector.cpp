@@ -1,4 +1,5 @@
 #include "plugin/CameraDirector.h"
+#include "plugin/EngineCull.h"
 #include "plugin/ThreadQueues.h"
 
 #include "plugin/CameraTweaks.h"
@@ -901,6 +902,12 @@ namespace fo4flatvr::camdir
                 if (*reinterpret_cast<const std::uint8_t*>(reinterpret_cast<const std::uint8_t*>(mc) + 0x1A1) == 0) {
                     return true;  // AI-driven player (scripted walk / scene)
                 }
+            }
+            // 22 Nov (VATS head agent): only in the world. At the main menu the player has no cell / 3D and HasKeywordHelper
+            // read garbage (crash 0xC0000005 read 0x137C6 at Fallout4.exe+CA8B41 from PollAftercare 8 s after launch, twice,
+            // whenever AAF.esm's keyword was found before the first load).
+            if (!player->parentCell || !player->Get3D()) {
+                return false;
             }
             // the keyword is looked up once (LookupForm walks the plugin list; this runs every camera tick now)
             static std::atomic<RE::BGSKeyword*> s_kw{ nullptr };
@@ -2950,6 +2957,7 @@ namespace fo4flatvr::camdir
 
     void PollHeadHide()
     {
+        headhide::CullHook() = &enginecull::Set;  // 22 Nov: the POV head hide through the engine's SetAppCulled (EngineCull.h)
         PollAftercare();  // 20 Nov late: scene aftercare's input-layer watch (4 Hz; this main tick is camdir's)
         HeadHideConfig();
         bool active = false;

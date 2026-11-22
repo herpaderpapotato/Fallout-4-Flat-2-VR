@@ -1,6 +1,7 @@
 // VR dialogue, game side (Dialogue.h): D-look call-site patches, UI / MenuTopicManager polling, weapon cull, haptic
 // edge, primary stick -> option button.
 #include "plugin/Dialogue.h"
+#include "plugin/EngineCull.h"
 
 #include "plugin/ControllerBindings.h"
 #include "plugin/ConfigStore.h"
@@ -38,7 +39,14 @@ namespace fo4flatvr::dlg
         constexpr std::uintptr_t kSites[3] = { 0xBB0039, 0xBB0251, 0xBB0376 };  // looking / show buttons / keep menu
         constexpr std::uintptr_t kMenuTopicManager = 0x30E6E50;                 // MenuTopicManager* (singleton pointer)
         constexpr std::size_t    kMenuOpen = 0x4C;                               // bool menuOpen
-        constexpr std::size_t    kBlockInput = 0x55;                             // input ignored while set (HandleEvent, TryToInterrupt...)
+        // +0x55: a player choice is pending (22 Nov, OnMenuButtonPress BAF7C0: 0 -> TryToInterruptDialogueLine, set -> the
+        // response is taken + HideButtons + cleared; DialogueMenu::HandleEvent 1043720 returns early while it is set so the
+        // movie's option buttons pick). Before 22 Nov it was read as "input blocked" and CanPick required it clear.
+        constexpr std::size_t    kChoicePending = 0x55;
+        // MenuTopicManager::OnMenuButtonPress(SCENE_ACTION_PLAYER_RESPONSE_TYPE) (FO4VR CEA480, called by the VR thumbstick
+        // handler 12ED530): 0 Positive, 1 Negative, 2 Neutral, 3 Question.
+        constexpr std::uintptr_t kOnMenuButtonPress = 0xBAF7C0;
+        constexpr std::uint8_t   kOmbpBytes[10] = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18 };
         // DialogueMenu (1.11 DialogueMenu::ProcessMessage 1043460 / SetIsLookingAtSpeaker 1043E50 / HandleEvent 1043720)
         constexpr std::size_t kDmAcceptInput = 0x154;  // HandleEvent returns early when 0
         constexpr std::size_t kDmLooking = 0x164;      // EnableMenu (1) / DisableMenu (0)
@@ -53,7 +61,7 @@ namespace fo4flatvr::dlg
         using QCam_t = bool (*)(void*, std::uint32_t);
         QCam_t                     g_orig[3]{};
         bool                       g_patched[3]{};
-        std::atomic<bool>          g_look{ true }, g_hideWeapon{ true }, g_haptics{ true }, g_stick{ true };
+        std::atomic<bool>          g_look{ true }, g_hideWeapon{ true }, g_haptics{ true }, g_stick{ true }, g_listScroll{ true };
         std::atomic<std::uint64_t> g_calls[3]{}, g_forced[3]{};
 
         bool MenuOpenFlag()
@@ -80,18 +88,90 @@ namespace fo4flatvr::dlg
         // Main thread (Tick)
         struct Game
         {
-            bool          open{ false }, menuOpen{ false }, accept{ false }, looking{ false }, buttons{ false }, block{ false };
+            bool          open{ false }, menuOpen{ false }, accept{ false }, looking{ false }, buttons{ false }, pending{ false };
             bool          flatExclusive{ false };
             std::string   otherFlat;  // other FlatScreenModel menus (names) when not exclusive
             bool          weaponCulled{ false };  // we culled WEAPON and have not restored it
             std::uint64_t ticks{ 0 }, openTicks{ 0 }, lookingTicks{ 0 }, notLookingTicks{ 0 }, buttonEdges{ 0 }, opens{ 0 };
             std::uint64_t weaponCulls{ 0 }, weaponRecull{ 0 }, weaponRestores{ 0 }, weaponMissing{ 0 };
             std::uint64_t lookOffEdges{ 0 };  // looking 1 -> 0 while open
-            // stick -> button
-            int           stickBtn{ -1 };  // 0 A, 1 B, 2 X, 3 Y; -1 none
-            std::uint64_t stickPresses[4]{};
+            // stick -> response (presenter thread)
+            bool          stickArmed{ false };  // the stick was in neutral since the last flick / since the menu opened
+            int           lastDir{ 0 };
+            std::uint64_t stickFlicks[5]{};     // per FO4VR direction 1 up, 2 right, 3 down, 4 left
+            std::uint64_t scrollSteps{ 0 };
+            int           scrollDir{ 0 };
+            std::chrono::steady_clock::time_point nextScroll{};
             std::string   lastStick{ "none" };
         };
+
+        // ---- FO4VR stick direction (BSOpenVRControllerDevice stick, VR 1BC0B10 + 1BBFDD0) ---------------------------
+        // magnitude rescaled with fLThumbDeadzone 0.25 .. fLThumbDeadzoneMax 0.94 (VR 3882650 / 3882698, used for both hands),
+        // each component below fDirectionalDeadzone 0.5 (38826C8) zeroed, then the dominant axis: |x| >= cos 45 -> right /
+        // left. DIRECTION_VAL: 0 none, 1 up, 2 right, 3 down, 4 left.
+        constexpr float kThumbDead = 0.25f, kThumbDeadMax = 0.94f, kDirDead = 0.5f;
+        int Fo4vrDir(float a_x, float a_y)
+        {
+            const float r = std::sqrt(a_x * a_x + a_y * a_y);
+            if (r <= 0.0f) {
+                return 0;
+            }
+            const float s = std::clamp((r - kThumbDead) / (kThumbDeadMax - kThumbDead), 0.0f, 1.0f) / r;
+            float x = a_x * s, y = a_y * s;
+            if (std::abs(x) < kDirDead) x = 0.0f;
+            if (std::abs(y) < kDirDead) y = 0.0f;
+            if (x == 0.0f && y == 0.0f) {
+                return 0;
+            }
+            const float inv = 1.0f / std::sqrt(x * x + y * y);
+            if (std::abs(x * inv) >= 0.70710677f) {
+                return x < 0.0f ? 4 : 2;
+            }
+            return y < 0.0f ? 3 : 1;
+        }
+        // VR 12ED530: direction -> SCENE_ACTION_PLAYER_RESPONSE_TYPE (0 Positive, 1 Negative, 2 Neutral, 3 Question)
+        constexpr int kDirToType[5] = { -1, 3, 1, 0, 2 };
+        constexpr const char* kDirName[5] = { "none", "up", "right", "down", "left" };
+        constexpr const char* kTypeName[4] = { "Positive", "Negative", "Neutral", "Question" };
+
+        // ---- MenuTopicManager::OnMenuButtonPress probe + call -------------------------------------------------------
+        using Ombp_t = void (*)(void*, std::int32_t);
+        Ombp_t                     g_ombpOrig{ nullptr };   // trampoline stub (detoured) or the function itself
+        std::string                g_ombpInstall{ "not installed" };
+        std::atomic<std::uint64_t> g_ombpCalls{ 0 }, g_ombpOurs{ 0 };
+        std::atomic<int>           g_ombpLastType{ -1 };
+        thread_local bool          t_ombpFromUs{ false };
+        void HkOnMenuButtonPress(void* a_mtm, std::int32_t a_type)
+        {
+            ++g_ombpCalls;
+            if (t_ombpFromUs) ++g_ombpOurs;
+            g_ombpLastType = a_type;
+            REX::INFO("dialogue: MenuTopicManager::OnMenuButtonPress({} {}){}", a_type, a_type >= 0 && a_type < 4 ? kTypeName[a_type] : "?",
+                t_ombpFromUs ? " (stick, direct)" : "");
+            g_ombpOrig(a_mtm, a_type);
+        }
+
+        // ---- Extended Dialogue Interface list (main thread: Tick writes, presenter reads) --------------------------------
+        enum XdiMode : int
+        {
+            kNoXdi = 0,      // XDI.dll not loaded or no List_mc (vanilla DialogueMenu.swf)
+            kXdiSlots = 1,   // XDI list showing <= 4 rows whose optionIDs are the 4 response slots
+            kXdiLong = 2,    // XDI list with more rows / other optionIDs (framework options): stick scrolls
+            kXdiHidden = 3,  // XDI list not shown (between lines)
+        };
+        std::atomic<int> g_xdiDll{ -1 };
+        std::atomic<int> g_xdiMode{ kNoXdi };
+        std::mutex       g_xdiLock;
+        std::string      g_xdiDesc{ "-" };  // under g_xdiLock
+        bool XdiDll()
+        {
+            int e = g_xdiDll.load();
+            if (e < 0) {
+                e = ::GetModuleHandleW(L"XDI.dll") ? 1 : 0;
+                g_xdiDll = e;
+            }
+            return e != 0;
+        }
         Game              g_g;
         std::mutex        g_gLock;  // g_g strings for the pipe thread
         std::atomic<bool> g_open{ false }, g_flatExclusive{ false }, g_hapticReq{ false }, g_weaponHidden{ false };
@@ -125,14 +205,8 @@ namespace fo4flatvr::dlg
             return reinterpret_cast<GetObjectByName_t>(Base() + kGetObjectByName)(root, kWeapon, true, false);
         }
         bool Culled(const RE::NiAVObject* a_o) { return (a_o->flags.flags & 1) != 0; }
-        void SetCulled(RE::NiAVObject* a_o, bool a_on)
-        {
-            if (a_on) {
-                a_o->flags.flags |= 1;
-            } else {
-                a_o->flags.flags &= ~static_cast<std::uint64_t>(1);
-            }
-        }
+        // 22 Nov (VATS head agent): through the engine's SetAppCulled (EngineCull.h: bit 0 now, engine mark on the main thread)
+        void SetCulled(RE::NiAVObject* a_o, bool a_on) { enginecull::Set(a_o, a_on); }
 
         void UpdateWeapon(Game& g, bool a_want)
         {
@@ -167,9 +241,9 @@ namespace fo4flatvr::dlg
 
         std::string CfgString(const Config& c)
         {
-            return std::format("look={} panel={} hideWeapon={} haptics={} pointer={} stick={} dist={:.2f} down={:.2f} width={:.2f} pitch={:.1f} "
+            return std::format("look={} panel={} hideWeapon={} haptics={} pointer={} stickResponses={} dist={:.2f} down={:.2f} width={:.2f} pitch={:.1f} "
                                "lag={:.2f}s deadzone={:.1f} crop=[{:.3f},{:.3f}..{:.3f},{:.3f}] src={:X} premul={} haptic={:.2f}/{:.2f}s leftHanded={}",
-                c.lookAnywhere ? 1 : 0, c.panel ? 1 : 0, c.hideWeapon ? 1 : 0, c.haptics ? 1 : 0, c.pointer ? 1 : 0, c.stickOptions ? 1 : 0,
+                c.lookAnywhere ? 1 : 0, c.panel ? 1 : 0, c.hideWeapon ? 1 : 0, c.haptics ? 1 : 0, c.pointer ? 1 : 0, c.stickResponses ? 1 : 0,
                 c.distanceMeters, c.downMeters, c.widthMeters, c.pitchDeg, c.lagSeconds, c.deadzoneDeg, c.cropLeft, c.cropTop, c.cropRight,
                 c.cropBottom, c.source, c.premultiplied ? 1 : 0, c.hapticAmplitude, c.hapticSeconds, c.leftHanded ? 1 : 0);
         }
@@ -194,7 +268,8 @@ namespace fo4flatvr::dlg
         c.hideWeapon = rb("bHideWeapon", c.hideWeapon);
         c.haptics = rb("bHaptics", c.haptics);
         c.pointer = rb("bPointer", c.pointer);
-        c.stickOptions = rb("bStickOptions", c.stickOptions);
+        c.stickResponses = rb("bStickResponses", c.stickResponses);
+        c.listScroll = rd("Controllers", "bDialogueListNav", 1.0f) != 0.0f;
         // [Menus] bDialoguePanel (default 1, ui-menus): the options go on the menu panel (Presenter, FlatScreenModel capture,
         // live world) instead of into the stereo world image; options stay selectable wherever the head / hand points
         // (FO4VR rule), weapon hidden, haptic pulse. This module's own crop panel ([Dialogue] bPanel) stays as configured.
@@ -230,7 +305,8 @@ namespace fo4flatvr::dlg
             g_look = c.lookAnywhere;
             g_hideWeapon = c.hideWeapon;
             g_haptics = c.haptics;
-            g_stick = c.stickOptions;
+            g_stick = c.stickResponses;
+            g_listScroll = c.listScroll;
         }
     }
 
@@ -240,7 +316,7 @@ namespace fo4flatvr::dlg
         ApplyCfg(c);
         // 20 Nov (live settings, ConfigStore.h): [Dialogue] and [Menus] bDialoguePanel are re-read on a change; the D-look call
         // sites are patched whatever bLookAnywhere says at load (each passes through while g_look is off)
-        cfgstore::Subscribe("dialogue", "Dialogue,Menus/bDialoguePanel,Controllers/bLeftHanded", [](const cfgstore::Changes&) {
+        cfgstore::Subscribe("dialogue", "Dialogue,Menus/bDialoguePanel,Controllers/bLeftHanded,Controllers/bDialogueListNav", [](const cfgstore::Changes&) {
             const Config n = ReadCfg();
             ApplyCfg(n);
             REX::INFO("dialogue: settings re-read (live): {}", CfgString(n));
@@ -276,7 +352,30 @@ namespace fo4flatvr::dlg
         } else {
             sites = " not installed (bLookAnywhere=0)";
         }
-        const auto s = CfgString(c) + " | look sites" + sites;
+        // 22 Nov: OnMenuButtonPress pass-through probe (records the response type the engine receives, from the stick, a
+        // movie button or XDI); the stick calls the function through it. Bytes checked; not detoured if they differ.
+        {
+            const auto addr = Base() + kOnMenuButtonPress;
+            if (std::memcmp(reinterpret_cast<const void*>(addr), kOmbpBytes, sizeof(kOmbpBytes)) == 0) {
+                static REL::Trampoline tramp{ "fo4flatvr dialogue pick" };
+                tramp.create(64);
+                auto* stub = static_cast<std::uint8_t*>(tramp.allocate(5 + 14));
+                std::memcpy(stub, reinterpret_cast<const void*>(addr), 5);  // mov [rsp+10h],rbx: position independent
+                stub[5] = 0xFF;
+                stub[6] = 0x25;
+                std::memset(stub + 7, 0, 4);
+                const std::uint64_t back = addr + 5;
+                std::memcpy(stub + 11, &back, 8);
+                g_ombpOrig = reinterpret_cast<Ombp_t>(stub);
+                tramp.write_jmp<5>(addr, reinterpret_cast<void*>(&HkOnMenuButtonPress));
+                g_ombpInstall = "detoured (pass-through probe)";
+            } else {
+                g_ombpOrig = reinterpret_cast<Ombp_t>(addr);  // still callable; no probe
+                g_ombpInstall = "bytes differ (another mod hooks it?): no probe, called directly";
+            }
+            REX::INFO("dialogue: MenuTopicManager::OnMenuButtonPress {:X} {}", kOnMenuButtonPress, g_ombpInstall);
+        }
+        const auto s = CfgString(c) + " | look sites" + sites + " | OnMenuButtonPress " + g_ombpInstall;
         REX::INFO("dialogue: {}", s);
         return s;
     }
@@ -284,6 +383,169 @@ namespace fo4flatvr::dlg
     const Config& GetConfig()
     {
         return g_cfg;
+    }
+
+    namespace
+    {
+        using GValue = Scaleform::GFx::Value;
+        std::atomic<bool> g_canFlick{ false };  // DialogueMenu open, accepting input, enabled (looking)
+
+        double GNum(const GValue& a_v, double a_def)
+        {
+            switch (a_v.GetType()) {
+            case GValue::ValueType::kNumber: return a_v.GetNumber();
+            case GValue::ValueType::kInt: return a_v.GetInt();
+            case GValue::ValueType::kUInt: return a_v.GetUInt();
+            default: return a_def;
+            }
+        }
+        double GMem(const GValue& a_o, const char* a_n, double a_def)
+        {
+            GValue v;
+            return a_o.IsObject() && a_o.GetMember(a_n, &v) ? GNum(v, a_def) : a_def;
+        }
+
+        // Main thread. XDI's movie: root1 = MainTimeline, root1.List_mc = its BSScrollingList (entryList rows carry optionID =
+        // the response slot 0..3 for the vanilla options; XDI framework options have their own ids).
+        void UpdateXdi(RE::IMenu* a_m, bool a_shown)
+        {
+            int         mode = kNoXdi;
+            std::string desc = "-";
+            GValue      list;
+            if (a_m && XdiDll() && a_m->uiMovie && a_m->uiMovie->GetVariable(&list, "root1.List_mc") && list.IsObject()) {
+                mode = kXdiHidden;
+                if (a_shown) {
+                    GValue      arr;
+                    const double alpha = GMem(list, "alpha", 0.0);
+                    const int    sel = static_cast<int>(GMem(list, "selectedIndex", -1.0));
+                    std::uint32_t n = 0;
+                    bool          slots = true;
+                    unsigned      seen = 0;
+                    std::string   rows;
+                    if (list.GetMember("entryList", &arr) && arr.IsArray()) {
+                        n = arr.GetArraySize();
+                        for (std::uint32_t i = 0; i < n; ++i) {
+                            GValue e, t;
+                            arr.GetElement(i, &e);
+                            const int id = static_cast<int>(GMem(e, "optionID", -1.0));
+                            if (id < 0 || id > 3 || (seen & (1u << id))) {
+                                slots = false;
+                            } else {
+                                seen |= 1u << id;
+                            }
+                            std::string txt = e.IsObject() && e.GetMember("text", &t) && t.IsString() ? std::string(t.GetString()) : std::string();
+                            if (txt.size() > 24) txt.resize(24);
+                            std::replace(txt.begin(), txt.end(), '\'', '`');
+                            rows += std::format("{}{}:{}\"{}\"", i ? " " : "", i, id, txt);
+                        }
+                    }
+                    if (alpha > 0.0 && n > 0) {
+                        mode = slots && n <= 4 ? kXdiSlots : kXdiLong;
+                    }
+                    desc = std::format("rows={} alpha={:.2f} sel={} [{}]", n, alpha, sel, rows);
+                }
+            }
+            const int prev = g_xdiMode.exchange(mode);
+            // log on a mode change or new rows (not on a selection / fade change)
+            static std::string s_key;
+            const auto         b = desc.find(" [");
+            const std::string  key = b == std::string::npos ? std::string() : desc.substr(b);
+            if (mode != prev || ((mode == kXdiSlots || mode == kXdiLong) && key != s_key)) {
+                static constexpr const char* kM[4] = { "no XDI list", "XDI slots (stick = the 4 responses)", "XDI long list (stick scrolls)",
+                    "XDI list hidden" };
+                if (mode != kNoXdi || prev != kNoXdi) {
+                    REX::INFO("dialogue: {} {}", kM[mode], desc);
+                }
+            }
+            if (mode == kXdiSlots || mode == kXdiLong) {
+                s_key = key;
+            }
+            std::scoped_lock l(g_xdiLock);
+            if (mode != kXdiHidden || g_xdiDesc == "-") {
+                g_xdiDesc = desc;
+            }
+        }
+
+        Scaleform::Ptr<RE::IMenu> DialogueMenuPtr()
+        {
+            auto* ui = RE::UI::GetSingleton();
+            static const RE::BSFixedString kDialogue("DialogueMenu");
+            return ui ? ui->GetMenu(kDialogue) : nullptr;
+        }
+
+        // Main thread: the response `a_type` as FO4VR's stick does (12ED530 -> OnMenuButtonPress). Under XDI with a choice
+        // pending, XDI's own row for that slot is picked (its click handler), so XDI's result / framework logic runs.
+        void PickOnMain(int a_type, int a_dir)
+        {
+            auto        menu = DialogueMenuPtr();
+            const auto* mtm = *reinterpret_cast<std::uint8_t* const*>(Base() + kMenuTopicManager);
+            if (!menu || !mtm || !g_ombpOrig) {
+                return;
+            }
+            const auto* raw = reinterpret_cast<const std::uint8_t*>(menu.get());
+            if (!raw[kDmAcceptInput]) {
+                return;
+            }
+            const bool pending = mtm[kChoicePending] != 0;
+            GValue     list, root;
+            if (XdiDll() && menu->uiMovie && menu->uiMovie->GetVariable(&list, "root1.List_mc") && list.IsObject() &&
+                menu->uiMovie->GetVariable(&root, "root1") && root.IsObject()) {
+                if (pending && GMem(list, "alpha", 0.0) > 0.0) {
+                    GValue arr;
+                    int    idx = -1;
+                    if (list.GetMember("entryList", &arr) && arr.IsArray()) {
+                        for (std::uint32_t i = 0; i < arr.GetArraySize(); ++i) {
+                            GValue e;
+                            arr.GetElement(i, &e);
+                            if (static_cast<int>(GMem(e, "optionID", -1.0)) == a_type) {
+                                idx = static_cast<int>(i);
+                                break;
+                            }
+                        }
+                    }
+                    if (idx < 0) {
+                        REX::INFO("dialogue: stick {} -> {} ({}): XDI shows no row for that response; nothing picked", kDirName[a_dir], a_type,
+                            kTypeName[a_type]);
+                        return;
+                    }
+                    list.SetMember("selectedIndex", GValue(static_cast<std::int32_t>(idx)));
+                    GValue nul(nullptr);
+                    const bool ok = root.Invoke("onItemPress", nullptr, &nul, 1);
+                    REX::INFO("dialogue: stick {} -> {} ({}): XDI row {} picked ({})", kDirName[a_dir], a_type, kTypeName[a_type], idx,
+                        ok ? "onItemPress" : "onItemPress FAILED");
+                    return;
+                }
+            }
+            REX::INFO("dialogue: stick {} -> {} ({}): OnMenuButtonPress ({})", kDirName[a_dir], a_type, kTypeName[a_type],
+                pending ? "choice pending: the response" : "no choice pending: interrupts the line, as FO4VR");
+            t_ombpFromUs = true;
+            g_ombpOrig(const_cast<std::uint8_t*>(mtm), a_type);
+            t_ombpFromUs = false;
+        }
+
+        // Main thread: one scroll step in XDI's list (its own gamepad handlers: DialogueMenu.ProcessUserEvent QuickkeyUp/Down
+        // -> List_mc.moveSelectionUp/Down, QuickkeyLeft/Right -> MainTimeline.listmcspindown/up for value rows).
+        void ScrollOnMain(int a_dir)
+        {
+            auto        menu = DialogueMenuPtr();
+            const auto* mtm = *reinterpret_cast<std::uint8_t* const*>(Base() + kMenuTopicManager);
+            GValue      list, root;
+            if (!menu || !mtm || !mtm[kChoicePending] || !menu->uiMovie || !menu->uiMovie->GetVariable(&list, "root1.List_mc") ||
+                !list.IsObject() || GMem(list, "alpha", 0.0) <= 0.0 || !menu->uiMovie->GetVariable(&root, "root1") || !root.IsObject()) {
+                return;
+            }
+            bool ok = false;
+            switch (a_dir) {
+            case 1: ok = list.Invoke("moveSelectionUp"); break;
+            case 3: ok = list.Invoke("moveSelectionDown"); break;
+            case 4: ok = root.Invoke("listmcspindown"); break;
+            case 2: ok = root.Invoke("listmcspinup"); break;
+            default: break;
+            }
+            if (!ok) {
+                REX::WARN("dialogue: XDI scroll {} failed", kDirName[a_dir]);
+            }
+        }
     }
 
     void Tick()
@@ -295,6 +557,7 @@ namespace fo4flatvr::dlg
         g.open = g.accept = g.looking = g.buttons = false;
         g.flatExclusive = false;
         std::string other;
+        Scaleform::Ptr<RE::IMenu> dlgMenu;  // 22 Nov: XDI list poll (main thread, after the stack walk)
         if (ui) {
             static const RE::BSFixedString kDialogue("DialogueMenu");
             auto& lock = *reinterpret_cast<RE::BSReadWriteLock*>(Base() + kMenuStackLock);
@@ -311,6 +574,7 @@ namespace fo4flatvr::dlg
                     g.accept = raw[kDmAcceptInput] != 0;
                     g.looking = raw[kDmLooking] != 0;
                     g.buttons = raw[kDmButtons] != 0;
+                    dlgMenu = m;
                     continue;
                 }
                 const auto  flags = m->menuFlags.underlying();
@@ -327,7 +591,7 @@ namespace fo4flatvr::dlg
         g.flatExclusive = g.open && other.empty();
         const auto* mtm = *reinterpret_cast<std::uint8_t* const*>(Base() + kMenuTopicManager);
         g.menuOpen = mtm && mtm[kMenuOpen] != 0;
-        g.block = mtm && mtm[kBlockInput] != 0;
+        g.pending = mtm && mtm[kChoicePending] != 0;
         if (g.open) {
             ++g.openTicks;
             ++(g.looking ? g.lookingTicks : g.notLookingTicks);
@@ -351,7 +615,9 @@ namespace fo4flatvr::dlg
         UpdateWeapon(g, g_hideWeapon.load() && g.open);
         g_open = g.open;
         g_flatExclusive = g.flatExclusive;
-        g_canPick = g.open && g.buttons && g.looking && g.accept && !g.block;
+        g_canPick = g.open && g.buttons && g.looking && g.accept && g.pending;
+        g_canFlick = g.open && g.looking && g.accept;
+        UpdateXdi(dlgMenu.get(), g.open && g.buttons);
         std::scoped_lock l(g_gLock);
         g.otherFlat = other;
     }
@@ -365,38 +631,71 @@ namespace fo4flatvr::dlg
     void FilterPad(pad::State& a_p, float a_x, float a_y)
     {
         Game& g = g_g;
-        // EDI list navigation owns the primary stick (ControllerBindings: D-pad steps); no stick -> option button then
-        if (!g_stick.load() || !g_open.load() || bindings::DialogueListNavActive()) {
-            g.stickBtn = -1;
+        if (!g_open.load()) {
+            g.stickArmed = false;  // a stick held when the menu opens must come back to neutral first
+            g.lastDir = g.scrollDir = 0;
             return;
         }
-        const bool left = g_cfg.leftHanded;
-        // The primary stick belongs to the options while the menu is open (no turning / wheel from it).
-        if (left) {
+        const int  mode = g_xdiMode.load();
+        const bool xdi = mode != kNoXdi;
+        const bool responses = g_stick.load();
+        if (!responses && !(xdi && g_listScroll.load())) {
+            return;  // both off: the stick is passed on as before 22 Nov
+        }
+        // The primary stick belongs to the options while the menu is open (no turning / wheel from it). Under XDI the
+        // bindings' D-pad pulses (bDialogueListNav) are dropped: the list is driven through its movie below.
+        if (g_cfg.leftHanded) {
             a_p.lx = a_p.ly = 0.0f;
         } else {
             a_p.rx = a_p.ry = 0.0f;
         }
-        const float ax = std::abs(a_x), ay = std::abs(a_y);
-        const float m = (std::max)(ax, ay);
-        if (g.stickBtn >= 0 && m < 0.35f) {
-            g.stickBtn = -1;  // released: re-armed
-        } else if (g.stickBtn < 0 && m > 0.7f && g_canPick.load()) {
-            // flat gamepad layout of the 4 options: Y top, X left, B right, A bottom
-            g.stickBtn = ay >= ax ? (a_y > 0.0f ? 3 : 0) : (a_x > 0.0f ? 1 : 2);
-            ++g.stickPresses[g.stickBtn];
-            static constexpr const char* kN[4] = { "A(down)", "B(right)", "X(left)", "Y(up)" };
+        if (xdi) {
+            a_p.dpadUp = a_p.dpadDown = a_p.dpadLeft = a_p.dpadRight = false;
+        }
+        const int  dir = Fo4vrDir(a_x, a_y);
+        const auto now = std::chrono::steady_clock::now();
+        const bool scroll = xdi && g_listScroll.load() && (mode == kXdiLong || (mode == kXdiSlots && !responses));
+        if (scroll) {
+            // XDI long list: one step per push, repeating while held (the quick-loot pulser timing: 450 ms, then 170 ms)
+            if (dir == 0) {
+                g.scrollDir = 0;
+                g.stickArmed = true;
+                return;
+            }
+            g.stickArmed = false;
+            if (!g_canPick.load()) {
+                return;
+            }
+            if (dir != g.scrollDir || now >= g.nextScroll) {
+                g.nextScroll = now + std::chrono::milliseconds(dir != g.scrollDir ? 450 : 170);
+                g.scrollDir = dir;
+                ++g.scrollSteps;
+                tq::RunOnMain([dir]() { ScrollOnMain(dir); });
+            }
+            return;
+        }
+        g.scrollDir = 0;
+        if (dir == 0) {
+            g.stickArmed = true;
+            g.lastDir = 0;
+            return;
+        }
+        if (!g.stickArmed || !responses) {
+            return;  // FO4VR fires on the move out of neutral only (ThumbstickEvent prev == none)
+        }
+        g.stickArmed = false;
+        g.lastDir = dir;
+        if (!g_canFlick.load()) {
+            return;
+        }
+        const int type = kDirToType[dir];
+        ++g.stickFlicks[dir];
+        {
             std::scoped_lock l(g_gLock);
-            g.lastStick = std::format("{} at stick {:.2f},{:.2f}", kN[g.stickBtn], a_x, a_y);
-            REX::INFO("dialogue: stick -> {}", g.lastStick);
+            g.lastStick = std::format("{} -> {} {} at stick {:.2f},{:.2f} ({})", kDirName[dir], type, kTypeName[type], a_x, a_y,
+                mode == kXdiSlots ? "XDI row" : mode == kNoXdi ? "OnMenuButtonPress" : "between lines: OnMenuButtonPress");
         }
-        switch (g.stickBtn) {
-        case 0: a_p.a = true; break;
-        case 1: a_p.b = true; break;
-        case 2: a_p.x = true; break;
-        case 3: a_p.y = true; break;
-        default: break;
-        }
+        tq::RunOnMain([type, dir]() { PickOnMain(type, dir); });
     }
 
     std::string GameStatus()
@@ -413,16 +712,25 @@ namespace fo4flatvr::dlg
             std::scoped_lock l(g_cfgLock);
             c = g_cfg;
         }
-        return std::format("open={} menuOpen={} looking={} buttons={} accept={} block={} exclusive={} otherFlat='{}' opens={} ticks={} openTicks={} "
+        std::string xdi;
+        {
+            std::scoped_lock l(g_xdiLock);
+            xdi = g_xdiDesc;
+        }
+        static constexpr const char* kM[4] = { "none", "slots", "long", "hidden" };
+        return std::format("open={} menuOpen={} looking={} buttons={} accept={} pending={} exclusive={} otherFlat='{}' opens={} ticks={} openTicks={} "
                            "lookingTicks={} notLookingTicks={} lookOffEdges={} buttonEdges={} | look={} patched={}{}{} calls={}/{}/{} forced={}/{}/{} | "
-                           "weapon hide={} hidden={} culls={} recull={} restores={} missing={} | stick on={} canPick={} presses A={} B={} X={} Y={} last {} | "
-                           "haptics={} | cfg {}",
-            g.open ? 1 : 0, g.menuOpen ? 1 : 0, g.looking ? 1 : 0, g.buttons ? 1 : 0, g.accept ? 1 : 0, g.block ? 1 : 0, g.flatExclusive ? 1 : 0, other,
-            g.opens, g.ticks, g.openTicks, g.lookingTicks, g.notLookingTicks, g.lookOffEdges, g.buttonEdges, g_look.load() ? 1 : 0,
+                           "weapon hide={} hidden={} culls={} recull={} restores={} missing={} | stick responses={} listScroll={} canPick={} canFlick={} "
+                           "flicks up={} right={} down={} left={} scrollSteps={} last='{}' | engine picks={} ours={} lastType={} probe='{}' | "
+                           "xdiDll={} xdiMode={} xdi='{}' | haptics={} | cfg {}",
+            g.open ? 1 : 0, g.menuOpen ? 1 : 0, g.looking ? 1 : 0, g.buttons ? 1 : 0, g.accept ? 1 : 0, g.pending ? 1 : 0, g.flatExclusive ? 1 : 0,
+            other, g.opens, g.ticks, g.openTicks, g.lookingTicks, g.notLookingTicks, g.lookOffEdges, g.buttonEdges, g_look.load() ? 1 : 0,
             g_patched[0] ? 1 : 0, g_patched[1] ? 1 : 0, g_patched[2] ? 1 : 0, g_calls[0].load(), g_calls[1].load(), g_calls[2].load(),
             g_forced[0].load(), g_forced[1].load(), g_forced[2].load(), g_hideWeapon.load() ? 1 : 0, g_weaponHidden.load() ? 1 : 0, g.weaponCulls,
-            g.weaponRecull, g.weaponRestores, g.weaponMissing, g_stick.load() ? 1 : 0, g_canPick.load() ? 1 : 0, g.stickPresses[0], g.stickPresses[1],
-            g.stickPresses[2], g.stickPresses[3], stick, g_haptics.load() ? 1 : 0, CfgString(c));
+            g.weaponRecull, g.weaponRestores, g.weaponMissing, g_stick.load() ? 1 : 0, g_listScroll.load() ? 1 : 0, g_canPick.load() ? 1 : 0,
+            g_canFlick.load() ? 1 : 0, g.stickFlicks[1], g.stickFlicks[2], g.stickFlicks[3], g.stickFlicks[4], g.scrollSteps, stick,
+            g_ombpCalls.load(), g_ombpOurs.load(), g_ombpLastType.load(), g_ombpInstall, g_xdiDll.load(), kM[std::clamp(g_xdiMode.load(), 0, 3)],
+            xdi, g_haptics.load() ? 1 : 0, CfgString(c));
     }
 
     std::string GameCommand(const std::string& a_arg)
@@ -448,7 +756,11 @@ namespace fo4flatvr::dlg
                     const float  d = std::sqrt((p.x - pp.x) * (p.x - pp.x) + (p.y - pp.y) * (p.y - pp.y) + (p.z - pp.z) * (p.z - pp.z));
                     const char*  nm = r->GetDisplayFullName();
                     const auto*  base = r->GetObjectReference();
-                    v.emplace_back(d, std::format("{:08X}/{:08X} '{}' {:.0f}", r->GetFormID(), base ? base->GetFormID() : 0, nm ? nm : "", d));
+                    // 22 Nov: bearing (game heading convention: 0 = +Y, clockwise, degrees) and height difference, so a test can
+                    // point a hand at the actor directly
+                    const float brg = std::atan2(p.x - pp.x, p.y - pp.y) * 57.29578f;
+                    v.emplace_back(d, std::format("{:08X}/{:08X} '{}' {:.0f} b={:.1f} dz={:.0f}", r->GetFormID(), base ? base->GetFormID() : 0,
+                                          nm ? nm : "", d, brg, p.z - pp.z));
                 }
                 std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
                 std::string s = std::format("n={}", v.size());
@@ -474,7 +786,8 @@ namespace fo4flatvr::dlg
             return {};
         };
         using Flag = std::pair<const char*, std::atomic<bool>*>;
-        const Flag flags[] = { { "look", &g_look }, { "weapon", &g_hideWeapon }, { "haptics", &g_haptics }, { "stick", &g_stick } };
+        const Flag flags[] = { { "look", &g_look }, { "weapon", &g_hideWeapon }, { "haptics", &g_haptics }, { "stick", &g_stick },
+            { "scroll", &g_listScroll } };
         for (const auto& [k, f] : flags) {
             if (auto r = onoff(k, *f); !r.empty()) {
                 return r;

@@ -12,8 +12,15 @@
 //          restored when it closes. WeaponHidden() is the query for other features (Hands).
 //  D-rumble rising edge of DialogueMenu +0x165 (set by ProcessMessage on DialogueShowButtons = "ShowButtonHelp") ->
 //          one haptic pulse on the primary controller (FO4VR fDialogueRumble*).
-//  D-stick primary thumbstick direction -> MultiActivate face button through the virtual pad (up Y, down A, left X,
-//          right B: the flat gamepad layout of the 4 options; FO4VR maps the same 4 directions), stick zeroed meanwhile.
+//  D-stick 22 Nov (FO4VR DialogueMenu::HandleEvent(ThumbstickEvent) VR 12ED530; evidence/dialogue.md): a primary-stick
+//          flick from neutral picks a response at once, by FO4VR's fixed directions: up = Question, right = Negative
+//          (sarcastic), down = Positive, left = Neutral; FO4VR's direction rule (fLThumbDeadzone 0.25 / Max 0.94 rescale,
+//          fDirectionalDeadzone 0.5 per axis, dominant axis at 45 deg). Vanilla DialogueMenu.swf: MenuTopicManager::
+//          OnMenuButtonPress(type) (BAF7C0), the call FO4VR makes. Extended Dialogue Interface (XDI.dll): its list row
+//          whose optionID is that slot is picked through XDI's own handler (List_mc.selectedIndex + root.onItemPress),
+//          so XDI's framework / result logic runs as on a click. XDI lists that are not the 4 slots (more than 4 rows or
+//          other optionIDs): the stick scrolls (List_mc.moveSelectionUp/Down, repeat while held; left/right = XDI value
+//          rows), A / the trigger picks the highlighted row. Primary stick zeroed while DialogueMenu is open.
 // Render / XR side (DialogueLayer.cpp, D3D11):
 //  D-cap   GameHud H1 (DrawPostFX call A3D3C5) copies the "FlatScreenModel" renderer's 0x3E/0x3F (crop box) while
 //          DialogueMenu is the only open FlatScreenModel menu; H2 (RenderMain call A3CD30) skips that renderer's
@@ -49,7 +56,9 @@ namespace fo4flatvr::dlg
         bool  hideWeapon{ false };     // [Dialogue] bHideWeapon
         bool  haptics{ false };        // [Dialogue] bHaptics
         bool  pointer{ false };        // [Dialogue] bPointer (menu laser pointer on the panel)
-        bool  stickOptions{ false };   // [Dialogue] bStickOptions (primary stick direction -> option button)
+        bool  stickResponses{ true };  // [Dialogue] bStickResponses (22 Nov; FO4VR primary-stick directions -> the 4 responses).
+                                       // The old [Dialogue] bStickOptions (off by default, pad buttons) is no longer read.
+        bool  listScroll{ true };      // [Controllers] bDialogueListNav: XDI long lists scroll with the primary stick
         float distanceMeters{ 0.6f }; // [Dialogue] fDistanceMeters (ahead of the HMD, horizontal)
         float downMeters{ 0.2f };     // [Dialogue] fDownMeters (below the HMD)
         float widthMeters{ 0.6f };    // [Dialogue] fWidthMeters (height from the crop's aspect)
@@ -77,11 +86,11 @@ namespace fo4flatvr::dlg
     bool FlatExclusive();        // ... and no other FlatScreenModel menu is open (the capture holds only the options)
     bool TakeHapticRequest();    // true once per options-shown edge (bHaptics)
     bool WeaponHidden();         // the first-person weapon is culled by us right now (query for Hands)
-    bool CanPick();              // options shown + enabled + input accepted (last Tick; any thread)
+    bool CanPick();              // options shown + enabled + input accepted + a choice pending (last Tick; any thread)
     // Presenter, before comfort::FilterPad: primary stick direction -> pad face button while options can be picked.
     void FilterPad(pad::State& a_p, float a_stickX, float a_stickY);
     std::string GameStatus();
-    std::string GameCommand(const std::string& a_arg);  // look/weapon/haptics/stick on|off
+    std::string GameCommand(const std::string& a_arg);  // look/weapon/haptics/stick/scroll on|off, npcs
 
     // ---- render / XR side (DialogueLayer.cpp) --------------------------------------------------------------------
     bool CaptureWanted();                              // GameHud H1, renderer "FlatScreenModel"

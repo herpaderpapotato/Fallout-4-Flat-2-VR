@@ -95,14 +95,25 @@ def rows():
     R.append(row("Quick", "Controls", "Controllers", "bWorkshopHandPointer", "bool", 1, "Workshop: place with the hand",
                  "Highlight and placement of workshop objects follow the aim hand's pointer, as FO4VR (0 = the camera ray). Live.",
                  apply="@reload"))
-    R.append(row("Quick", "Controls", "Menus", "bWorkshopHandCrop", "bool", 1, "Workshop: build area on the hand",
-                 "The hand panel shows only the build area of the workshop menu, readable (0 = the whole menu image). Live.",
+    R.append(row("Quick", "Controls", "Menus", "bWorkshopHandCrop", "bool", 1, "Workshop: menu stage on the hand",
+                 "The hand panel shows the workshop menu's 16:9 stage from the start below (0 = the whole menu image). Live.",
                  apply="@reload"))
-    R.append(row("Quick", "Controls", "Menus", "fWorkshopCropTop", "float", 0.45, "Workshop build area start",
-                 "Where the build area starts, as a fraction of the menu height from the top.", 0.0, 0.9, 0.05, apply="@reload"))
+    # 22 Nov: default 0 (the whole stage): flat Workshop.swf puts item info / requirements / rows over v 0.09-0.96
+    R.append(row("Quick", "Controls", "Menus", "fWorkshopCropTop", "float", 0.0, "Workshop menu area start",
+                 "Where the hand panel's menu area starts, as a fraction of the menu height from the top (0 = all; "
+                 "0.08 = without the settlement stats bar).", 0.0, 0.9, 0.01, apply="@reload"))
     R.append(row("Quick", "Controls", "Controllers", "bGlyphRemap", "bool", 1, "Glyphs match the Touch buttons",
                  "Button glyphs in menus, HUD prompts and messages show the Touch control that does the action (0 = flat Xbox glyphs). "
                  "A menu already open keeps its glyphs until it opens again.", apply="@reload"))
+    # 22 Nov (dialogue agent): FO4VR right-stick dialogue responses (GameDialogue.cpp FilterPad; evidence/dialogue.md)
+    R.append(row("Quick", "Controls", "Dialogue", "bStickResponses", "bool", 1, "Dialogue: stick picks the response",
+                 "Flick the aiming hand's stick to answer, always the same direction as FO4VR: up question, right sarcastic, down "
+                 "positive, left neutral. With Extended Dialogue Interface its row for that response is picked. Live.",
+                 apply="@reload"))
+    R.append(row("Quick", "Controls", "Controllers", "bDialogueListNav", "bool", 1, "Dialogue: stick scrolls long lists",
+                 "Extended Dialogue Interface lists that are not the four standard responses scroll with the aiming hand's stick; "
+                 "A or the trigger picks the highlighted row. Live (the trigger as A: after a restart).",
+                 apply="@reload"))
     # ---- Camera ----
     for st, dflt, label in CAMERA_STATES:
         help_ = ("TRACK = head-tracked first-person world; SCENE = the game camera position + your head (AAF method); "
@@ -505,6 +516,16 @@ def rows():
     # 20 Nov (VATS agent): C44 1st / 3rd person switch sync (FRIK-flat PovSwitchSync.h)
     R.append(row("FRIK", "Body", "FRIK", "bPovSwitchSync", "bool", 1, "Keep view switches in step with the body",
                  "VATS playback / third person switches run completely with the FRIK body shown (animated VATS body, VATS shots from the real muzzle, no stuck crouch height after VATS). Live.",
+                 apply="frik reread"))
+    # 22 Nov (VATS head agent): C45 head shown outside first person, C23b skin restore onto the live bones
+    R.append(row("FRIK", "Body", "FRIK", "bEngineCullFlag", "bool", 1, "Head hide through the engine",
+                 "Every FRIK-flat / fo4flatvr hide and show also uses the game's own hide call (main thread), so things shown again are drawn - e.g. the head in VATS playback (off: it stayed invisible). Live.",
+                 apply="frik reread"))
+    R.append(row("FRIK", "Body", "FRIK", "bShowHeadOutsideFirstPerson", "bool", 1, "Head always shown outside first person",
+                 "VATS playback, third person and other game cameras (not the free camera) never show the player without a head, whatever hid it. Live.",
+                 apply="frik reread"))
+    R.append(row("FRIK", "Body", "FRIK", "bSkinRestoreLiveBones", "bool", 1, "Body skin back on the live bones",
+                 "Leaving first person, every body / head / outfit piece is skinned from the animated bones again (none left on FRIK's last first-person pose). Live.",
                  apply="frik reread"))
     R.append(row("FRIK", "Body", "FRIK", "bAnimatedLegs", "bool", 1, "VRIK-style legs",
                  "Moving: the legs follow the game's walk / run / strafe animation (needs Body animation graph). Standing: planted feet with short steps. Off: FRIK's walk.",

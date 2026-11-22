@@ -6,6 +6,7 @@
 #include "plugin/ControllerBindings.h"
 #include "plugin/FloatingGun.h"
 #include "plugin/FrikBridge.h"
+#include "plugin/ThreadQueues.h"  // v9 RunOnMain
 #include "plugin/FrikBridgeApi.h"
 #include "plugin/Gestures.h"
 #include "plugin/Haptics.h"
@@ -394,8 +395,16 @@ namespace fo4flatvr::frikbridge
             return bindings::SetClaims(a_owner, a_left, a_right) ? 1 : 0;
         }
 
+        // v9: main-thread queue for FRIK-flat (engine cull calls)
+        std::uint8_t RunOnMainC(void (*a_fn)(void*), void* a_ctx)
+        {
+            if (!a_fn) return 0;
+            return tq::RunOnMain([a_fn, a_ctx] { a_fn(a_ctx); }) ? 1 : 0;
+        }
+
         constexpr FO4FlatVR_FrikBridge kBridge{ FO4FLATVR_FRIK_BRIDGE_VERSION, 0, &GetFrame, &Vibrate, &SetFrikActive, &IniPathC, &SetFrameCallback,
-            &BodyEnabled, &SetCameraOffsetCallback, &GetSelfie, &RecentreCount, &NoScalingC, &SetFrikConfigApiC, &ConfigRevisionC, &SetInputClaimsC };
+            &BodyEnabled, &SetCameraOffsetCallback, &GetSelfie, &RecentreCount, &NoScalingC, &SetFrikConfigApiC, &ConfigRevisionC, &SetInputClaimsC,
+            &RunOnMainC };
     }
 
     bool BodyActive() { return g_frikActive.load(); }
@@ -600,7 +609,7 @@ namespace fo4flatvr::frikbridge
 extern "C" __declspec(dllexport) const FO4FlatVR_FrikBridge* FO4FLATVR_GetFrikBridge(std::uint32_t a_version)
 {
     using namespace fo4flatvr::frikbridge;
-    // v4 appends GetSelfie, v5 RecentreCount, v6 NoScaling + SetFrikConfigApi, v7 ConfigRevision, v8 SetInputClaims: an older FRIK.dll gets the same table (it never
+    // v4 appends GetSelfie, v5 RecentreCount, v6 NoScaling + SetFrikConfigApi, v7 ConfigRevision, v8 SetInputClaims, v9 RunOnMain: an older FRIK.dll gets the same table (it never
     // reads past its own fields)
     if (a_version < FO4FLATVR_FRIK_BRIDGE_MIN_VERSION || a_version > FO4FLATVR_FRIK_BRIDGE_VERSION) {
         REX::WARN("[FRIK] FRIK.dll asked for bridge v{}, have v{}..v{}: FRIK-flat stays dormant", a_version, FO4FLATVR_FRIK_BRIDGE_MIN_VERSION,

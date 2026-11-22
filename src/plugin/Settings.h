@@ -99,14 +99,18 @@ namespace fo4flatvr
         float       menuWorkbenchDistanceMeters{ 0.68f }; // [Menus] fWorkbenchDistanceMeters
         float       menuWorkbenchHeightMeters{ -0.08f }; // [Menus] fWorkbenchHeightMeters
         // FO4VR workshop mode: the WorkshopMenu movie on the off-hand controller (WSWorkshopModel, WS_InvWand.nif on the
-        // secondary wand, ~0.40 m), not in front of the head. Placement in the off-hand grip frame.
+        // secondary wand, ~0.40 m), not in front of the head. 22 Nov: placement in the off hand's FO4VR wand frame (the
+        // OpenXR grip . [Weapon] fGripRot / fGripOffset, the frame the floating gun and FRIK-flat use; -60 deg X = the aim
+        // pose), offsets and pitch = WS_InvWand.nif's shape transform under SecondaryUIOffsetNode (identity on Touch).
         bool        menuWorkshopOnHand{ true };          // [Menus] bWorkshopOnHand
         float       menuWorkshopHandWidthMeters{ 0.40f }; // [Menus] fWorkshopHandWidthMeters
-        float       menuWorkshopHandUpMeters{ 0.13f };   // [Menus] fWorkshopHandUpMeters (along the grip's +Y)
-        float       menuWorkshopHandBackMeters{ 0.03f }; // [Menus] fWorkshopHandBackMeters (along the grip's +Z, toward the user)
-        float       menuWorkshopHandPitchDeg{ -25.0f };  // [Menus] fWorkshopHandPitchDeg (negative = face tilted up toward the eyes)
-        bool        menuWorkshopHandCrop{ true };        // [Menus] bWorkshopHandCrop: hand panel = the build area of the Workshop movie only (21 Nov)
-        float       menuWorkshopCropTop{ 0.45f };        // [Menus] fWorkshopCropTop: that area starts this far down the 16:9 stage (0..0.9)
+        float       menuWorkshopHandUpMeters{ -0.004f }; // [Menus] fWorkshopHandUpMeters (along the wand's up, before the pitch)
+        float       menuWorkshopHandBackMeters{ 0.024f }; // [Menus] fWorkshopHandBackMeters (along the wand's back, toward the user)
+        float       menuWorkshopHandPitchDeg{ -26.8f };  // [Menus] fWorkshopHandPitchDeg (about the wand's X; negative = face tilted up toward the eyes)
+        bool        menuWorkshopHandCrop{ true };        // [Menus] bWorkshopHandCrop: hand panel = the Workshop stage only (no side bands)
+        float       menuWorkshopCropTop{ 0.0f };         // [Menus] fWorkshopCropTop: the shown area starts this far down the 16:9 stage (0..0.9)
+        float       wandGripRotDeg[3]{ -60.0f, 0.0f, 0.0f };  // [Weapon] (else [Hands]) fGripRotX/Y/ZDeg: OpenXR grip -> FO4VR wand
+        float       wandGripOffsetCm[3]{ 0.0f, 0.0f, 0.0f };  // [Weapon] (else [Hands]) fGripOffsetX/Y/Z (right, forward, up; cm)
         float       menuVatsLabelScale{ 2.0f }; // [Menus] fVatsLabelScale: VATS overlay magnified about the selected target (1 = off)
         bool        menuVatsNoVignette{ true }; // [Menus] bVatsNoVignette: no flat VATS VignetteMenu over the live world
         bool        pipboyFloating{ false };    // [Pipboy] bFloating: FO4VR projected Pip-Boy in front of the head instead of the wrist

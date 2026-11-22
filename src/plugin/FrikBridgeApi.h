@@ -43,7 +43,10 @@
 // a claimed control for a gameplay action. The raw state in GetFrame / FRIK-flat's IVRSystem shim is never masked (the
 // claimer reads it there). Masks of all owners are ORed. fo4flatvr.ini [ROCK] bInputClaims=1 (live; 0 = claims are stored
 // but ignored, SetInputClaims returns 0). Appended as v4..v7; a client asks v8 and calls it only when version >= 8.
-#define FO4FLATVR_FRIK_BRIDGE_VERSION 8u
+// v9 (22 Nov, engine cull): RunOnMain - queue a_fn(a_ctx) on fo4flatvr's main-thread queue (tq::RunOnMain: OnIdle C34794,
+// after the frame's job threads). FRIK-flat routes its node hides / shows (NiAVObject::SetAppCulled, which also marks every
+// parent changed - shared scene-graph nodes) through it. Returns 1 = queued, 0 = not (the caller runs it itself).
+#define FO4FLATVR_FRIK_BRIDGE_VERSION 9u
 #define FO4FLATVR_FRIK_BRIDGE_MIN_VERSION 3u
 
 #ifdef __cplusplus
@@ -172,6 +175,8 @@ typedef struct FO4FlatVR_FrikBridge
     // a_right = FO4FLATVR_CLAIM_* bits of the physical left / right controller; 0, 0 releases the owner's claims. Returns 1
     // when fo4flatvr honours claims now ([ROCK] bInputClaims=1), 0 when they are stored but ignored (switch off, bad owner).
     uint8_t (*SetInputClaims)(uint32_t a_owner, uint32_t a_left, uint32_t a_right);
+    // v9: run a_fn(a_ctx) on the main thread (queued; any thread may call). 1 = queued.
+    uint8_t (*RunOnMain)(void (*a_fn)(void*), void* a_ctx);
 } FO4FlatVR_FrikBridge;
 
 // v8 input claim bits (per physical hand)

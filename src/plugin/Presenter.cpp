@@ -102,6 +102,7 @@ namespace fo4flatvr::present
             bool          workshopOnHand{ false };     // round 6: the WorkshopMenu panel follows the off-hand grip this frame
             std::uint64_t workshopHandFrames{ 0 };
             bool          workshopCropOn{ false };     // 21 Nov: the hand panel shows only the build area (SetCinemaQuadCrop)
+            float         workshopFaceDeg{ -1.0f };    // 22 Nov: hand panel normal vs the direction to the head (deg; -1 = none)
             // round 7: a terminal on its own monitor in the live world (FO4VR), "" = none; panel geometry source of the last anchor
             std::string   worldScreen;
             std::uint64_t worldScreenFrames{ 0 };
@@ -911,13 +912,32 @@ namespace fo4flatvr::present
                     const bool  gripOk = c.active && (offRight ? c.rightGripPoseValid : c.leftGripPoseValid);
                     if (gripOk) {
                         const xr::Pose& g = offRight ? c.rightGripPose : c.leftGripPose;
-                        const float     half = s.settings.menuWorkshopHandPitchDeg * 0.5f * 0.0174532925f;
-                        const xr::Quat  tilt{ std::sin(half), 0.0f, 0.0f, std::cos(half) };  // about the grip's +X
-                        const xr::Quat& q = g.orientation;
-                        const xr::Quat  o{ q.w * tilt.x + q.x * tilt.w + q.y * tilt.z - q.z * tilt.y,
-                            q.w * tilt.y - q.x * tilt.z + q.y * tilt.w + q.z * tilt.x,
-                            q.w * tilt.z + q.x * tilt.y - q.y * tilt.x + q.z * tilt.w,
-                            q.w * tilt.w - q.x * tilt.x - q.y * tilt.y - q.z * tilt.z };
+                        auto qmul = [](const xr::Quat& a, const xr::Quat& b) {
+                            return xr::Quat{ a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+                                a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z };
+                        };
+                        auto axisQ = [](float x, float y, float z, float deg) {
+                            const float h = deg * 0.5f * 0.0174532925f;
+                            return xr::Quat{ x * std::sin(h), y * std::sin(h), z * std::sin(h), std::cos(h) };
+                        };
+                        // 22 Nov (user: "perpendicular to my face at rest"): the panel was placed in the raw OpenXR grip frame
+                        // as if grip +Y were up and +Z toward the user. OpenXR grip -Z runs along the handle (little finger ->
+                        // thumb), so on Touch the grip is pitched 60 deg up from the pointing (aim) direction: +Y points back at
+                        // the user, +Z down the handle, and the old -25 deg tilt left the face 35 deg below the aim's backward
+                        // direction, edge-on to the eyes. FO4VR hangs WS_InvWand.nif under SecondaryUIOffsetNode (VR
+                        // 140EF43C0..44D7: Rx(-fWeaponRotate_X_Oculus:VR), default 0 = identity) under the secondary wand node;
+                        // the wand frame here = grip . [Weapon] fGripRot / fGripOffset (default -60 deg X = the aim pose), the
+                        // same grip -> wand calibration as the floating gun and FRIK-flat; mirrored for the left hand.
+                        const float*   rd = s.settings.wandGripRotDeg;
+                        const float    mir = offRight ? 1.0f : -1.0f;  // left hand: mirror through the grip's YZ plane
+                        const xr::Quat cw = qmul(qmul(axisQ(0, 1, 0, rd[2] * mir), axisQ(0, 0, 1, -rd[1] * mir)), axisQ(1, 0, 0, rd[0]));
+                        const xr::Quat q = qmul(g.orientation, cw);  // the FO4VR wand frame (OpenXR axes: -Z forward, +Y up)
+                        const float*   oc = s.settings.wandGripOffsetCm;  // game axes (right, forward, up), cm
+                        const xr::Vec3 wo = RotXr(g.orientation, { oc[0] * mir * 0.01f, oc[2] * 0.01f, -oc[1] * 0.01f });
+                        const xr::Vec3 wp{ g.position.x + wo.x, g.position.y + wo.y, g.position.z + wo.z };
+                        // panel = the nif shape's transform in the wand frame: Rx(fWorkshopHandPitchDeg) (-26.8: the face
+                        // normal 26.8 deg above the wand's backward axis), face centre up / back (-0.004 / 0.024 m)
+                        const xr::Quat o = qmul(q, axisQ(1, 0, 0, s.settings.menuWorkshopHandPitchDeg));
                         // 20 Nov (controls agent): FO4VR's X minimises the build menu (hidden: no layer, a vanishing quad
                         // for the pointer) and the held off stick click shows the settlement stats (panel enlarged, raised
                         // so it stays clear of the hand) - ControllerBindings.h WorkshopPanelHidden / WorkshopPanelScale
@@ -925,16 +945,27 @@ namespace fo4flatvr::present
                         const float wsW = s.settings.menuWorkshopHandWidthMeters * wsScale;
                         const float wsUp = s.settings.menuWorkshopHandUpMeters + (wsScale - 1.0f) * s.settings.menuWorkshopHandWidthMeters * 0.3f;
                         const xr::Vec3 off = RotXr(q, { 0.0f, wsUp, s.settings.menuWorkshopHandBackMeters });
-                        const xr::Pose hp{ o, { g.position.x + off.x, g.position.y + off.y, g.position.z + off.z } };
+                        const xr::Pose hp{ o, { wp.x + off.x, wp.y + off.y, wp.z + off.z } };
                         s.runtime.SetCinemaQuadOverride(&hp, bindings::WorkshopPanelHidden() ? 0.001f : wsW);
                         handQuad = true;
                         ++s.workshopHandFrames;
-                        // 21 Nov (workshop agent; user: "the build selection view is not visible ... hidden at the bottom"): the
-                        // whole FlatScreenModel image on a 0.40 m hand panel put flat's build bar (bottom 25 % of the 16:9 stage,
-                        // 60 % of its width) as a thin strip at the panel's lower edge, at the hand. FO4VR's WS_InvWand.nif maps
-                        // only parts of its Workshop movie onto the wand (UV strips). Ours: only the build area of the stage
-                        // (stage v >= fWorkshopCropTop, full stage width) on the hand panel; the whole image while the
-                        // settlement stats are held (they are the stage's top bar). [Menus] bWorkshopHandCrop.
+                        // facing angle: the panel's normal vs the direction from its centre to the head (0 = square on)
+                        if (s.pubHeadValid) {
+                            const xr::Vec3 n = RotXr(o, { 0.0f, 0.0f, 1.0f });
+                            const xr::Vec3 e{ s.pubHead.position.x - hp.position.x, s.pubHead.position.y - hp.position.y,
+                                s.pubHead.position.z - hp.position.z };
+                            const float el = std::sqrt(e.x * e.x + e.y * e.y + e.z * e.z);
+                            if (el > 1e-4f) {
+                                s.workshopFaceDeg = std::acos(std::clamp((n.x * e.x + n.y * e.y + n.z * e.z) / el, -1.0f, 1.0f)) * 57.2957795f;
+                            }
+                        }
+                        // 21 Nov: the hand panel showed only the stage from v 0.45 down. 22 Nov (user: "the top is cropped
+                        // except when I hold left stick in"): flat Workshop.swf (stage 1280x720, frame 1) spreads what building
+                        // needs over nearly the whole stage: Description_tf v 0.09-0.17, ItemName_tf 0.19-0.23, requirements /
+                        // produces card 0.32-0.49 (perk panels to 0.78), category path 0.72-0.76, item row + icons 0.64-0.93,
+                        // button bar ~0.90-0.96; only the stats bar (0.04-0.08) is above. A crop keeps the width, so it never
+                        // enlarges text: now the whole stage (fWorkshopCropTop 0: only the side bands outside the 16:9 stage
+                        // are cut). [Menus] bWorkshopHandCrop.
                         if (s.settings.menuWorkshopHandCrop && wsScale <= 1.0f) {
                             const float stageAspect = 16.0f / 9.0f;
                             const float sw = aspect > stageAspect ? stageAspect / aspect : 1.0f;  // stage width / image width
@@ -961,8 +992,11 @@ namespace fo4flatvr::present
                     float qwl = 0.0f, qhl = 0.0f;
                     xr::Pose qpl;
                     s.runtime.CinemaQuadPose(qpl, qwl, qhl);
-                    REX::INFO("workshop hand panel: on the {} hand, {:.2f}x{:.2f} m, build area only {} (stage from v {:.2f}; image aspect {:.3f})",
-                        s.settings.leftHanded ? "right" : "left", qwl, qhl, s.workshopCropOn ? "yes" : "no", s.settings.menuWorkshopCropTop, aspect);
+                    REX::INFO("workshop hand panel: on the {} hand, {:.2f}x{:.2f} m, stage crop {} (from v {:.2f}; image aspect {:.3f}); wand frame = grip "
+                              "rot {:.1f},{:.1f},{:.1f} deg; panel pitch {:.1f} deg, up {:.3f} back {:.3f} m; normal {:.1f} deg off the head direction",
+                        s.settings.leftHanded ? "right" : "left", qwl, qhl, s.workshopCropOn ? "yes" : "no", s.settings.menuWorkshopCropTop, aspect,
+                        s.settings.wandGripRotDeg[0], s.settings.wandGripRotDeg[1], s.settings.wandGripRotDeg[2], s.settings.menuWorkshopHandPitchDeg,
+                        s.settings.menuWorkshopHandUpMeters, s.settings.menuWorkshopHandBackMeters, s.workshopFaceDeg);
                 }
                 s.workshopOnHand = handQuad;
             }
@@ -1504,8 +1538,8 @@ namespace fo4flatvr::present
                     if (s.xrOk) {
                         s.runtime.CinemaQuadPose(qp, qw, qh);
                     }
-                    return std::format(" wbGeom={} wsHand={} wsHandFrames={} wsCrop={} quadPos={:.3f},{:.3f},{:.3f} quadSize={:.2f}x{:.2f} panelGeom='{}' worldScreen='{}' worldScreenFrames={}",
-                        s.workbenchGeometry ? 1 : 0, s.workshopOnHand ? 1 : 0, s.workshopHandFrames, s.workshopCropOn ? 1 : 0, qp.position.x, qp.position.y,
+                    return std::format(" wbGeom={} wsHand={} wsHandFrames={} wsCrop={} wsFaceDeg={:.1f} quadPos={:.3f},{:.3f},{:.3f} quadSize={:.2f}x{:.2f} panelGeom='{}' worldScreen='{}' worldScreenFrames={}",
+                        s.workbenchGeometry ? 1 : 0, s.workshopOnHand ? 1 : 0, s.workshopHandFrames, s.workshopCropOn ? 1 : 0, s.workshopFaceDeg, qp.position.x, qp.position.y,
                         qp.position.z, qw, qh, s.panelGeometry, s.worldScreen, s.worldScreenFrames);
                 }() +
                 std::format(" panoShown={} panoFailed={} {}", s.panoShown, s.panoFailed, s.xrOk ? s.runtime.PanoramaReport() : std::string{});
