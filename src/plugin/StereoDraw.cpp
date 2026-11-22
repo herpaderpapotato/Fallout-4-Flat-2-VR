@@ -28,6 +28,7 @@
 #include "StereoPoC.h"
 #include "StereoInternal.h"
 #include "DxbcSig.h"
+#include "Dlss.h"
 
 #include <Windows.h>
 #undef ERROR
@@ -116,7 +117,8 @@ namespace fo4flatvr::stereo
             // +0x60 DrawIndexed, +0x68 Draw, +0xA0 DrawIndexedInstanced, +0x370 ClearState)
             constexpr std::size_t kPSSetShader = 9, kVSSetShader = 11, kDrawIndexed = 12, kDraw = 13, kMap = 14, kUnmap = 15,
                                   kIASetInputLayout = 17, kDrawIndexedInstanced = 20, kDrawInstanced = 21,
-                                  kOMSetRenderTargets = 33, kOMSetDepthStencilState = 36, kDispatch = 41, kClearState = 110;
+                                  kOMSetRenderTargets = 33, kOMSetDepthStencilState = 36, kDispatch = 41, kClearDepthStencilView = 53,
+                                  kClearState = 110;
         }
 
         using CreateVS_t = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const void*, SIZE_T, ID3D11ClassLinkage*, ID3D11VertexShader**);
@@ -133,6 +135,7 @@ namespace fo4flatvr::stereo
         using OMSetRT_t = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*, ID3D11DepthStencilView*);
         using OMSetDSS_t = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11DepthStencilState*, UINT);
         using ClearState_t = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*);
+        using ClearDSV_t = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11DepthStencilView*, UINT, FLOAT, UINT8);
         using CreatePS_t = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const void*, SIZE_T, ID3D11ClassLinkage*, ID3D11PixelShader**);
         using CreateCS_t = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const void*, SIZE_T, ID3D11ClassLinkage*, ID3D11ComputeShader**);
         using Map_t = HRESULT(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT, D3D11_MAP, UINT, D3D11_MAPPED_SUBRESOURCE*);
@@ -169,9 +172,13 @@ namespace fo4flatvr::stereo
 #define o_omSetRT (Live<OMSetRT_t>(slot::kOMSetRenderTargets))
 #define o_omSetDSS (Live<OMSetDSS_t>(slot::kOMSetDepthStencilState))
 #define o_clearState (Live<ClearState_t>(slot::kClearState))
+#define o_clearDSV (Live<ClearDSV_t>(slot::kClearDepthStencilView))
 #define o_map (Live<Map_t>(slot::kMap))
 #define o_unmap (Live<Unmap_t>(slot::kUnmap))
 #define o_dispatch (Live<Dispatch_t>(slot::kDispatch))
+        // 20 Nov (DLSS): while dlss:: drives the immediate context (NGX evaluates, its compute passes) the hooks pass straight
+        // through: no shadow-state tracking, no stereo conversion (Dlss.h g_bypass)
+#define IsOurs(ctx) ((ctx) == g_ctx && !::fo4flatvr::dlss::Bypass())
 
         // ---- config / globals --------------------------------------------------------------------
         std::mutex        g_cfgLock;
@@ -417,6 +424,16 @@ namespace fo4flatvr::stereo
         double        g_jitterMax = 0;                // max |VP - VPunjittered| since the last stats line
         std::atomic<bool> g_frameStereoCam{ false };  // a stereo world camera was built during this frame
         std::atomic<bool> g_secondCam{ false };       // VATS camera window render in progress (VatsWindow.cpp): frame-level hooks skip it
+        // engine off-screen render in progress (FaceGen customization, FaceDiag.cpp): gate forced off (mode 0)
+        std::atomic<int>           g_offscreen{ 0 };
+        std::atomic<int>           g_offscreenMode{ 0 };   // 0 bypass, 1 pass (old behaviour), 2 force world gate
+        std::atomic<std::uint64_t> g_offRenders{ 0 }, g_offDraws{ 0 }, g_offGated{ 0 }, g_offGatedEntry{ 0 };
+        int                        g_offEntryGate = 0;
+        // GBuffer draws that take the split path (their PS/VS read per-eye b12 rows): logged per distinct shader pair
+        // (19 Nov black-face investigation; pipe "stereogbsplit [0|1|log]": 1 = split as before, 0 = convert like any GBuffer draw)
+        std::atomic<int>           g_gbSplitMode{ 1 };
+        std::atomic<int>           g_gbSplitLog{ 24 };
+        std::vector<std::pair<void*, void*>> g_gbSplitSeen;
         bool          g_lastFrameStereo = false;      // latched at OnPresent for the frame being presented
         bool          g_gbCleared = false;            // measurement: GBuffer cleared at this frame's first GBuffer draw
 
@@ -811,7 +828,7 @@ namespace fo4flatvr::stereo
 
         void STDMETHODCALLTYPE HkVSSet(ID3D11DeviceContext* a_this, ID3D11VertexShader* a_vs, ID3D11ClassInstance* const* a_ci, UINT a_n)
         {
-            if (a_this == g_ctx) {
+            if (IsOurs(a_this)) {
                 g_s.engineVS = a_vs;
                 g_s.info = (a_n == 0) ? Lookup(a_vs) : nullptr;  // class instances: never convert
                 g_s.boundOurVS = nullptr;
@@ -821,7 +838,7 @@ namespace fo4flatvr::stereo
 
         void STDMETHODCALLTYPE HkPSSet(ID3D11DeviceContext* a_this, ID3D11PixelShader* a_ps, ID3D11ClassInstance* const* a_ci, UINT a_n)
         {
-            if (a_this == g_ctx) {
+            if (IsOurs(a_this)) {
                 g_s.enginePS = a_ps;
                 g_s.boundOurPS = nullptr;
                 g_s.psInfo = nullptr;
@@ -837,7 +854,7 @@ namespace fo4flatvr::stereo
 
         void STDMETHODCALLTYPE HkIASetIL(ID3D11DeviceContext* a_this, ID3D11InputLayout* a_il)
         {
-            if (a_this == g_ctx) {
+            if (IsOurs(a_this)) {
                 g_s.layout = a_il;
                 g_s.boundTwinLayout = false;
                 g_s.layoutPerInstance = false;
@@ -858,19 +875,19 @@ namespace fo4flatvr::stereo
 
         void STDMETHODCALLTYPE HkClearState(ID3D11DeviceContext* a_this)
         {
-            if (a_this == g_ctx) {
+            if (IsOurs(a_this)) {
                 g_s = CtxState{};
                 g_curDsv = nullptr;
             }
             o_clearState(a_this);
-            if (a_this == g_ctx) {
+            if (IsOurs(a_this)) {
                 GpuFrameBegin();  // Renderer::Begin clears the state once per frame: start of the frame's GPU work
             }
         }
 
         void STDMETHODCALLTYPE HkOMSetDSS(ID3D11DeviceContext* a_this, ID3D11DepthStencilState* a_dss, UINT a_ref)
         {
-            if (a_this == g_ctx) {
+            if (IsOurs(a_this)) {
                 g_s.dss = a_dss;
                 g_s.stencilRef = a_ref;
                 g_s.boundOurDSS = false;
@@ -963,7 +980,7 @@ namespace fo4flatvr::stereo
 
         void STDMETHODCALLTYPE HkOMSetRT(ID3D11DeviceContext* a_this, UINT a_n, ID3D11RenderTargetView* const* a_rtv, ID3D11DepthStencilView* a_dsv)
         {
-            if (a_this == g_ctx) {
+            if (IsOurs(a_this)) {
                 ID3D11RenderTargetView* const next = (a_n && a_rtv) ? a_rtv[0] : nullptr;
                 PassCapOnRT(a_this, next);
                 // Capture: the target written by the converted draws is about to be unbound -> snapshot it.
@@ -1229,7 +1246,7 @@ namespace fo4flatvr::stereo
             D3D11_MAPPED_SUBRESOURCE* a_out)
         {
             const HRESULT hr = o_map(a_this, a_res, a_sub, a_type, a_flags, a_out);
-            if (a_this != g_ctx || FAILED(hr) || !a_out || a_type != D3D11_MAP_WRITE_DISCARD || a_sub != 0) {
+            if (!IsOurs(a_this) || FAILED(hr) || !a_out || a_type != D3D11_MAP_WRITE_DISCARD || a_sub != 0) {
                 return hr;
             }
             Tracked* t = TrackedFor(a_res);
@@ -1264,7 +1281,7 @@ namespace fo4flatvr::stereo
         void STDMETHODCALLTYPE HkUnmap(ID3D11DeviceContext* a_this, ID3D11Resource* a_res, UINT a_sub)
         {
             bool refresh = false;
-            if (a_this == g_ctx && a_sub == 0) {
+            if (IsOurs(a_this) && a_sub == 0) {
                 if (Tracked* t = TrackedFor(a_res); t && t->mapped) {
                     std::memcpy(t->real, t->data, t->size);
                     t->mapped = false;
@@ -1849,6 +1866,16 @@ namespace fo4flatvr::stereo
 
 #include "StereoPost.inl"
 #include "StereoTiled.inl"
+#include "HiddenArea.inl"
+
+        // 22 Nov (hidden-area agent): depth clears of the stamped target (HiddenArea.inl re-stamps after them)
+        void STDMETHODCALLTYPE HkClearDSV(ID3D11DeviceContext* a_this, ID3D11DepthStencilView* a_dsv, UINT a_flags, FLOAT a_depth, UINT8 a_stencil)
+        {
+            o_clearDSV(a_this, a_dsv, a_flags, a_depth, a_stencil);
+            if (IsOurs(a_this)) {
+                HamOnClearDepth(a_dsv, a_flags);
+            }
+        }
 
         // ---- per-eye motion vectors: the pass (constants: BuildMvFix) ---------------------------------------------
         constexpr const char* kMvFixHlsl = R"(
@@ -2256,6 +2283,7 @@ float2 ps(float4 pos : SV_Position) : SV_Target
 
         void AfterDraw(ID3D11DeviceContext* a_ctx)
         {
+            dlss::OnAfterTaaDraw(a_ctx);  // 20 Nov: NR on the engine's TAA result when DLSS is off (no-op otherwise)
             if (g_stageCap.state != 2 || !g_s.psInfo || !g_s.rtv[0]) {
                 return;
             }
@@ -2405,16 +2433,16 @@ float2 ps(float4 pos : SV_Position) : SV_Target
 
         void STDMETHODCALLTYPE HkDispatch(ID3D11DeviceContext* a_this, UINT a_x, UINT a_y, UINT a_z)
         {
-            if (a_this == g_ctx) {
+            if (IsOurs(a_this)) {
                 ++g_stats.dispatches;
                 if (g_gateCam.load(std::memory_order_relaxed)) {
                     ++g_stats.gateDispatches;
                 }
             }
-            if (a_this != g_ctx || !TiledDispatch(a_this, a_x, a_y, a_z)) {
+            if (!IsOurs(a_this) || !TiledDispatch(a_this, a_x, a_y, a_z)) {
                 o_dispatch(a_this, a_x, a_y, a_z);
             }
-            if (a_this == g_ctx) {
+            if (IsOurs(a_this)) {
                 PassCapOnDispatch(a_this, a_x, a_y, a_z);
             }
         }
@@ -2430,6 +2458,9 @@ float2 ps(float4 pos : SV_Position) : SV_Target
             const bool secondCam = g_secondCam.load(std::memory_order_relaxed);
             if (!secondCam) {
                 ShadowSigOnDraw(a_ctx, a_instances, a_count);  // main view only
+            }
+            if (g_ham.probeState == 1 && g_s.psInfo && (g_s.psInfo->group == kGroupLight || g_s.psInfo->group == kGroupComposite) && !secondCam) {
+                HamProbe(a_ctx);  // 22 Nov: "ham probe" readback (after the prepass + GBuffer, before the lights shade)
             }
             if (g_s.psInfo && g_s.psInfo->group == kGroupComposite) {
                 // Measurement setting ("stereoclear 1"): the HDR scene target keeps stale content where nothing draws
@@ -2452,6 +2483,17 @@ float2 ps(float4 pos : SV_Position) : SV_Target
                         RunMvFix(a_ctx, 2, nullptr);
                     } else if (auto* const dsrv = GBufferDepthSRV()) {
                         RunMvFix(a_ctx, g_s.psInfo->group == kGroupMotionBlur ? 1 : 3, dsrv);
+                    }
+                }
+            }
+            // 20 Nov (DLSS agent, Dlss.h): per-eye DLSS / neural rendering in place of the main view's TAA resolve of a stereo
+            // frame (after the motion-vector pass above). Handled = the engine's TAA draw is skipped.
+            if (g_s.psInfo && g_s.psInfo->group == kGroupTaa && !secondCam && g_frameStereoCam.load(std::memory_order_relaxed)) {
+                const int mode = g_mode.load(std::memory_order_relaxed);
+                if (mode == static_cast<int>(Mode::kStereoDebug) || mode == static_cast<int>(Mode::kStereoFaithful)) {
+                    const dlss::TaaDraw d{ a_ctx, g_seamPad, g_seamFullW, g_jitX, g_jitY, g_mvFixDone, g_mvSign };
+                    if (dlss::OnTaaDraw(d)) {
+                        return Action::kSkip;
                     }
                 }
             }
@@ -2531,7 +2573,15 @@ float2 ps(float4 pos : SV_Position) : SV_Target
                     ClearGBufferOnce(a_ctx);
                 }
             }
-            const int cam = mode >= static_cast<int>(Mode::kCensus) ? g_gateCam.load(std::memory_order_relaxed) : 0;
+            int cam = mode >= static_cast<int>(Mode::kCensus) ? g_gateCam.load(std::memory_order_relaxed) : 0;
+            if (g_offscreen.load(std::memory_order_relaxed) > 0) {
+                // engine off-screen render (FaceGen customization textures): not a world view. The gate may still hold the
+                // previous frame's world camera (it changes only on SetCameraData), which converted these draws.
+                g_offDraws.fetch_add(1, std::memory_order_relaxed);
+                if (cam) g_offGated.fetch_add(1, std::memory_order_relaxed);
+                const int om = g_offscreenMode.load(std::memory_order_relaxed);
+                cam = om == 0 ? 0 : om == 2 ? 1 : cam;
+            }
             if (!cam) {
                 RestoreEngine(a_ctx);
                 SetDepthOverride(a_ctx, false);
@@ -2572,7 +2622,22 @@ float2 ps(float4 pos : SV_Position) : SV_Target
                 const bool    psEye = pi && (pi->cb12 & kEyeRows);
                 const bool    vsEye = info && !info->twin && (info->cb12 & kEyeRows);
                 const bool    sao = pi && pi->group == kGroupSaoRaw && cam == 1 && g_saoPerEye.load(std::memory_order_relaxed);
-                if (psEye || vsEye || sao) {
+                if ((psEye || vsEye || sao) && gbDraw && g_gbSplitLog.load(std::memory_order_relaxed) > 0) {
+                    const std::pair<void*, void*> key{ g_s.engineVS, g_s.enginePS };
+                    if (std::find(g_gbSplitSeen.begin(), g_gbSplitSeen.end(), key) == g_gbSplitSeen.end()) {
+                        g_gbSplitSeen.push_back(key);
+                        g_gbSplitLog.fetch_sub(1, std::memory_order_relaxed);
+                        D3D11_DEPTH_STENCIL_DESC dd{};
+                        if (g_s.dss) g_s.dss->GetDesc(&dd);
+                        REX::INFO("stereo gbsplit: VS {} g{} cat {} twin {} cb12 0x{:X} | PS {} g{} cb12 0x{:X} | psEye {} vsEye {} | count {} inst {} "
+                                  "rtv {} | depth {} func {} write {} stencil {} | cam {} mode {}",
+                            static_cast<void*>(g_s.engineVS), info ? info->group : -1, info ? info->cat : 0, info && info->twin ? 1 : 0,
+                            info ? info->cb12 : 0ull, static_cast<void*>(g_s.enginePS), pi ? pi->group : -1, pi ? pi->cb12 : 0ull, psEye ? 1 : 0,
+                            vsEye ? 1 : 0, a_count, a_instances, g_s.numRTV, dd.DepthEnable, static_cast<int>(dd.DepthFunc),
+                            static_cast<int>(dd.DepthWriteMask), dd.StencilEnable, cam, g_gbSplitMode.load(std::memory_order_relaxed));
+                    }
+                }
+                if ((psEye || vsEye || sao) && !(gbDraw && g_gbSplitMode.load(std::memory_order_relaxed) == 0)) {
                     const bool fullscreen = info && info->group == kGroupLight && a_count <= 6;
                     const bool twin = info && info->twin && info->cat == 2 && !fullscreen && (!g_s.layoutPerInstance || g_s.layoutTwin);
                     if (twin) {
@@ -2695,6 +2760,10 @@ float2 ps(float4 pos : SV_Position) : SV_Target
                     if (!prepass && !g_s.gbBound) {
                         ++g_stats.forwardInst;
                     }
+                    // 22 Nov: hidden-area mask into this depth target before its first stereo prepass / GBuffer draw
+                    if (stereoMode && (prepass || gbDraw)) {
+                        HamMaybeStamp(a_ctx);
+                    }
                     return Action::kStereo;
                 }
                 ++g_stats.notConvertible;
@@ -2717,7 +2786,7 @@ float2 ps(float4 pos : SV_Position) : SV_Target
 
         void STDMETHODCALLTYPE HkDrawIndexed(ID3D11DeviceContext* a_this, UINT a_count, UINT a_start, INT a_base)
         {
-            if (a_this != g_ctx) {
+            if (!IsOurs(a_this)) {
                 ++g_otherCtxDraws;
                 g_lastOtherCtx = a_this;
                 return o_drawIndexed(a_this, a_count, a_start, a_base);
@@ -2752,7 +2821,7 @@ float2 ps(float4 pos : SV_Position) : SV_Target
         void STDMETHODCALLTYPE HkDrawIndexedInstanced(ID3D11DeviceContext* a_this, UINT a_count, UINT a_inst, UINT a_start, INT a_base,
             UINT a_startInst)
         {
-            if (a_this != g_ctx) {
+            if (!IsOurs(a_this)) {
                 return o_drawIdxInst(a_this, a_count, a_inst, a_start, a_base, a_startInst);
             }
             ++g_stats.drawIdxInst;
@@ -2780,7 +2849,7 @@ float2 ps(float4 pos : SV_Position) : SV_Target
 
         void STDMETHODCALLTYPE HkDraw(ID3D11DeviceContext* a_this, UINT a_count, UINT a_start)
         {
-            if (a_this != g_ctx) {
+            if (!IsOurs(a_this)) {
                 ++g_otherCtxDraws;
                 g_lastOtherCtx = a_this;
                 return o_draw(a_this, a_count, a_start);
@@ -2815,7 +2884,7 @@ float2 ps(float4 pos : SV_Position) : SV_Target
 
         void STDMETHODCALLTYPE HkDrawInstanced(ID3D11DeviceContext* a_this, UINT a_count, UINT a_inst, UINT a_start, UINT a_startInst)
         {
-            if (a_this != g_ctx) {
+            if (!IsOurs(a_this)) {
                 return o_drawInst(a_this, a_count, a_inst, a_start, a_startInst);
             }
             ++g_stats.drawInst;
@@ -3588,6 +3657,7 @@ float2 ps(float4 pos : SV_Position) : SV_Target
         g_splitOn.store(a_config.split);
         g_saoPerEye.store(a_config.saoPerEye);
         g_taaPerEye.store(a_config.taaPerEye);
+        g_hamOn.store(a_config.hiddenAreaMask);
         math::g_eyeFarScale.store((std::max)(1.0, a_config.eyeFarScale));
         g_seamPad = (std::max)(0, a_config.seamPad);
         g_seamFullW = a_config.renderWidth > 0 ? a_config.renderWidth : 2.0 * (a_config.eyeWidth + g_seamPad);
@@ -3599,6 +3669,25 @@ float2 ps(float4 pos : SV_Position) : SV_Target
             a_config.noJitter, a_config.eyeWidth, a_config.eyeHeight, a_config.shaderDir, a_config.split, a_config.saoPerEye,
             a_config.cutTaa, a_config.cutMotionBlur, a_config.cutDof, a_config.cutLensFlare, a_config.cutGodrays, a_config.cutSsr,
             a_config.cutHbao, a_config.cutTiled, a_config.saoPixelShader, a_config.forceCuts, g_seamPad, g_seamFullW);
+    }
+
+    void SetHiddenAreaMask(bool a_extension, std::uint64_t a_serial, const std::vector<float> a_xy[2], const std::vector<std::uint32_t> a_indices[2])
+    {
+        std::scoped_lock l(g_ham.lock);
+        const bool was = g_ham.ext;
+        g_ham.ext = a_extension;
+        if (a_serial && a_serial != g_ham.serial && a_xy && a_indices) {
+            for (int e = 0; e < 2; ++e) {
+                g_ham.xy[e] = a_xy[e];
+                g_ham.idx[e] = a_indices[e];
+            }
+            g_ham.serial = a_serial;
+            ++g_ham.fetches;
+            REX::INFO("stereo ham: hidden-area mesh {} from the runtime: triangles L {} R {} (vertices {} / {})", a_serial, a_indices[0].size() / 3,
+                a_indices[1].size() / 3, a_xy[0].size() / 2, a_xy[1].size() / 2);
+        } else if (was != a_extension) {
+            REX::INFO("stereo ham: XR_KHR_visibility_mask {}", a_extension ? "present" : "absent");
+        }
     }
 
     Config CurrentConfig()
@@ -3647,6 +3736,7 @@ float2 ps(float4 pos : SV_Position) : SV_Target
             g_table[slot::kOMSetRenderTargets] = reinterpret_cast<void*>(&HkOMSetRT);
             g_table[slot::kOMSetDepthStencilState] = reinterpret_cast<void*>(&HkOMSetDSS);
             g_table[slot::kClearState] = reinterpret_cast<void*>(&HkClearState);
+            g_table[slot::kClearDepthStencilView] = reinterpret_cast<void*>(&HkClearDSV);
             g_table[slot::kMap] = reinterpret_cast<void*>(&HkMap);
             g_table[slot::kUnmap] = reinterpret_cast<void*>(&HkUnmap);
             g_table[slot::kDispatch] = reinterpret_cast<void*>(&HkDispatch);
@@ -3738,6 +3828,33 @@ float2 ps(float4 pos : SV_Position) : SV_Target
         g_secondCam.store(a_on, std::memory_order_relaxed);
     }
 
+    void BeginEngineOffscreen()
+    {
+        if (g_offscreen.fetch_add(1, std::memory_order_relaxed) == 0) {
+            g_offRenders.fetch_add(1, std::memory_order_relaxed);
+            g_offEntryGate = g_gateCam.load(std::memory_order_relaxed);
+            if (g_offEntryGate) g_offGatedEntry.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    void EndEngineOffscreen()
+    {
+        g_offscreen.fetch_sub(1, std::memory_order_relaxed);
+    }
+
+    void SetEngineOffscreenMode(int a_mode)
+    {
+        g_offscreenMode.store(a_mode, std::memory_order_relaxed);
+    }
+
+    std::string EngineOffscreenStatus()
+    {
+        const int m = g_offscreenMode.load(std::memory_order_relaxed);
+        return std::format("offscreen mode {} ({}) renders {} (gate set at entry {}, last entry gate {}) draws {} gated {}{}", m,
+            m == 0 ? "bypass" : m == 1 ? "pass" : "force", g_offRenders.load(), g_offGatedEntry.load(), g_offEntryGate, g_offDraws.load(),
+            g_offGated.load(), m == 0 ? " (not converted)" : "");
+    }
+
     bool StereoSubmitActive()
     {
         return g_lastFrameStereo;
@@ -3803,6 +3920,9 @@ float2 ps(float4 pos : SV_Position) : SV_Target
             g_lastFrameStereo = g_frameStereoCam.exchange(false, std::memory_order_relaxed);
             g_gbCleared = false;
             g_mvFixDone = false;
+            g_ham.lastFrameStamps = g_ham.frameStamps;  // hidden-area mask: stamps of the frame just presented
+            g_ham.frameStamps = 0;
+            g_ham.stampedValid = false;
         }
         // cut list: on while frames are rendered in stereo (mono keeps TAA, SSR, ...)
         internal::UpdateCuts(g_lastFrameStereo);
@@ -3911,6 +4031,7 @@ float2 ps(float4 pos : SV_Position) : SV_Target
                 g_stats.gateDispatches / n, g_stats.tiledFrames, g_tiledSplit[0], g_tiledSplit[1], g_tiledFail, g_gpuFrames ? g_gpuMsSum / g_gpuFrames : 0.0, g_gpuFrames,
                 g_lastFrameStereo ? 1 : 0, internal::CutsStatus(), g_taaPerEye.load() ? 1 : 0, g_mvFixes / n, g_mvSkips, g_mvSign, g_jitX,
                 g_jitY, g_jitOff);
+            REX::INFO("stereo ham: {}", HamStatus());
             g_mvFixes = 0;
             g_jitOff = 0;
             g_gpuMsSum = 0;
@@ -3959,6 +4080,25 @@ float2 ps(float4 pos : SV_Position) : SV_Target
     {
         Config     c = CurrentConfig();
         const bool on = std::atoi(a_arg.c_str()) != 0;
+        if (a_verb == "stereoham") {
+            // 22 Nov hidden-area mask: "stereoham" status, "stereoham 0|1" on/off ([Stereo] bHiddenAreaMask), "stereoham probe" readback at
+            // the next frame's first deferred light draw, "stereoham synth <f>" synthetic corner mask (test aid, 0 = the runtime's)
+            if (a_arg == "probe") {
+                g_ham.probeState = 1;
+                g_ham.probeResult = "armed";
+                return "probe armed (log: stereo ham probe line; then stereoham)";
+            }
+            if (a_arg.rfind("synth", 0) == 0) {
+                std::scoped_lock l(g_ham.lock);
+                g_ham.synthetic = static_cast<float>((std::clamp)(std::atof(a_arg.c_str() + 5), 0.0, 0.5));
+                return std::format("synthetic mask {:.2f}", g_ham.synthetic);
+            }
+            if (!a_arg.empty()) {
+                c.hiddenAreaMask = on;
+                Configure(c);
+            }
+            return HamStatus();
+        }
         if (a_verb == "stereosplit") {
             c.split = on;
         } else if (a_verb == "stereosao") {
@@ -3967,6 +4107,16 @@ float2 ps(float4 pos : SV_Position) : SV_Target
             // SAO RawAO twin (eye-relative noise) on/off (A/B)
             g_saoEyeNoise.store(on);
             return std::format("saoEyeNoise={}", on ? 1 : 0);
+        } else if (a_verb == "stereogbsplit") {
+            // GBuffer draws whose shaders read per-eye b12 rows: 1 split per half (default), 0 converted like other GBuffer draws;
+            // "log" = log the next 24 distinct shader pairs again
+            if (a_arg == "log") {
+                g_gbSplitSeen.clear();
+                g_gbSplitLog.store(24);
+            } else if (!a_arg.empty()) {
+                g_gbSplitMode.store(std::atoi(a_arg.c_str()));
+            }
+            return std::format("gbsplit mode {}", g_gbSplitMode.load());
         } else if (a_verb == "stereoskipgroups") {
             // measurement: "stereoskipgroups <a> [b]" skips every draw whose VS or PS is from fxp group a/b; "-1" = off
             int a = -1, b = -1;

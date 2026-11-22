@@ -5,3 +5,5 @@
 *.f4se binary
 *.pack binary
 *.tbl binary
+*.lib binary
+*.dll binary

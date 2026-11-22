@@ -28,6 +28,8 @@
 
 #include <string>
 
+struct FO4FlatVR_FrikConfigApi;
+
 namespace xr
 {
     struct ControllerState;
@@ -52,6 +54,11 @@ namespace fo4flatvr::frikbridge
 
     // FRIK-flat's body is active (FRIK.dll reported SetFrikActive(1)): its mirror-body selfie is available (Gestures.h)
     bool BodyActive();
+
+    // v6: FRIK.dll's config table for the VR settings panel's FRIK pages (null = FRIK.dll older than v6 or not loaded)
+    const FO4FlatVR_FrikConfigApi* ConfigApi();
+    // v6: [General] bNoScaling (live, re-read about once a second)
+    bool NoScaling();
 
     // pipe: frik [status|smooth on|off|reset]
     std::string Command(const std::string& a_arg);

@@ -23,6 +23,7 @@
 #include "StereoPoC.h"
 #include "StereoMath.h"
 #include "plugin/HeadPose.h"
+#include "plugin/Dlss.h"
 #include "StereoInternal.h"
 
 #include <Windows.h>
@@ -341,13 +342,21 @@ namespace fo4flatvr::stereo
             if (a_state) {
                 auto* const flag = reinterpret_cast<int*>(static_cast<std::uint8_t*>(a_state) + kStateJitterEnable);
                 // The TAA cut (stereo frames, [Stereo] bCutTaa) uses the same switch: 0 = no TAA and no jitter.
-                const bool  force = CurrentConfig().noJitter || internal::TaaCutActive();
-                if (force && g_savedJitter < 0) {
+                // 20 Nov (DLSS agent): DLSS / NR replace the TAA draw, so TAA must stay active (State+0xAC = 1, also when the
+                // user's sAntiAliasing is not TAA); their jitter switch ([DLSS] bJitter) and "stereojitter 0" then go through
+                // SetCameraData's jitter argument instead (BuildCameraStateData 182D750 jitters only with +0xAC != 0 AND it).
+                const bool  dlssTaa = dlss::WantsTaa();
+                const bool  force = !dlssTaa && (CurrentConfig().noJitter || internal::TaaCutActive());
+                if ((force || dlssTaa) && g_savedJitter < 0) {
                     g_savedJitter = *flag;
-                    REX::INFO("stereo: jitter forced off (State+0xAC was {})", g_savedJitter);
+                    REX::INFO("stereo: TAA/jitter switch forced {} (State+0xAC was {}){}", dlssTaa ? "on" : "off", g_savedJitter,
+                        dlssTaa ? " for DLSS" : "");
                 }
-                if (force) {
-                    *flag = 0;
+                if (force || dlssTaa) {
+                    *flag = dlssTaa ? 1 : 0;
+                    if (dlssTaa && (!dlss::WantsJitter() || CurrentConfig().noJitter)) {
+                        a_jitter = false;
+                    }
                 } else if (g_savedJitter >= 0) {
                     *flag = g_savedJitter;
                     g_savedJitter = -1;

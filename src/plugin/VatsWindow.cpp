@@ -1,6 +1,7 @@
 // VATS camera window, game side (VatsWindow.h). Engine calls only; the D3D work is in VatsWindowGpu.cpp.
 #include "plugin/VatsWindow.h"
 #include "plugin/VatsWindowInternal.h"
+#include "plugin/ConfigStore.h"
 #include "plugin/Settings.h"
 #include "plugin/StereoPoC.h"
 
@@ -971,7 +972,23 @@ namespace fo4flatvr::vatswin
     bool ConfiguredOn()
     {
         static std::once_flag once;
-        std::call_once(once, ReadIni);
+        std::call_once(once, [] {
+            ReadIni();
+            // 20 Nov (live settings, ConfigStore.h): the window's tuning keys re-read on a change; bVatsCameraWindow itself is
+            // restart-only (its call sites and the camera director's VATS gates are installed at load only when on)
+            cfgstore::Subscribe("vatswin", "Menus", [](const cfgstore::Changes& a_ch) {
+                bool any = false;
+                for (const auto& k : a_ch.keys) any = any || k.rfind("menus\nfvatswindow", 0) == 0 || k.rfind("menus\nivatswindow", 0) == 0 ||
+                                                     k.rfind("menus\nbvatswindow", 0) == 0;
+                if (!any) return;
+                const bool on = g_cfg.on;
+                ReadIni();
+                g_cfg.on = on;
+                REX::INFO("vatswin: settings re-read (live): every {} scene {} fov {} fit {} aimPart {} exposure {} width {} mask {}/{} sun {} ambient {}",
+                    g_cfg.every, g_cfg.scene, g_cfg.fovDeg, g_cfg.fitScale, g_cfg.aimPart, S().exposure.load(), S().width.load(),
+                    S().mask.load() ? 1 : 0, S().maskStrength.load(), g_sun.load(), S().ambient.load());
+            });
+        });
         return g_cfg.on;
     }
 

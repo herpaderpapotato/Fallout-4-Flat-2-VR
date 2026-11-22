@@ -45,4 +45,14 @@ target("fo4flatvr", function()
     -- _retired/: code taken out of the build (kept for reference, see _retired/README.txt)
     add_files("src/plugin/**.cpp|_retired/**")
     add_headerfiles("src/plugin/**.h|_retired/**")
+    -- 20 Nov: Dear ImGui 1.92.9b (extern/imgui, MIT) for the VR settings panel (ConfigUI.cpp); its own warnings off
+    add_includedirs("extern/imgui", "extern/imgui/backends")
+    add_files("extern/imgui/imgui.cpp", "extern/imgui/imgui_draw.cpp", "extern/imgui/imgui_tables.cpp",
+        "extern/imgui/imgui_widgets.cpp", "extern/imgui/backends/imgui_impl_dx11.cpp", { warnings = "none" })
+    -- 20 Nov: NVIDIA NGX SDK 310.9.16 (extern/dlss: headers + nvsdk_ngx_d.lib, /MD x64; github.com/NVIDIA/DLSS 9981c63)
+    -- for per-eye DLSS and neural rendering (Dlss.cpp). The runtime DLLs ship in the MO2 mod (F4SE/Plugins/fo4flatvr/ngx).
+    add_includedirs("extern/dlss/include")
+    add_linkdirs("extern/dlss/lib")
+    add_links("nvsdk_ngx_d")
+    add_syslinks("d3dcompiler", "advapi32", "version", "shell32", "ole32")
 end)

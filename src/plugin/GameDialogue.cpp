@@ -3,7 +3,9 @@
 #include "plugin/Dialogue.h"
 
 #include "plugin/ControllerBindings.h"
+#include "plugin/ConfigStore.h"
 #include "plugin/Settings.h"
+#include "plugin/ThreadQueues.h"
 #include "plugin/VirtualPad.h"
 
 #include <F4SE/F4SE.h>
@@ -173,9 +175,11 @@ namespace fo4flatvr::dlg
         }
     }
 
-    std::string Install()
+    namespace
     {
-        const auto path = Settings::Path();
+        Config ReadCfg()
+        {
+            const auto path = Settings::Path();
         auto rd = [&](const char* sec, const char* k, float d) {
             char buf[64]{};
             ::GetPrivateProfileStringA(sec, k, "", buf, sizeof(buf), path.c_str());
@@ -214,18 +218,37 @@ namespace fo4flatvr::dlg
         c.hapticAmplitude = std::clamp(rd("Dialogue", "fHapticAmplitude", c.hapticAmplitude), 0.0f, 1.0f);
         c.hapticSeconds = std::clamp(rd("Dialogue", "fHapticSeconds", c.hapticSeconds), 0.0f, 2.0f);
         c.leftHanded = rd("Controllers", "bLeftHanded", 0.0f) != 0.0f;
-        {
-            std::scoped_lock l(g_cfgLock);
-            g_cfg = c;
+            return c;
         }
-        g_look = c.lookAnywhere;
-        g_hideWeapon = c.hideWeapon;
-        g_haptics = c.haptics;
-        g_stick = c.stickOptions;
+
+        void ApplyCfg(const Config& c)
+        {
+            {
+                std::scoped_lock l(g_cfgLock);
+                g_cfg = c;
+            }
+            g_look = c.lookAnywhere;
+            g_hideWeapon = c.hideWeapon;
+            g_haptics = c.haptics;
+            g_stick = c.stickOptions;
+        }
+    }
+
+    std::string Install()
+    {
+        const Config c = ReadCfg();
+        ApplyCfg(c);
+        // 20 Nov (live settings, ConfigStore.h): [Dialogue] and [Menus] bDialoguePanel are re-read on a change; the D-look call
+        // sites are patched whatever bLookAnywhere says at load (each passes through while g_look is off)
+        cfgstore::Subscribe("dialogue", "Dialogue,Menus/bDialoguePanel,Controllers/bLeftHanded", [](const cfgstore::Changes&) {
+            const Config n = ReadCfg();
+            ApplyCfg(n);
+            REX::INFO("dialogue: settings re-read (live): {}", CfgString(n));
+        });
 
         // D-look: byte-check each call site (mov edx,0xC ; call rel32 -> QCameraEquals), patch independently.
         std::string sites;
-        if (c.lookAnywhere) {
+        if (true) {
             auto& tramp = REL::GetTrampoline();
             if (tramp.empty()) {
                 REX::WARN("dialogue: F4SE trampoline not set up; creating a local one");
@@ -406,13 +429,9 @@ namespace fo4flatvr::dlg
     {
         if (a_arg == "npcs") {
             // Test helper: actors in the player's cell (ref id, name, distance in units), nearest first.
-            const auto tasks = F4SE::GetTaskInterface();
-            if (!tasks) {
-                return "error: no task interface";
-            }
             auto done = std::make_shared<std::promise<std::string>>();
             auto fut = done->get_future();
-            tasks->AddTask([done]() {
+            const bool queued = tq::RunOnMain([done]() {  // main-idle queue (ThreadQueues.h): walks the cell's references
                 auto* player = RE::PlayerCharacter::GetSingleton();
                 auto* cell = player ? player->GetParentCell() : nullptr;
                 if (!cell) {
@@ -438,6 +457,9 @@ namespace fo4flatvr::dlg
                 }
                 done->set_value(std::move(s));
             });
+            if (!queued) {
+                return "error: no main-thread queue";
+            }
             if (fut.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
                 return "error: main thread did not run the task within 2 s";
             }

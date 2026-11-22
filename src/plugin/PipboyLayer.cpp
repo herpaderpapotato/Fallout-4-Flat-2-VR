@@ -4,6 +4,7 @@
 #include "plugin/PipboyLayer.h"
 #include "plugin/GameMenuPointer.h"
 #include "plugin/GamePipboy.h"
+#include "plugin/PointerBeam.h"
 #include "xr/XrRuntime.h"
 
 #include <Windows.h>
@@ -759,6 +760,14 @@ float4 ps(float4 pos : SV_Position) : SV_Target
             ++g_wheels;
         }
         g_wheelDir = dir;
+        if (wrist && aimOk && (on || g_trigDown)) {  // pointer beam: only while on the screen (or a click is held)
+            beam::Ray br;
+            br.src = beam::Source::kPipboy;
+            br.hit = true;
+            br.length = g_hitDist;
+            br.pressed = g_trigDown;
+            beam::Offer(rightHand ? 0 : 1, br);
+        }
         if (wrist) {
             game::PipboyPointer p;
             p.onQuad = on;
@@ -796,7 +805,8 @@ float4 ps(float4 pos : SV_Position) : SV_Target
         if (!src.tex) {
             return false;
         }
-        ID3D11Texture2D* shown = PrepareDisplay(a_ctx, src, g_cfg.cursorDot && g_onQuad, g_u, g_v);
+        // the pointer beam's end dot (PointerBeam.h) replaces the dot drawn into the screen
+        ID3D11Texture2D* shown = PrepareDisplay(a_ctx, src, g_cfg.cursorDot && g_onQuad && !beam::DotReplacesCursor(beam::Source::kPipboy), g_u, g_v);
         if (!a_rt.SubmitWorldQuad(a_ctx, shown, g_pose, g_quadW, false)) {
             return false;
         }

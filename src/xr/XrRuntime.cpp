@@ -331,6 +331,7 @@ float4 ps(float4 pos : SV_Position) : SV_Target
         Config      config;
         std::string error;
         std::string runtimeName;
+        std::string apiLayers;
 
         ComPtr<ID3D11Device> device;
 
@@ -347,6 +348,53 @@ float4 ps(float4 pos : SV_Position) : SV_Target
         bool              instanceLost{ false };
         std::chrono::steady_clock::time_point nextRecreateAttempt{};
         PFN_xrGetD3D11GraphicsRequirementsKHR getGraphicsRequirements{ nullptr };
+        // 22 Nov (hidden-area agent): XR_KHR_visibility_mask (hidden triangles per eye)
+        bool                          visMaskExt{ false };
+        PFN_xrGetVisibilityMaskKHR    getVisibilityMask{ nullptr };
+        bool                          visMaskWanted{ false };  // fetch at the next PollEvents with a running session
+        int                           visMaskTries{ 0 };
+        std::uint64_t                 visMaskSerial{ 0 };
+        std::vector<float>            visMaskXy[2];
+        std::vector<std::uint32_t>    visMaskIdx[2];
+
+        // Hidden triangles of both eyes; false = keep trying later (session not running, runtime has no mesh yet).
+        bool FetchVisibilityMask()
+        {
+            if (!getVisibilityMask || session == XR_NULL_HANDLE)
+                return false;
+            std::vector<float>         xy[2];
+            std::vector<std::uint32_t> idx[2];
+            for (std::uint32_t e = 0; e < 2; ++e) {
+                XrVisibilityMaskKHR m{ XR_TYPE_VISIBILITY_MASK_KHR };
+                if (!Check(getVisibilityMask(session, kViewConfig, e, XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR, &m), "xrGetVisibilityMaskKHR"))
+                    return false;
+                if (m.vertexCountOutput == 0 || m.indexCountOutput < 3)
+                    continue;  // no hidden area for this eye (or not known yet)
+                std::vector<XrVector2f> v(m.vertexCountOutput);
+                idx[e].resize(m.indexCountOutput);
+                m.vertexCapacityInput = m.vertexCountOutput;
+                m.vertices = v.data();
+                m.indexCapacityInput = m.indexCountOutput;
+                m.indices = idx[e].data();
+                if (!Check(getVisibilityMask(session, kViewConfig, e, XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR, &m), "xrGetVisibilityMaskKHR"))
+                    return false;
+                v.resize(m.vertexCountOutput);
+                idx[e].resize(m.indexCountOutput - m.indexCountOutput % 3);
+                xy[e].reserve(v.size() * 2);
+                for (const auto& p : v) {
+                    xy[e].push_back(p.x);
+                    xy[e].push_back(p.y);
+                }
+            }
+            if (idx[0].empty() && idx[1].empty())
+                return false;
+            for (int e = 0; e < 2; ++e) {
+                visMaskXy[e] = std::move(xy[e]);
+                visMaskIdx[e] = std::move(idx[e]);
+            }
+            ++visMaskSerial;
+            return true;
+        }
 
         // Frame
         bool   frameBegun{ false };
@@ -393,6 +441,14 @@ float4 ps(float4 pos : SV_Position) : SV_Target
         XrExtent2Df             hudSize{ 1.0f, 0.5625f };
         ComPtr<ID3D11Texture2D> hudCapture;
 
+        // HUD pieces (SubmitHudPieces): one atlas swapchain, several quad layers on sub-rectangles of it.
+        ColorSwapchain     pieceSc;
+        bool               piecesSubmitted{ false };
+        bool               piecesPremultiplied{ true };
+        int                pieceCount{ 0 };
+        Runtime::HudPiece  pieces[Runtime::kMaxHudPieces]{};
+        std::uint64_t      pieceLayers{ 0 };
+
         // World-locked quads, reference space: one swapchain per slot (0 = wrist Pip-Boy, 1 = dialogue panel, ...).
         struct WorldQuad
         {
@@ -420,6 +476,34 @@ float4 ps(float4 pos : SV_Position) : SV_Target
         float                    vigKey[3]{ -1.0f, -1.0f, -1.0f };  // alpha (quantised), inner, outer of the last image
         std::uint64_t            vigFrames{ 0 }, vigUploads{ 0 };
         std::uint32_t            lastLayerCount{ 0 };
+
+        // Pointer beams (SubmitBeam): one shared ribbon image (colour baked in, re-uploaded on a colour change) and one
+        // end-dot image (two 64x64 cells: normal | pressed). Uploaded through the vignette's stage/blit path; the layers
+        // then reuse the swapchain's last released image every frame.
+        struct Beam
+        {
+            bool        submitted{ false };
+            XrPosef     pose{ { 0, 0, 0, 1 }, { 0, 0, 0 } };
+            XrExtent2Df size{ 0.007f, 1.0f };
+            bool        dot{ false };
+            bool        pressed{ false };
+            XrPosef     dotPose{ { 0, 0, 0, 1 }, { 0, 0, 0 } };
+            float       dotSize{ 0.01f };
+            int         style{ 0 };
+            bool        ribbon{ true };  // false: only the dot (a faded-out preview cone)
+        };
+        Beam                    beams[Runtime::kMaxBeams];
+        ColorSwapchain          beamSc, dotSc;
+        ComPtr<ID3D11Texture2D> beamSrc, dotSrc;
+        std::uint32_t           beamKey{ 0 };  // packed RGBA8 of the uploaded ribbon image
+        bool                    beamUploaded{ false }, dotUploaded{ false };
+        // activation preview style (kBeamPreview): cone image (straight alpha, colour + alpha baked) and marker image
+        // (two 64x64 cells: no target | target; premultiplied with alpha 0 = additive, colour baked)
+        ColorSwapchain          coneSc, markSc;
+        ComPtr<ID3D11Texture2D> coneSrc, markSrc;
+        std::uint32_t           coneKey{ 0 }, markKey{ 0 };
+        bool                    coneUploaded{ false }, markUploaded{ false };
+        std::uint64_t           beamFrames{ 0 }, beamUploads{ 0 };
 
         // AFR stereo: per-eye stage + swapchain; the stage keeps the eye's latest image across frames.
         ColorSwapchain eyeSc[2];
@@ -490,6 +574,8 @@ float4 ps(float4 pos : SV_Position) : SV_Target
         bool          quadOverride{ false };                 // SetCinemaQuadOverride: pose/width given per frame
         XrPosef       quadOverridePose{ { 0, 0, 0, 1 }, { 0, 0, 0 } };
         float         quadOverrideWidth{ 0.4f };
+        bool          quadCropOn{ false };                   // SetCinemaQuadCrop: sub-rectangle of the image (uv)
+        float         quadCrop[4]{ 0.0f, 0.0f, 1.0f, 1.0f };
 
         // ---------------------------------------------------------------- errors
 
@@ -541,14 +627,18 @@ float4 ps(float4 pos : SV_Position) : SV_Target
                 return false;
             }
 
-            const char* enabled[] = { XR_KHR_D3D11_ENABLE_EXTENSION_NAME };
+            // 22 Nov (hidden-area agent): XR_KHR_visibility_mask when offered (the lens-hidden area, stamped into depth)
+            visMaskExt = std::any_of(exts.begin(), exts.end(), [](const XrExtensionProperties& e) {
+                return std::strcmp(e.extensionName, XR_KHR_VISIBILITY_MASK_EXTENSION_NAME) == 0;
+            });
+            const char* enabled[] = { XR_KHR_D3D11_ENABLE_EXTENSION_NAME, XR_KHR_VISIBILITY_MASK_EXTENSION_NAME };
             XrInstanceCreateInfo ci{ XR_TYPE_INSTANCE_CREATE_INFO };
             std::snprintf(ci.applicationInfo.applicationName, XR_MAX_APPLICATION_NAME_SIZE, "%s", config.appName.c_str());
             ci.applicationInfo.applicationVersion = 1;
             std::snprintf(ci.applicationInfo.engineName, XR_MAX_ENGINE_NAME_SIZE, "xrcore");
             ci.applicationInfo.engineVersion = 1;
             ci.applicationInfo.apiVersion = XR_API_VERSION_1_0;  // nothing here needs 1.1; widest runtime support
-            ci.enabledExtensionCount = 1;
+            ci.enabledExtensionCount = visMaskExt ? 2 : 1;
             ci.enabledExtensionNames = enabled;
             if (!Check(xrCreateInstance(&ci, &instance), "xrCreateInstance"))
                 return false;
@@ -561,7 +651,28 @@ float4 ps(float4 pos : SV_Position) : SV_Target
                           XR_VERSION_MAJOR(props.runtimeVersion), XR_VERSION_MINOR(props.runtimeVersion),
                           XR_VERSION_PATCH(props.runtimeVersion));
             runtimeName = name;
+            {
+                // 20 Nov (DLSS agent): which API layers the loader offers (implicit layers load into every instance unless disabled,
+                // e.g. the dlss5-autopilot's ReShade layer) and whether a ReShade module is now in the process
+                std::uint32_t n = 0;
+                std::string   s;
+                if (XR_SUCCEEDED(xrEnumerateApiLayerProperties(0, &n, nullptr)) && n) {
+                    std::vector<XrApiLayerProperties> lp(n, { XR_TYPE_API_LAYER_PROPERTIES });
+                    if (XR_SUCCEEDED(xrEnumerateApiLayerProperties(n, &n, lp.data()))) {
+                        for (std::uint32_t i = 0; i < n; ++i) s += std::string(s.empty() ? "" : ", ") + lp[i].layerName;
+                    }
+                }
+                apiLayers = s.empty() ? "none" : s;
+                if (::GetModuleHandleW(L"ReShade64.dll")) apiLayers += " | module loaded: ReShade64.dll";
+                char env[8]{};
+                if (::GetEnvironmentVariableA("DISABLE_XR_APILAYER_reshade_1", env, sizeof(env))) apiLayers += " | DISABLE_XR_APILAYER_reshade_1 set";
+            }
 
+            if (visMaskExt &&
+                XR_FAILED(xrGetInstanceProcAddr(instance, "xrGetVisibilityMaskKHR", reinterpret_cast<PFN_xrVoidFunction*>(&getVisibilityMask)))) {
+                getVisibilityMask = nullptr;
+            }
+            visMaskWanted = getVisibilityMask != nullptr;
             return Check(xrGetInstanceProcAddr(instance, "xrGetD3D11GraphicsRequirementsKHR",
                                                reinterpret_cast<PFN_xrVoidFunction*>(&getGraphicsRequirements)),
                          "xrGetInstanceProcAddr(xrGetD3D11GraphicsRequirementsKHR)");
@@ -639,6 +750,8 @@ float4 ps(float4 pos : SV_Position) : SV_Target
             if (!Check(xrCreateSession(instance, &sci, &session), "xrCreateSession"))
                 return false;
             xrState = XR_SESSION_STATE_UNKNOWN;
+            visMaskWanted = getVisibilityMask != nullptr;  // 22 Nov: (re)fetch the hidden-area mesh for this session
+            visMaskTries = 0;
 
             if (!Check(xrEnumerateReferenceSpaces(session, 0, &count, nullptr), "xrEnumerateReferenceSpaces"))
                 return false;
@@ -1008,6 +1121,8 @@ float4 ps(float4 pos : SV_Position) : SV_Target
             DestroySwapchain(quadSc);
             DestroySwapchain(monoSc);
             DestroySwapchain(hudSc);
+            DestroySwapchain(pieceSc);
+            piecesSubmitted = false;
             for (auto& w : world) {
                 DestroySwapchain(w.sc);
                 w.submitted = false;
@@ -1018,6 +1133,13 @@ float4 ps(float4 pos : SV_Position) : SV_Target
             DestroySwapchain(vigSc);
             vigSubmitted = false;
             vigKey[0] = vigKey[1] = vigKey[2] = -1.0f;
+            DestroySwapchain(beamSc);
+            DestroySwapchain(dotSc);
+            DestroySwapchain(coneSc);
+            DestroySwapchain(markSc);
+            beamUploaded = dotUploaded = coneUploaded = markUploaded = false;
+            for (auto& b : beams)
+                b.submitted = false;
             DestroySwapchain(eyeSc[0]);
             DestroySwapchain(eyeSc[1]);
             DestroySwapchain(pano.sc[0]);
@@ -1060,9 +1182,15 @@ float4 ps(float4 pos : SV_Position) : SV_Target
                 sc->stageDesc = {};
                 sc->hasContent = false;
             };
-            for (ColorSwapchain* sc : { &quadSc, &monoSc, &hudSc, &eyeSc[0], &eyeSc[1] }) {
+            for (ColorSwapchain* sc : { &quadSc, &monoSc, &hudSc, &pieceSc, &eyeSc[0], &eyeSc[1], &vigSc, &beamSc, &dotSc, &coneSc, &markSc }) {
                 resetStage(sc);
             }
+            vigSrc.Reset();
+            beamSrc.Reset();
+            dotSrc.Reset();
+            coneSrc.Reset();
+            markSrc.Reset();
+            beamUploaded = dotUploaded = coneUploaded = markUploaded = false;
             for (auto& wq : world) {
                 resetStage(&wq.sc);
             }
@@ -1609,6 +1737,10 @@ float4 ps(float4 pos : SV_Position) : SV_Target
             case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:
                 d.recenterPending = true;  // user recentred in the runtime: re-anchor the quad to match
                 break;
+            case XR_TYPE_EVENT_DATA_VISIBILITY_MASK_CHANGED_KHR:
+                d.visMaskWanted = d.getVisibilityMask != nullptr;  // re-fetch both eyes below
+                d.visMaskTries = 0;
+                break;
             case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED:
                 {
                     const auto& sc = *reinterpret_cast<const XrEventDataSessionStateChanged*>(&ev);
@@ -1648,6 +1780,12 @@ float4 ps(float4 pos : SV_Position) : SV_Target
             if (d.instanceLost || d.session == XR_NULL_HANDLE)
                 break;
         }
+        // 22 Nov: hidden-area mesh once the session runs (some runtimes answer empty before); retried for ~10 s of polls
+        if (d.visMaskWanted && d.sessionRunning && d.visMaskTries < 900) {
+            ++d.visMaskTries;
+            if (d.FetchVisibilityMask())
+                d.visMaskWanted = false;
+        }
         d.HandleLosses();
     }
 
@@ -1677,6 +1815,7 @@ float4 ps(float4 pos : SV_Position) : SV_Target
         d.eyeSubmitted = false;
         d.backdropWanted = false;
         d.hudSubmitted = false;
+        d.piecesSubmitted = false;
         for (auto& w : d.world)
             w.submitted = false;
         d.displayTime = fs.predictedDisplayTime;
@@ -1916,6 +2055,34 @@ float4 ps(float4 pos : SV_Position) : SV_Target
         return true;
     }
 
+    bool Runtime::SubmitHudPieces(ID3D11DeviceContext* a_ctx, ID3D11Texture2D* a_atlas, const HudPiece* a_pieces, int a_count,
+        bool a_premultiplied)
+    {
+        auto& d = *_impl;
+        if (!d.frameBegun || !d.shouldRender || !a_ctx || !a_atlas || !a_pieces || a_count <= 0 || d.viewSpace == XR_NULL_HANDLE ||
+            d.refSpace == XR_NULL_HANDLE)
+            return false;
+        d.pieceSc.keepAlpha = true;
+        if (!d.CopyToStage(a_ctx, a_atlas, d.pieceSc) || !d.BlitStageToSwapchain(a_ctx, d.pieceSc))
+            return false;
+        d.pieceCount = 0;
+        for (int i = 0; i < a_count && d.pieceCount < kMaxHudPieces; ++i) {
+            const auto& p = a_pieces[i];
+            if (p.w <= 0 || p.h <= 0 || !(p.widthMeters > 0.0f) || p.x < 0 || p.y < 0 || static_cast<UINT>(p.x + p.w) > d.pieceSc.width ||
+                static_cast<UINT>(p.y + p.h) > d.pieceSc.height)
+                continue;
+            d.pieces[d.pieceCount++] = p;
+        }
+        d.piecesPremultiplied = a_premultiplied;
+        d.piecesSubmitted = d.pieceCount > 0;
+        return d.piecesSubmitted;
+    }
+
+    std::uint64_t Runtime::HudPieceLayersSubmitted() const noexcept
+    {
+        return _impl->pieceLayers;
+    }
+
     bool Runtime::SubmitWorldQuad(ID3D11DeviceContext* a_ctx, ID3D11Texture2D* a_src, const Pose& a_poseInRef, float a_widthMeters,
         bool a_alphaBlend, bool a_premultiplied, int a_slot)
     {
@@ -2027,6 +2194,258 @@ float4 ps(float4 pos : SV_Position) : SV_Target
         return true;
     }
 
+    namespace
+    {
+        // Orthonormal basis (columns x, y, z) -> quaternion.
+        XrQuaternionf QuatFromBasis(const Vec3& x, const Vec3& y, const Vec3& z)
+        {
+            const float m00 = x.x, m10 = x.y, m20 = x.z;
+            const float m01 = y.x, m11 = y.y, m21 = y.z;
+            const float m02 = z.x, m12 = z.y, m22 = z.z;
+            XrQuaternionf q{ 0, 0, 0, 1 };
+            const float   tr = m00 + m11 + m22;
+            if (tr > 0.0f) {
+                const float s = std::sqrt(tr + 1.0f) * 2.0f;
+                q.w = 0.25f * s, q.x = (m21 - m12) / s, q.y = (m02 - m20) / s, q.z = (m10 - m01) / s;
+            } else if (m00 > m11 && m00 > m22) {
+                const float s = std::sqrt(1.0f + m00 - m11 - m22) * 2.0f;
+                q.w = (m21 - m12) / s, q.x = 0.25f * s, q.y = (m01 + m10) / s, q.z = (m02 + m20) / s;
+            } else if (m11 > m22) {
+                const float s = std::sqrt(1.0f + m11 - m00 - m22) * 2.0f;
+                q.w = (m02 - m20) / s, q.x = (m01 + m10) / s, q.y = 0.25f * s, q.z = (m12 + m21) / s;
+            } else {
+                const float s = std::sqrt(1.0f + m22 - m00 - m11) * 2.0f;
+                q.w = (m10 - m01) / s, q.x = (m02 + m20) / s, q.y = (m12 + m21) / s, q.z = 0.25f * s;
+            }
+            const float n = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+            if (n > 1e-6f)
+                q.x /= n, q.y /= n, q.z /= n, q.w /= n;
+            return q;
+        }
+        Vec3  V3Sub(const Vec3& a, const Vec3& b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
+        float V3Dot(const Vec3& a, const Vec3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+        Vec3  V3Cross(const Vec3& a, const Vec3& b) { return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
+        Vec3  V3Scale(const Vec3& a, float s) { return { a.x * s, a.y * s, a.z * s }; }
+        bool  V3Norm(Vec3& a)
+        {
+            const float l = std::sqrt(V3Dot(a, a));
+            if (!(l > 1e-6f))
+                return false;
+            a = V3Scale(a, 1.0f / l);
+            return true;
+        }
+        // Unit vector perpendicular to a_axis, as close to a_toward as possible (a fallback when a_toward is parallel).
+        Vec3 Perp(const Vec3& a_axis, const Vec3& a_toward)
+        {
+            Vec3 z = V3Sub(a_toward, V3Scale(a_axis, V3Dot(a_toward, a_axis)));
+            if (V3Norm(z))
+                return z;
+            const Vec3 alt = std::fabs(a_axis.y) < 0.9f ? Vec3{ 0, 1, 0 } : Vec3{ 1, 0, 0 };
+            z = V3Sub(alt, V3Scale(a_axis, V3Dot(alt, a_axis)));
+            V3Norm(z);
+            return z;
+        }
+    }
+
+    bool Runtime::SubmitBeam(ID3D11DeviceContext* a_ctx, int a_slot, const Vec3& a_from, const Vec3& a_to, const Vec3& a_viewer, float a_widthMeters,
+        const float a_rgba[4], float a_dotSizeMeters, bool a_pressed, int a_style, const Vec3* a_dotAt)
+    {
+        const bool preview = a_style == kBeamPreview;
+        const Vec3 dotAt = a_dotAt ? *a_dotAt : a_to;
+        if (!std::isfinite(dotAt.x) || !std::isfinite(dotAt.y) || !std::isfinite(dotAt.z))
+            return false;
+        auto& d = *_impl;
+        if (!d.frameBegun || !d.shouldRender || !a_ctx || !a_rgba || a_slot < 0 || a_slot >= kMaxBeams || d.refSpace == XR_NULL_HANDLE)
+            return false;
+        for (const Vec3* v : { &a_from, &a_to, &a_viewer }) {  // a bad pose fails the whole xrEndFrame: never send one
+            if (!std::isfinite(v->x) || !std::isfinite(v->y) || !std::isfinite(v->z))
+                return false;
+        }
+        if (!std::isfinite(a_widthMeters) || !std::isfinite(a_dotSizeMeters))
+            return false;
+        Vec3        axis = V3Sub(a_to, a_from);
+        const float len = std::sqrt(V3Dot(axis, axis));
+        if (!(len > 1e-4f) || !V3Norm(axis))
+            return false;
+
+        auto to8 = [](float v) { return static_cast<std::uint32_t>(std::lround((v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v) * 255.0f)); };
+        const std::uint32_t key = to8(a_rgba[0]) | (to8(a_rgba[1]) << 8) | (to8(a_rgba[2]) << 16) | (to8(a_rgba[3]) << 24);
+        auto makeSrc = [&](ComPtr<ID3D11Texture2D>& a_tex, UINT a_w, UINT a_h, const char* a_what) {
+            if (a_tex)
+                return true;
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = a_w;
+            td.Height = a_h;
+            td.MipLevels = td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            return d.CheckHr(d.device->CreateTexture2D(&td, nullptr, &a_tex), a_what);
+        };
+        auto clamp01 = [](float v) { return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v; };
+        auto smooth = [&](float e0, float e1, float v) {
+            const float t = clamp01((v - e0) / (e1 - e0));
+            return t * t * (3.0f - 2.0f * t);
+        };
+        // FO4VR activation preview (bShowWandActivationPreview). Cone image (world_targetIndicator_ray.nif: a cone along the
+        // wand, vertex alpha 0 at the wand -> 1 at the tip, effect shader colour = white / green, normal alpha blend):
+        // straight alpha, rows = length (top row = tip = a_to), half width 1 - t, alpha = a * t.
+        if (preview && a_rgba[3] > 0.0f && (!d.coneUploaded || key != d.coneKey || d.coneSc.handle == XR_NULL_HANDLE)) {
+            constexpr UINT kW = 32, kH = 128;
+            if (!makeSrc(d.coneSrc, kW, kH, "CreateTexture2D(preview cone)"))
+                return false;
+            std::vector<std::uint32_t> px(static_cast<std::size_t>(kW) * kH);
+            for (UINT y = 0; y < kH; ++y) {
+                const float t = 1.0f - (static_cast<float>(y) + 0.5f) / kH;  // 0 at the wand (bottom), 1 at the tip (top)
+                const float w = 1.0f - t;                                     // half width, 1 = the quad's half width
+                for (UINT x = 0; x < kW; ++x) {
+                    const float s = std::fabs((static_cast<float>(x) + 0.5f) / kW * 2.0f - 1.0f);
+                    const float cov = clamp01((w - s) * kW * 0.5f + 0.5f);   // one-texel anti-aliased edge
+                    const float a = a_rgba[3] * t * cov;
+                    px[static_cast<std::size_t>(y) * kW + x] = (key & 0x00FFFFFFu) | (to8(a) << 24);
+                }
+            }
+            a_ctx->UpdateSubresource(d.coneSrc.Get(), 0, nullptr, px.data(), kW * 4, 0);
+            d.coneSc.keepAlpha = true;
+            if (!d.CopyToSwapchain(a_ctx, d.coneSrc.Get(), d.coneSc))
+                return false;
+            d.coneKey = key;
+            d.coneUploaded = true;
+            ++d.beamUploads;
+        }
+        // Preview end markers (activateArc_noTarget / activateArc_Target.nif: additive effect-shader spheres, colour = the
+        // ray's): premultiplied with alpha 0 (= additive), linear-light intensity I(r) re-encoded to sRGB. Cell 0 no target:
+        // double-sided shell, falloff opacity 0 facing -> 0.25 away = an even 0.25 disc. Cell 1 target: shell 0 falloff
+        // cos 0.989 -> 0.906, opacity 1 -> 0 (bright core) + shell 1 alpha 0.75, falloff cos -0.342 -> 1, 1 -> 0.1 (halo).
+        const std::uint32_t mkey = key & 0x00FFFFFFu;
+        if (preview && a_dotSizeMeters > 0.0f && (!d.markUploaded || mkey != d.markKey || d.markSc.handle == XR_NULL_HANDLE)) {
+            constexpr UINT kC = 64;
+            if (!makeSrc(d.markSrc, kC * 2, kC, "CreateTexture2D(preview marker)"))
+                return false;
+            auto lin = [](float s) { return s <= 0.04045f ? s / 12.92f : std::pow((s + 0.055f) / 1.055f, 2.4f); };
+            auto enc = [](float l) { return l <= 0.0031308f ? l * 12.92f : 1.055f * std::pow(l, 1.0f / 2.4f) - 0.055f; };
+            const float cl[3] = { lin(clamp01(a_rgba[0])), lin(clamp01(a_rgba[1])), lin(clamp01(a_rgba[2])) };
+            std::vector<std::uint32_t> px(static_cast<std::size_t>(kC) * 2 * kC);
+            for (UINT cell = 0; cell < 2; ++cell) {
+                for (UINT y = 0; y < kC; ++y) {
+                    for (UINT x = 0; x < kC; ++x) {
+                        const float dx = (static_cast<float>(x) + 0.5f) / kC * 2.0f - 1.0f;
+                        const float dy = (static_cast<float>(y) + 0.5f) / kC * 2.0f - 1.0f;
+                        const float r = std::sqrt(dx * dx + dy * dy);
+                        const float c = std::sqrt((std::max)(0.0f, 1.0f - r * r));  // cos(view, normal) on the sphere
+                        float       in = 0.0f;
+                        if (cell == 0) {
+                            in = 0.25f;
+                        } else {
+                            const float shell0 = clamp01((c - 0.906f) / (0.989f - 0.906f));
+                            const float shell1 = 0.75f * (1.0f + (0.1f - 1.0f) * clamp01((c + 0.342f) / 1.342f));
+                            in = (std::min)(1.0f, shell0 + shell1);
+                        }
+                        in *= 1.0f - smooth(1.0f - 4.0f / kC, 1.0f, r);  // silhouette, anti-aliased
+                        std::uint32_t v = 0;
+                        for (int k = 0; k < 3; ++k)
+                            v |= to8(enc(cl[k] * in)) << (8 * k);
+                        px[static_cast<std::size_t>(y) * kC * 2 + cell * kC + x] = v;  // alpha 0: additive
+                    }
+                }
+            }
+            a_ctx->UpdateSubresource(d.markSrc.Get(), 0, nullptr, px.data(), kC * 2 * 4, 0);
+            d.markSc.keepAlpha = true;
+            if (!d.CopyToSwapchain(a_ctx, d.markSrc.Get(), d.markSc))
+                return false;
+            d.markKey = mkey;
+            d.markUploaded = true;
+            ++d.beamUploads;
+        }
+        // Ribbon image: straight alpha (the layer says UNPREMULTIPLIED), colour everywhere, alpha = a * soft profile
+        // across the width (flat core over the middle 50 %, smooth to 0 at the edges); uniform along the length.
+        if (!preview && (!d.beamUploaded || key != d.beamKey || d.beamSc.handle == XR_NULL_HANDLE)) {
+            constexpr UINT kW = 64, kH = 8;
+            if (!makeSrc(d.beamSrc, kW, kH, "CreateTexture2D(beam)"))
+                return false;
+            std::vector<std::uint32_t> px(static_cast<std::size_t>(kW) * kH);
+            for (UINT x = 0; x < kW; ++x) {
+                const float s = std::fabs((static_cast<float>(x) + 0.5f) / kW * 2.0f - 1.0f);
+                float       t = (1.0f - s) / 0.5f;  // 1 at |s| <= 0.5, 0 at the edge
+                t = t < 0.0f ? 0.0f : t > 1.0f ? 1.0f : t;
+                const float a = a_rgba[3] * t * t * (3.0f - 2.0f * t);
+                const std::uint32_t c = (key & 0x00FFFFFFu) | (to8(a) << 24);
+                for (UINT y = 0; y < kH; ++y)
+                    px[static_cast<std::size_t>(y) * kW + x] = c;
+            }
+            a_ctx->UpdateSubresource(d.beamSrc.Get(), 0, nullptr, px.data(), kW * 4, 0);
+            d.beamSc.keepAlpha = true;
+            if (!d.CopyToSwapchain(a_ctx, d.beamSrc.Get(), d.beamSc))
+                return false;
+            d.beamKey = key;
+            d.beamUploaded = true;
+            ++d.beamUploads;
+        }
+        // End dot image: two 64x64 cells (normal | pressed): white (pressed: green) disc, dark rim, anti-aliased edge.
+        if (!preview && a_dotSizeMeters > 0.0f && (!d.dotUploaded || d.dotSc.handle == XR_NULL_HANDLE)) {
+            constexpr UINT kC = 64;
+            if (!makeSrc(d.dotSrc, kC * 2, kC, "CreateTexture2D(beam dot)"))
+                return false;
+            std::vector<std::uint32_t> px(static_cast<std::size_t>(kC) * 2 * kC);
+            for (UINT cell = 0; cell < 2; ++cell) {
+                for (UINT y = 0; y < kC; ++y) {
+                    for (UINT x = 0; x < kC; ++x) {
+                        const float dx = (static_cast<float>(x) + 0.5f) / kC * 2.0f - 1.0f;
+                        const float dy = (static_cast<float>(y) + 0.5f) / kC * 2.0f - 1.0f;
+                        const float r = std::sqrt(dx * dx + dy * dy);
+                        const float edge = 1.0f / kC * 2.0f;  // one texel, for anti-aliasing
+                        const float inner = 1.0f - smooth(0.58f - edge, 0.58f + edge, r);  // 1 inside the disc
+                        const float alpha = 1.0f - smooth(0.92f - 2.0f * edge, 0.92f, r);  // outer edge of the rim
+                        const float rgbIn[3] = { cell ? 0.3f : 1.0f, 1.0f, cell ? 0.3f : 1.0f };
+                        const float rim = 0.08f;
+                        std::uint32_t c = 0;
+                        for (int k = 0; k < 3; ++k)
+                            c |= to8(rim + (rgbIn[k] - rim) * inner) << (8 * k);
+                        c |= to8(alpha * (0.85f + 0.15f * inner)) << 24;
+                        px[static_cast<std::size_t>(y) * kC * 2 + cell * kC + x] = c;
+                    }
+                }
+            }
+            a_ctx->UpdateSubresource(d.dotSrc.Get(), 0, nullptr, px.data(), kC * 2 * 4, 0);
+            d.dotSc.keepAlpha = true;
+            if (!d.CopyToSwapchain(a_ctx, d.dotSrc.Get(), d.dotSc))
+                return false;
+            d.dotUploaded = true;
+            ++d.beamUploads;
+        }
+
+        auto& b = d.beams[a_slot];
+        // Ribbon: local Y along the beam, local +Z (the quad's front) toward the viewer, turned about the beam axis.
+        const Vec3 mid = V3Scale({ a_from.x + a_to.x, a_from.y + a_to.y, a_from.z + a_to.z }, 0.5f);
+        const Vec3 z = Perp(axis, V3Sub(a_viewer, mid));
+        const Vec3 x = V3Cross(axis, z);
+        b.pose.orientation = QuatFromBasis(x, axis, z);
+        b.pose.position = { mid.x, mid.y, mid.z };
+        b.size = { a_widthMeters > 0.0005f ? a_widthMeters : 0.0005f, len };
+        // End dot: facing the viewer, upright, 2 mm toward the viewer from the end point.
+        b.style = preview ? kBeamPreview : kBeamLaser;
+        b.dot = a_dotSizeMeters > 0.0f && (preview ? d.markUploaded : d.dotUploaded);
+        b.pressed = a_pressed;
+        b.ribbon = a_rgba[3] > 0.0f;
+        if (b.dot) {
+            Vec3 f = V3Sub(a_viewer, dotAt);
+            if (!V3Norm(f))
+                f = V3Scale(axis, -1.0f);
+            const Vec3 up = Perp(f, { 0.0f, 1.0f, 0.0f });
+            const Vec3 right = V3Cross(up, f);
+            b.dotPose.orientation = QuatFromBasis(right, up, f);
+            const Vec3 p{ dotAt.x + f.x * 0.002f, dotAt.y + f.y * 0.002f, dotAt.z + f.z * 0.002f };
+            b.dotPose.position = { p.x, p.y, p.z };
+            b.dotSize = a_dotSizeMeters;
+        }
+        b.submitted = true;
+        return true;
+    }
+
+    std::uint64_t Runtime::BeamLayersSubmitted() const noexcept { return _impl->beamFrames; }
+    std::uint64_t Runtime::BeamUploads() const noexcept { return _impl->beamUploads; }
+
     std::uint64_t Runtime::VignetteLayersSubmitted() const noexcept { return _impl->vigFrames; }
     std::uint64_t Runtime::VignetteUploads() const noexcept { return _impl->vigUploads; }
     std::uint32_t Runtime::LastLayerCount() const noexcept { return _impl->lastLayerCount; }
@@ -2088,7 +2507,7 @@ float4 ps(float4 pos : SV_Position) : SV_Target
         d.frameBegun = false;
 
         // Projection (world view) first, then the HUD quad, then the cinema quad on top.
-        const XrCompositionLayerBaseHeader* layers[5 + kMaxWorldQuads]{};
+        const XrCompositionLayerBaseHeader* layers[5 + kMaxHudPieces + kMaxWorldQuads + 2 * kMaxBeams]{};
         std::uint32_t layerCount = 0;
 
         XrCompositionLayerProjectionView views[2]{ { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW }, { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW } };
@@ -2185,12 +2604,36 @@ float4 ps(float4 pos : SV_Position) : SV_Target
             layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&hud);
         }
 
+        // HUD pieces (SubmitHudPieces): sub-rectangles of the piece atlas, each on its own pose, right above the HUD.
+        XrCompositionLayerQuad piece[kMaxHudPieces]{};
+        if (d.piecesSubmitted && d.shouldRender && d.pieceSc.handle != XR_NULL_HANDLE) {
+            for (int i = 0; i < d.pieceCount; ++i) {
+                const auto& p = d.pieces[i];
+                auto&       l = piece[i];
+                l.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
+                l.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+                               (d.piecesPremultiplied ? 0 : XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT);
+                l.space = p.inView ? d.viewSpace : d.refSpace;
+                l.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                l.subImage.swapchain = d.pieceSc.handle;
+                l.subImage.imageRect = { { p.x, p.y }, { p.w, p.h } };
+                l.subImage.imageArrayIndex = 0;
+                const auto& o = p.pose.orientation;
+                const auto& t = p.pose.position;
+                l.pose = { { o.x, o.y, o.z, o.w }, { t.x, t.y, t.z } };
+                l.size = { p.widthMeters, p.heightMeters > 0.0f ? p.heightMeters : p.widthMeters * static_cast<float>(p.h) / static_cast<float>(p.w) };
+                layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&l);
+                ++d.pieceLayers;
+            }
+        }
+
         // World quads in slot order (0 = Pip-Boy, 1 = dialogue panel): above the HUD, below the cinema quad.
+        // 20 Nov: kTopWorldQuad (VR settings panel) is held back and goes after the cinema quad, below the beams.
         XrCompositionLayerQuad world[kMaxWorldQuads]{};
-        for (int i = 0; i < kMaxWorldQuads; ++i) {
+        auto emitWorld = [&](int i) {
             const auto& w = d.world[i];
             if (!w.submitted || !d.shouldRender || w.sc.handle == XR_NULL_HANDLE)
-                continue;
+                return;
             auto& l = world[i];
             l.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
             l.layerFlags = w.blend ? (XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
@@ -2205,6 +2648,10 @@ float4 ps(float4 pos : SV_Position) : SV_Target
             l.size = w.size;
             layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&l);
             ++d.worldFrames[i];
+        };
+        for (int i = 0; i < kMaxWorldQuads; ++i) {
+            if (i != kTopWorldQuad)
+                emitWorld(i);
         }
 
         XrCompositionLayerQuad quad{ XR_TYPE_COMPOSITION_LAYER_QUAD };
@@ -2217,12 +2664,65 @@ float4 ps(float4 pos : SV_Position) : SV_Target
             quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
             quad.subImage.swapchain = d.quadSc.handle;
             quad.subImage.imageRect = { { 0, 0 }, { static_cast<std::int32_t>(d.quadSc.width), static_cast<std::int32_t>(d.quadSc.height) } };
+            float cropAspect = d.quadAspect;
+            if (d.quadCropOn && d.quadSc.width > 0 && d.quadSc.height > 0) {  // 21 Nov: sub-rectangle (SetCinemaQuadCrop)
+                const auto W = static_cast<float>(d.quadSc.width), H = static_cast<float>(d.quadSc.height);
+                const std::int32_t x0 = static_cast<std::int32_t>(d.quadCrop[0] * W), y0 = static_cast<std::int32_t>(d.quadCrop[1] * H);
+                const std::int32_t x1 = static_cast<std::int32_t>(d.quadCrop[2] * W), y1 = static_cast<std::int32_t>(d.quadCrop[3] * H);
+                if (x1 - x0 >= 8 && y1 - y0 >= 8) {
+                    quad.subImage.imageRect = { { x0, y0 }, { x1 - x0, y1 - y0 } };
+                    cropAspect = static_cast<float>(y1 - y0) / static_cast<float>(x1 - x0);
+                }
+            }
             quad.subImage.imageArrayIndex = 0;
             quad.pose = d.QuadPose();
             const float qw = d.quadOverride ? d.quadOverrideWidth : d.config.quad.widthMeters;
-            quad.size = { qw, qw * d.quadAspect };
+            quad.size = { qw, qw * cropAspect };
             layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad);
         }
+        emitWorld(kTopWorldQuad);  // VR settings panel: over menu panels and the flat window
+
+        // Pointer beams over everything they can end on (menus, panels, Pip-Boy), then their end dots; below the fade.
+        XrCompositionLayerQuad beamL[kMaxBeams]{}, dotL[kMaxBeams]{};
+        for (int pass = 0; pass < 2; ++pass) {
+            for (int i = 0; i < kMaxBeams; ++i) {
+                const auto& b = d.beams[i];
+                if (!b.submitted || !d.shouldRender)
+                    continue;
+                const bool dotPass = pass == 1;
+                const bool prev = b.style == kBeamPreview;
+                const auto& dsc = prev ? d.markSc : d.dotSc;   // end dot / preview marker
+                const auto& bsc = prev ? d.coneSc : d.beamSc;  // laser ribbon / preview cone
+                if (dotPass && (!b.dot || dsc.handle == XR_NULL_HANDLE))
+                    continue;
+                if (!dotPass && (!b.ribbon || bsc.handle == XR_NULL_HANDLE))
+                    continue;
+                auto& l = dotPass ? dotL[i] : beamL[i];
+                l.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
+                // the preview marker is additive (premultiplied, alpha 0); everything else straight alpha
+                l.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+                               (dotPass && prev ? 0 : XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT);
+                l.space = d.refSpace;
+                l.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                l.subImage.imageArrayIndex = 0;
+                if (dotPass) {
+                    const std::int32_t cell = static_cast<std::int32_t>(dsc.height);
+                    l.subImage.swapchain = dsc.handle;
+                    l.subImage.imageRect = { { b.pressed ? cell : 0, 0 }, { cell, cell } };
+                    l.pose = b.dotPose;
+                    l.size = { b.dotSize, b.dotSize };
+                } else {
+                    l.subImage.swapchain = bsc.handle;
+                    l.subImage.imageRect = { { 0, 0 }, { static_cast<std::int32_t>(bsc.width), static_cast<std::int32_t>(bsc.height) } };
+                    l.pose = b.pose;
+                    l.size = b.size;
+                    ++d.beamFrames;
+                }
+                layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&l);
+            }
+        }
+        for (auto& b : d.beams)
+            b.submitted = false;
 
         XrCompositionLayerQuad fade{ XR_TYPE_COMPOSITION_LAYER_QUAD };
         if (d.fadeSubmitted && d.shouldRender && d.fadeSc.handle != XR_NULL_HANDLE) {
@@ -2247,6 +2747,7 @@ float4 ps(float4 pos : SV_Position) : SV_Target
         d.backdropWanted = false;
         d.pano.submitted = false;
         d.hudSubmitted = false;
+        d.piecesSubmitted = false;
         for (auto& w : d.world)
             w.submitted = false;
 
@@ -2263,7 +2764,30 @@ float4 ps(float4 pos : SV_Position) : SV_Target
         const auto& d = *_impl;
         a_pose = ToPose(d.QuadPose());
         a_width = d.quadOverride ? d.quadOverrideWidth : d.config.quad.widthMeters;
-        a_height = a_width * d.quadAspect;
+        float aspect = d.quadAspect;
+        if (d.quadCropOn && d.quadCrop[2] - d.quadCrop[0] > 1e-3f) {
+            aspect *= (d.quadCrop[3] - d.quadCrop[1]) / (d.quadCrop[2] - d.quadCrop[0]);
+        }
+        a_height = a_width * aspect;
+    }
+
+    void Runtime::SetCinemaQuadCrop(const float* a_uv4)
+    {
+        auto& d = *_impl;
+        d.quadCropOn = a_uv4 && a_uv4[2] - a_uv4[0] > 1e-3f && a_uv4[3] - a_uv4[1] > 1e-3f;
+        if (d.quadCropOn) {
+            for (int i = 0; i < 4; ++i) d.quadCrop[i] = std::clamp(a_uv4[i], 0.0f, 1.0f);
+        }
+    }
+
+    bool Runtime::CinemaQuadCrop(float a_uv4[4]) const
+    {
+        const auto& d = *_impl;
+        if (!d.quadCropOn) {
+            return false;
+        }
+        for (int i = 0; i < 4; ++i) a_uv4[i] = d.quadCrop[i];
+        return true;
     }
 
     void Runtime::Recenter()
@@ -2315,6 +2839,18 @@ float4 ps(float4 pos : SV_Position) : SV_Target
     }
 
     std::string Runtime::runtimeName() const { return _impl->runtimeName; }
+    std::string Runtime::apiLayers() const { return _impl->apiLayers; }
+
+    bool Runtime::VisibilityMaskSupported() const noexcept { return _impl->getVisibilityMask != nullptr; }
+    std::uint64_t Runtime::VisibilityMaskSerial() const noexcept { return _impl->visMaskSerial; }
+    bool Runtime::VisibilityMask(int a_eye, std::vector<float>& a_xy, std::vector<std::uint32_t>& a_indices) const
+    {
+        if (a_eye < 0 || a_eye > 1)
+            return false;
+        a_xy = _impl->visMaskXy[a_eye];
+        a_indices = _impl->visMaskIdx[a_eye];
+        return !a_indices.empty();
+    }
 
     std::int64_t Runtime::swapchainFormat() const noexcept
     {

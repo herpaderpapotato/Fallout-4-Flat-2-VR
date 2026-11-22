@@ -19,6 +19,10 @@ namespace fo4flatvr::head
     void Recenter();
     // Number of re-anchors so far (incl. the automatic first one). Any thread.
     unsigned RecenterCount();
+    // Until the first explicit Recenter(), a valid pose more than a_metres from the previous valid one re-anchors
+    // (OpenXR runtimes that hand out a placeholder pose first; HeadPose.cpp). <= 0 = off. [OpenXR] bRecentreOnPoseJump.
+    void     SetRecentreOnPoseJump(float a_metres);
+    unsigned PoseJumpRecentres(float* a_lastJumpM = nullptr);
 
     // Degrees. yaw + = look right, pitch + = look up, roll + = tilt head right.
     void SetOverride(float a_yawDeg, float a_pitchDeg, float a_rollDeg);

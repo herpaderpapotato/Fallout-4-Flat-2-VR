@@ -1,7 +1,10 @@
 #include "plugin/Comfort.h"
 
+#include "plugin/CameraDirector.h"
+
 #include "plugin/GameBridge.h"
 #include "plugin/Roomscale.h"
+#include "plugin/ConfigStore.h"
 #include "plugin/Settings.h"
 
 #include <F4SE/F4SE.h>
@@ -72,6 +75,7 @@ namespace fo4flatvr::comfort
             int               camState{ -1 };
             std::uint32_t     inputFlags{ 0 };
             bool              owns{ false };
+            unsigned          ownLogs{ 0 };
             Clock::time_point turningUntil{};
             // direction
             float             deltaDeg{ 0.0f }, heading{ 0.0f }, camYaw{ 0.0f }, handRelDeg{ 0.0f };
@@ -138,9 +142,34 @@ namespace fo4flatvr::comfort
         }
     }
 
+    namespace
+    {
+        void ReadCfgLocked();
+    }
+
     std::string Install()
     {
+        static std::once_flag s_sub;
+        std::call_once(s_sub, [] {
+            // 20 Nov (live settings, ConfigStore.h): every [Comfort] turn / move / vignette key and the handedness, live
+            cfgstore::Subscribe("comfort", "Comfort,Controllers/bLeftHanded", [](const cfgstore::Changes&) {
+                std::scoped_lock l(g_lock);
+                ReadCfgLocked();
+                REX::INFO("comfort: settings re-read (live): {}", CfgString());
+            });
+        });
         std::scoped_lock l(g_lock);
+        ReadCfgLocked();
+        g_installed = true;
+        const auto s = CfgString();
+        REX::INFO("comfort: {}", s);
+        return s;
+    }
+
+    namespace
+    {
+    void ReadCfgLocked()
+    {
         const auto path = Settings::Path();
         auto rd = [&](const char* sec, const char* k, float d) {
             char buf[64]{};
@@ -150,22 +179,20 @@ namespace fo4flatvr::comfort
             return end != buf ? v : d;
         };
         Cfg& c = g_cfg;
-        c.turnMode = std::clamp(static_cast<int>(rd("Comfort", "iTurnMode", static_cast<float>(c.turnMode))), 0, 2);
-        c.snapDeg = rd("Comfort", "fSnapTurnDeg", c.snapDeg);
-        c.snapThreshold = rd("Comfort", "fSnapThreshold", c.snapThreshold);
-        c.snapRearm = rd("Comfort", "fSnapRearm", c.snapRearm);
-        c.snapCooldownMs = rd("Comfort", "fSnapCooldownMs", c.snapCooldownMs);
-        c.smoothDegPerSec = rd("Comfort", "fSmoothTurnDegPerSec", c.smoothDegPerSec);
-        c.turnDeadzone = std::clamp(rd("Comfort", "fTurnDeadzone", c.turnDeadzone), 0.0f, 0.9f);
-        c.moveDir = std::clamp(static_cast<int>(rd("Comfort", "iMoveDirection", static_cast<float>(c.moveDir))), 0, 2);
+        const Cfg dflt{};  // code defaults (a key removed from every layer goes back to these)
+        c.turnMode = std::clamp(static_cast<int>(rd("Comfort", "iTurnMode", static_cast<float>(dflt.turnMode))), 0, 2);
+        c.snapDeg = rd("Comfort", "fSnapTurnDeg", dflt.snapDeg);
+        c.snapThreshold = rd("Comfort", "fSnapThreshold", dflt.snapThreshold);
+        c.snapRearm = rd("Comfort", "fSnapRearm", dflt.snapRearm);
+        c.snapCooldownMs = rd("Comfort", "fSnapCooldownMs", dflt.snapCooldownMs);
+        c.smoothDegPerSec = rd("Comfort", "fSmoothTurnDegPerSec", dflt.smoothDegPerSec);
+        c.turnDeadzone = std::clamp(rd("Comfort", "fTurnDeadzone", dflt.turnDeadzone), 0.0f, 0.9f);
+        c.moveDir = std::clamp(static_cast<int>(rd("Comfort", "iMoveDirection", static_cast<float>(dflt.moveDir))), 0, 2);
         c.vignette = rd("Comfort", "bVignette", 1.0f) != 0.0f;
-        c.vignetteStrength = std::clamp(rd("Comfort", "fVignetteStrength", c.vignetteStrength), 0.0f, 1.0f);
-        c.vignetteFadeMs = rd("Comfort", "fVignetteFadeMs", c.vignetteFadeMs);
+        c.vignetteStrength = std::clamp(rd("Comfort", "fVignetteStrength", dflt.vignetteStrength), 0.0f, 1.0f);
+        c.vignetteFadeMs = rd("Comfort", "fVignetteFadeMs", dflt.vignetteFadeMs);
         c.leftHanded = rd("Controllers", "bLeftHanded", 0.0f) != 0.0f;
-        g_installed = true;
-        const auto s = CfgString();
-        REX::INFO("comfort: {}", s);
-        return s;
+    }
     }
 
     void FilterPad(PadFrame& a_f)
@@ -179,11 +206,23 @@ namespace fo4flatvr::comfort
         if (auto* iem = RE::BSInputEnableManager::GetSingleton()) {
             inputFlags = *reinterpret_cast<const std::uint32_t*>(reinterpret_cast<const std::uint8_t*>(iem) + 0x118);  // as Roomscale
         }
-        if (a_f.worldView) {
+        // 20 Nov (camera agent, [Camera] bSameInputAllViews): every head-tracked view takes the same comfort handling.
+        // Turning is ours where the view's yaw is the owned heading (first person, iron sights, the body camera); in a SCENE
+        // view the yaw is the game camera's, so the game keeps turning it. The stick direction is rotated from the frame the
+        // game moves the player in (first person: the body heading; any other state: the game camera's own yaw, which third
+        // person moves along) to the head-tracked view. The free camera is the one exception: its stick flying already follows
+        // the view (camdir HkFreeCamMove), so it gets no extra rotation.
+        const bool bodyView = camdir::BodyView(camState);
+        const bool fpFrame = camState == 0 || camState == 4;
+        if (a_f.worldView && camState != 3) {
             haveCam = CameraYaw(camYaw);
             if (auto* player = RE::PlayerCharacter::GetSingleton()) {
                 heading = player->data.angle.z;
                 havePlayer = true;
+            }
+            if (!fpFrame && camdir::SameInputAllViews()) {
+                float gy = 0.0f;
+                if (camdir::GameCameraYaw(gy)) heading = gy;
             }
         }
         std::scoped_lock l(g_lock);
@@ -205,7 +244,20 @@ namespace fo4flatvr::comfort
         // ---- turning: rs::UserTurn (consumed by the next primary ModifyMovementData as angleDelta.z) ----
         // Owned only in the first-person / iron-sights world view with looking enabled (bit 1 of the input-enable
         // flags) while the movement update runs; elsewhere (furniture, VATS, menus, cinema) the stick goes to the game.
-        s.owns = c.turnMode != kGame && a_f.worldView && live && (camState == 0 || camState == 4) && (inputFlags & 2) != 0;
+        const bool ownsBefore = s.owns;
+        s.owns = c.turnMode != kGame && a_f.worldView && live && (camState == 0 || camState == 4 || bodyView) && (inputFlags & 2) != 0;
+        if (s.owns != ownsBefore && s.ownLogs < 400) {
+            // 20 Nov (user: "Turning controls can get stuck after using vats, requiring a wiggle"): every change of the
+            // turning owner with its reason, so a stuck turn in a headset session shows which gate held it
+            ++s.ownLogs;
+            const char* why = c.turnMode == kGame                                ? "turn mode game"
+                              : !a_f.worldView                                   ? "no head-tracked world view (menu / panel / VATS overlay / Pip-Boy)"
+                              : !live                                            ? "player movement update not running"
+                              : !(camState == 0 || camState == 4 || bodyView)    ? "camera state"
+                              : (inputFlags & 2) == 0                            ? "looking disabled by the game"
+                                                                                 : "head-tracked view, looking enabled";
+            REX::INFO("comfort: turning {} ({}) camState={} inputFlags={:X} stick x={:.2f}", s.owns ? "ours" : "not ours", why, camState, inputFlags, a_f.rx);
+        }
         const float x = a_f.rx;
         float       turnDeg = 0.0f;
         if (s.owns) {

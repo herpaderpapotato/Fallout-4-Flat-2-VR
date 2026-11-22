@@ -49,5 +49,11 @@ namespace fo4flatvr::game
     // at most once a second queues a UI task that checks HUDFramework's widget container maps to the HUD stage, corrects it
     // if not, and logs the widget layout on change ("hudfw:"). No-op without HUDFramework. Status: pipe "hud fw".
     void        HudFrameworkTick();
+    // FO4VR HUD split (HudLayer.h SplitConfig): twice a second (from hud::OnPresent) the HUD clips' screen rectangles are read on
+    // the UI thread and handed to hud::SetPieceRect. No-op while no piece is enabled.
+    void        HudSplitTick();
     std::string HudFrameworkStatus();
+    // 20 Nov (live settings): [HUD] bHudFrameworkFix and the split clip lists (sHandHudLeftClips / sHandHudRightClips /
+    // sCompassClips) are read again at their next check
+    void ReloadHudSettings();
 }

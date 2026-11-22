@@ -4,143 +4,331 @@
   "minMcmVersion": 2,
   "content": [
     {
-      "text": "fo4flatvr: flat Fallout 4 in VR. Gesture and selfie settings apply immediately (re-read within a second).",
+      "text": "fo4flatvr: flat Fallout 4 in VR. Live settings apply within a second; the others after a restart. The same settings are in the VR panel: hold the left menu button for 1 s, Ctrl+F2, or the right stick Up-then-down gesture.",
       "type": "text"
     }
   ],
   "pages": [
     {
-      "pageDisplayName": "Gestures",
+      "pageDisplayName": "Camera",
       "content": [
         {
-          "text": "VRIK-style gestures: hold a stick click, move the hand, release. Directions follow where your head faced when you clicked. A press without movement is 'Press'; out and back again is a two-way gesture. The right stick click no longer opens the favourites menu.",
+          "text": "These values are also in the VR settings panel (hold the left menu button, or the gesture). MCM shows its own default until a value is changed here or in the panel; the panel shows the value in effect (fo4flatvr.ini, then these MCM changes).",
           "type": "text"
         },
         {
-          "text": "Gestures",
+          "text": "Fades",
           "type": "section"
         },
         {
-          "id": "bEnabled:Gestures",
-          "text": "Gestures",
-          "type": "switcher",
-          "help": "Master switch. Off: no gesture runs and the sticks behave as without gestures.",
+          "id": "fFadeMs:Camera",
+          "text": "Fade length (ms)",
+          "type": "slider",
+          "help": "Every camera fade to black.",
           "valueOptions": {
-            "sourceType": "ModSettingBool"
+            "min": 0,
+            "max": 1000,
+            "step": 10,
+            "sourceType": "ModSettingFloat"
           }
         },
         {
-          "id": "bRightHand:Gestures",
-          "text": "Right stick gestures",
-          "type": "switcher",
-          "help": "Gestures with the right stick click.",
+          "id": "fFadeTimeoutS:Camera",
+          "text": "Longest black hold (s)",
+          "type": "slider",
+          "help": "",
           "valueOptions": {
-            "sourceType": "ModSettingBool"
+            "min": 0,
+            "max": 10,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
           }
         },
         {
-          "id": "bLeftHand:Gestures",
-          "text": "Left stick gestures",
-          "type": "switcher",
-          "help": "Gestures with the left stick click. The left click is also sprint: with this on, sprint starts once the click is held still for the button delay (as VRIK's button delay).",
+          "id": "fJumpFadeUnits:Camera",
+          "text": "Jump blink (units)",
+          "type": "slider",
+          "help": "A game camera jump larger than this per update blinks (0 = off).",
           "valueOptions": {
-            "sourceType": "ModSettingBool"
+            "min": 0,
+            "max": 300,
+            "step": 5,
+            "sourceType": "ModSettingFloat"
           }
         },
         {
-          "text": "Detection",
+          "text": "Third person",
           "type": "section"
         },
         {
-          "id": "fMoveCm:Gestures",
-          "text": "Movement threshold (cm)",
-          "type": "slider",
-          "help": "How far the hand must move for a direction (VRIK: about 11 cm).",
+          "id": "bThirdPersonReturn:Camera",
+          "text": "Return to first person",
+          "type": "switcher",
+          "help": "A script's third person (AAF, Force3rdPerson) goes back to first person once you are in control again.",
           "valueOptions": {
-            "min": 5.0,
-            "max": 30.0,
-            "step": 0.5,
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "fThirdPersonReturnS:Camera",
+          "text": "Return after (s)",
+          "type": "slider",
+          "help": "",
+          "valueOptions": {
+            "min": 0,
+            "max": 10,
+            "step": 0.25,
             "sourceType": "ModSettingFloat"
           }
         },
         {
-          "id": "fDominance:Gestures",
-          "text": "Direction clarity",
-          "type": "slider",
-          "help": "The main direction must be this many times larger than any other, else the gesture is ignored (1 = VRIK, no check).",
+          "id": "bPovHeadHide:Camera",
+          "text": "Hide the head the view sits in",
+          "type": "switcher",
+          "help": "Free-camera scene view (AAF POV): the head at the camera is hidden; with Camera stays on the body, your own head.",
           "valueOptions": {
-            "min": 1.0,
-            "max": 3.0,
-            "step": 0.1,
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bFreeCamScene:Camera",
+          "text": "Free camera = scene view",
+          "type": "switcher",
+          "help": "The free camera (AAF scenes, tfc) is head-tracked like a scene (0 = sPolicyFree). Live: the free-camera hook stays installed and switches.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "text": "Camera locks (compare)",
+          "type": "section"
+        },
+        {
+          "id": "bLockFirstPerson:Camera",
+          "text": "Always first person",
+          "type": "switcher",
+          "help": "Refuse every game request to leave first person (third person, free camera, furniture, animated, bleedout, mount, dialogue camera, kill cams); VATS excepted.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bBodyCamera:Camera",
+          "text": "Camera stays on the body",
+          "type": "switcher",
+          "help": "Every camera state (VATS excepted) is seen from your first-person eye on the player body.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bBodyCameraFollowsAnimation:Camera",
+          "text": "Body camera follows the animation",
+          "type": "switcher",
+          "help": "With Camera stays on the body: in scenes, furniture and paired animations the eye rides your animated head instead of the spot your body stood on (0 = always the capsule position). Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "fBodyCameraEyeForward:Camera",
+          "text": "Body camera eye in front of the head",
+          "type": "slider",
+          "help": "Units from the animated Head bone to the eye, along the face. Live.",
+          "valueOptions": {
+            "min": 0,
+            "max": 20,
+            "step": 1,
             "sourceType": "ModSettingFloat"
           }
         },
         {
-          "id": "fMaxHoldS:Gestures",
-          "text": "Longest press (s)",
-          "type": "slider",
-          "help": "A press held longer than this is not a gesture.",
+          "id": "bBodyCameraYieldsToPov:Camera",
+          "text": "Body camera yields to AAF POV",
+          "type": "switcher",
+          "help": "With Camera stays on the body: AAF's POV on another actor's head is shown from that head (0 = always your own head). Live.",
           "valueOptions": {
-            "min": 0.5,
-            "max": 5.0,
-            "step": 0.1,
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bCameraHudNotify:Camera",
+          "text": "HUD message on camera changes",
+          "type": "switcher",
+          "help": "Camera state and view mode changes, and refused requests.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bSameInputAllViews:Camera",
+          "text": "Same controls in every view",
+          "type": "switcher",
+          "help": "Gameplay bindings and comfort in every camera view while no menu is open (0 = menu layout outside first person).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "text": "AAF and defeat scenes",
+          "type": "section"
+        },
+        {
+          "id": "bLockAllowScenes:Camera",
+          "text": "Scenes pass the camera locks",
+          "type": "switcher",
+          "help": "With Always first person on, AAF scenes and defeat flows (bleedout, then the script's third person) keep their cameras; the lock comes back 2 s after the scene.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "fDefeatWindowS:Camera",
+          "text": "Defeat window after a bleedout (s)",
+          "type": "slider",
+          "help": "A script's third person this long after your bleedout counts as the defeat scene.",
+          "valueOptions": {
+            "min": 0,
+            "max": 120,
+            "step": 5,
             "sourceType": "ModSettingFloat"
           }
         },
         {
-          "id": "fCooldownS:Gestures",
-          "text": "Cooldown (s)",
+          "id": "bOrbitStatesScene:Camera",
+          "text": "Orbit cameras: TRACK = SCENE",
+          "type": "switcher",
+          "help": "TRACK on third person, bleedout, mount, idle orbit or the dialogue camera is shown as SCENE (TRACK made the view and the movement follow the head there).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bFreeCamOwnStickYaw:Camera",
+          "text": "Free camera keeps the stick turn",
+          "type": "switcher",
+          "help": "The stick's turn in the free camera / AAF POV stays for the whole scene (AAF's POV auto mode no longer pulls it back).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bFreeCamStatePosition:Camera",
+          "text": "Free camera: this frame's position",
+          "type": "switcher",
+          "help": "The free camera's position is read after AAF writes it (POV head, glides), not the previous frame's. Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bSceneAftercare:Camera",
+          "text": "Pip-Boy after scenes",
+          "type": "switcher",
+          "help": "A refused Pip-Boy press shows why; what a finished scene left behind (AI control, input layers) is released.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "text": "13 more settings of this page (camera views, keyboard keys) are only in the VR panel.",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "pageDisplayName": "Comfort",
+      "content": [
+        {
+          "text": "These values are also in the VR settings panel (hold the left menu button, or the gesture). MCM shows its own default until a value is changed here or in the panel; the panel shows the value in effect (fo4flatvr.ini, then these MCM changes).",
+          "type": "text"
+        },
+        {
+          "text": "Turning",
+          "type": "section"
+        },
+        {
+          "id": "iTurnMode:Comfort",
+          "text": "Turning",
+          "type": "dropdown",
+          "help": "Right stick turning.",
+          "valueOptions": {
+            "sourceType": "ModSettingInt",
+            "options": [
+              "Smooth",
+              "Snap",
+              "Game (camera look)"
+            ]
+          }
+        },
+        {
+          "id": "fSnapTurnDeg:Comfort",
+          "text": "Snap angle (deg)",
           "type": "slider",
-          "help": "After a gesture fires, new presses are ignored for this long.",
+          "help": "",
+          "valueOptions": {
+            "min": 10,
+            "max": 90,
+            "step": 5,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fSmoothTurnDegPerSec:Comfort",
+          "text": "Smooth turn speed (deg/s)",
+          "type": "slider",
+          "help": "",
+          "valueOptions": {
+            "min": 30,
+            "max": 360,
+            "step": 10,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fTurnDeadzone:Comfort",
+          "text": "Turn dead zone",
+          "type": "slider",
+          "help": "",
           "valueOptions": {
             "min": 0.0,
-            "max": 2.0,
+            "max": 0.5,
             "step": 0.05,
             "sourceType": "ModSettingFloat"
           }
         },
         {
-          "id": "fButtonDelayS:Gestures",
-          "text": "Button delay (s)",
-          "type": "slider",
-          "help": "Left stick gestures only: holding the click still this long passes it to the game (sprint).",
-          "valueOptions": {
-            "min": 0.2,
-            "max": 2.0,
-            "step": 0.05,
-            "sourceType": "ModSettingFloat"
-          }
-        },
-        {
-          "id": "fKeyHoldMs:Gestures",
-          "text": "Key press length (ms)",
-          "type": "slider",
-          "help": "How long an emulated key is held down.",
-          "valueOptions": {
-            "min": 30.0,
-            "max": 500.0,
-            "step": 10.0,
-            "sourceType": "ModSettingFloat"
-          }
-        },
-        {
-          "text": "Haptics",
+          "text": "Moving",
           "type": "section"
         },
         {
-          "id": "bHaptics:Gestures",
-          "text": "Haptic pulse",
+          "id": "iMoveDirection:Comfort",
+          "text": "Move direction",
+          "type": "dropdown",
+          "help": "Left stick forward follows ...",
+          "valueOptions": {
+            "sourceType": "ModSettingInt",
+            "options": [
+              "Head",
+              "Off hand",
+              "Body"
+            ]
+          }
+        },
+        {
+          "id": "bVignette:Comfort",
+          "text": "Comfort vignette",
           "type": "switcher",
-          "help": "A pulse on the gesture hand when a gesture fires (and on selfie on/off).",
+          "help": "Dark edges while moving or turning with the stick.",
           "valueOptions": {
             "sourceType": "ModSettingBool"
           }
         },
         {
-          "id": "fHapticAmp:Gestures",
-          "text": "Pulse strength",
+          "id": "fVignetteStrength:Comfort",
+          "text": "Vignette strength",
           "type": "slider",
-          "help": "0..1",
+          "help": "",
           "valueOptions": {
             "min": 0.0,
             "max": 1.0,
@@ -149,35 +337,1827 @@
           }
         },
         {
-          "id": "fHapticS:Gestures",
-          "text": "Pulse length (s)",
+          "id": "fVignetteFadeMs:Comfort",
+          "text": "Vignette fade (ms)",
           "type": "slider",
           "help": "",
           "valueOptions": {
-            "min": 0.01,
+            "min": 0,
+            "max": 500,
+            "step": 10,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "text": "Effects",
+          "type": "section"
+        },
+        {
+          "id": "bNoCameraShake:Comfort",
+          "text": "No camera shake",
+          "type": "switcher",
+          "help": "Explosions, power armour steps, scripts.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bNoRadialBlur:Comfort",
+          "text": "No radial blur",
+          "type": "switcher",
+          "help": "",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bNoDoubleVision:Comfort",
+          "text": "No double vision",
+          "type": "switcher",
+          "help": "",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bNoImodBlur:Comfort",
+          "text": "No full-screen blur",
+          "type": "switcher",
+          "help": "",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bNoDepthOfField:Comfort",
+          "text": "No depth of field",
+          "type": "switcher",
+          "help": "Also the world's permanent depth of field.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        }
+      ]
+    },
+    {
+      "pageDisplayName": "Render",
+      "content": [
+        {
+          "text": "These values are also in the VR settings panel (hold the left menu button, or the gesture). MCM shows its own default until a value is changed here or in the panel; the panel shows the value in effect (fo4flatvr.ini, then these MCM changes).",
+          "type": "text"
+        },
+        {
+          "text": "HUD (FO4VR placement)",
+          "type": "section"
+        },
+        {
+          "id": "bHandHud:HUD",
+          "text": "Meters on the hand",
+          "type": "switcher",
+          "help": "Health, rads, AP, ammo, effects on a panel beside the aim hand, like FO4VR's wand HUD.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "fHandHudWidthM:HUD",
+          "text": "Hand panel width (m)",
+          "type": "slider",
+          "help": "",
+          "valueOptions": {
+            "min": 0.05,
+            "max": 0.4,
+            "step": 0.01,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fHandHudX:HUD",
+          "text": "Hand panel X (m)",
+          "type": "slider",
+          "help": "Sideways from the controller (mirrored for the left hand).",
+          "valueOptions": {
+            "min": -0.3,
             "max": 0.3,
             "step": 0.01,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fHandHudY:HUD",
+          "text": "Hand panel Y (m)",
+          "type": "slider",
+          "help": "Up from the controller.",
+          "valueOptions": {
+            "min": -0.3,
+            "max": 0.3,
+            "step": 0.01,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fHandHudZ:HUD",
+          "text": "Hand panel Z (m)",
+          "type": "slider",
+          "help": "Back toward you from the controller.",
+          "valueOptions": {
+            "min": -0.3,
+            "max": 0.3,
+            "step": 0.01,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fHandHudPitchDeg:HUD",
+          "text": "Hand panel tilt (deg)",
+          "type": "slider",
+          "help": "+ = top toward you.",
+          "valueOptions": {
+            "min": -90,
+            "max": 90,
+            "step": 5,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "bCompassChin:HUD",
+          "text": "Compass under the chin",
+          "type": "switcher",
+          "help": "FO4VR's compass panel: follows your heading, look down to read it. Off = on the head-locked HUD.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "fCompassDistanceM:HUD",
+          "text": "Compass distance (m)",
+          "type": "slider",
+          "help": "",
+          "valueOptions": {
+            "min": 0.1,
+            "max": 1.5,
+            "step": 0.02,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fCompassHeightM:HUD",
+          "text": "Compass height (m)",
+          "type": "slider",
+          "help": "Below the eyes (negative).",
+          "valueOptions": {
+            "min": -1.0,
+            "max": 0.2,
+            "step": 0.02,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fCompassWidthM:HUD",
+          "text": "Compass width (m)",
+          "type": "slider",
+          "help": "",
+          "valueOptions": {
+            "min": 0.1,
+            "max": 1.5,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "iCompassShow:HUD",
+          "text": "Show compass",
+          "type": "dropdown",
+          "help": "Slides in and out like VRIK's compass.",
+          "valueOptions": {
+            "sourceType": "ModSettingInt",
+            "options": [
+              "Always",
+              "Never",
+              "Hand raised (not high)",
+              "Palm up (VRIK)"
+            ]
+          }
+        },
+        {
+          "id": "iCompassHand:HUD",
+          "text": "Compass hand",
+          "type": "dropdown",
+          "help": "",
+          "valueOptions": {
+            "sourceType": "ModSettingInt",
+            "options": [
+              "Either",
+              "Left",
+              "Right"
+            ]
+          }
+        },
+        {
+          "id": "fCompassRaiseLowM:HUD",
+          "text": "Raise: lowest (m below eyes)",
+          "type": "slider",
+          "help": "",
+          "valueOptions": {
+            "min": 0.1,
+            "max": 1.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fCompassRaiseHighM:HUD",
+          "text": "Raise: highest (m below eyes)",
+          "type": "slider",
+          "help": "Higher than this hides it again.",
+          "valueOptions": {
+            "min": -0.5,
+            "max": 0.5,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fCompassPalmUpDot:HUD",
+          "text": "Palm-up threshold",
+          "type": "slider",
+          "help": "VRIK: 0.65.",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fCompassSlideM:HUD",
+          "text": "Compass slide (m)",
+          "type": "slider",
+          "help": "VRIK: 50 units.",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fCompassSlideRate:HUD",
+          "text": "Compass slide rate",
+          "type": "slider",
+          "help": "VRIK: 10 (about 0.4 s).",
+          "valueOptions": {
+            "min": 1.0,
+            "max": 40.0,
+            "step": 1.0,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "text": "Menus",
+          "type": "section"
+        },
+        {
+          "id": "bPanelModMenus:Menus",
+          "text": "Mod menus on the panel",
+          "type": "switcher",
+          "help": "Mod menus that take input (Silhouette, Screen Archer Menu, F4SE menus) on the menu panel with the pointer.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "text": "Resolution",
+          "type": "section"
+        },
+        {
+          "id": "iWidth:Render",
+          "text": "Render width (both eyes)",
+          "type": "slider",
+          "help": "The game's render width; with stereo each eye gets half. Restart: the game sizes its whole render-target set (about 100 targets, the post chains, the stereo seam guard) from the swapchain once, when its renderer starts; flat Fallout 4 has no in-game resolution change.",
+          "valueOptions": {
+            "min": 1024,
+            "max": 8192,
+            "step": 64,
+            "sourceType": "ModSettingInt"
+          }
+        },
+        {
+          "id": "iHeight:Render",
+          "text": "Render height",
+          "type": "slider",
+          "help": "Restart: the game sizes its whole render-target set (about 100 targets, the post chains, the stereo seam guard) from the swapchain once, when its renderer starts; flat Fallout 4 has no in-game resolution change.",
+          "valueOptions": {
+            "min": 512,
+            "max": 4320,
+            "step": 32,
+            "sourceType": "ModSettingInt"
+          }
+        },
+        {
+          "id": "fRenderScale:Render",
+          "text": "Render scale",
+          "type": "slider",
+          "help": "Multiplies the size above (like FO4VR's fRenderTargetSizeMultiplier). Restart: the game sizes its whole render-target set (about 100 targets, the post chains, the stereo seam guard) from the swapchain once, when its renderer starts; flat Fallout 4 has no in-game resolution change.",
+          "valueOptions": {
+            "min": 0.5,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "text": "Desktop window",
+          "type": "section"
+        },
+        {
+          "id": "iWidth:Window",
+          "text": "Window width",
+          "type": "slider",
+          "help": "The desktop mirror window; the render size is not affected.",
+          "valueOptions": {
+            "min": 640,
+            "max": 3840,
+            "step": 64,
+            "sourceType": "ModSettingInt"
+          }
+        },
+        {
+          "id": "iHeight:Window",
+          "text": "Window height",
+          "type": "slider",
+          "help": "",
+          "valueOptions": {
+            "min": 360,
+            "max": 2160,
+            "step": 36,
+            "sourceType": "ModSettingInt"
+          }
+        },
+        {
+          "text": "Stereo",
+          "type": "section"
+        },
+        {
+          "id": "iMode:Stereo",
+          "text": "Stereo mode",
+          "type": "dropdown",
+          "help": "Single-pass stereo. Switches live (the render size stays the one chosen at start; with bInstallHooks=0 and a mono start it needs a restart).",
+          "valueOptions": {
+            "sourceType": "ModSettingInt",
+            "options": [
+              "0 Off (mono)",
+              "1 Census (diagnostic)",
+              "2 Debug (diagnostic)",
+              "3 Stereo",
+              "4 Identity (diagnostic)"
+            ]
+          }
+        },
+        {
+          "id": "bHiddenAreaMask:Stereo",
+          "text": "Hidden-area mask",
+          "type": "switcher",
+          "help": "Skips shading the pixels the headset lenses never show (the runtime's visibility mask, stamped into depth before the world draws), as FO4VR does. Nothing changes where you can see. Needs the runtime to offer it (logged).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "text": "Stereo cuts (only while stereo)",
+          "type": "section"
+        },
+        {
+          "id": "bCutTaa:Stereo",
+          "text": "Cut TAA (FXAA instead)",
+          "type": "switcher",
+          "help": "Applies at the next frame (the engine reads these switches every frame).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bCutMotionBlur:Stereo",
+          "text": "Cut motion blur",
+          "type": "switcher",
+          "help": "Applies at the next frame (the engine reads these switches every frame).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bCutDof:Stereo",
+          "text": "Cut depth of field",
+          "type": "switcher",
+          "help": "Applies at the next frame (the engine reads these switches every frame).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bCutLensFlare:Stereo",
+          "text": "Cut lens flare",
+          "type": "switcher",
+          "help": "Applies at the next frame (the engine reads these switches every frame).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bCutGodrays:Stereo",
+          "text": "Cut god rays",
+          "type": "switcher",
+          "help": "Applies at the next frame (the engine reads these switches every frame).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bCutSsr:Stereo",
+          "text": "Cut screen-space reflections",
+          "type": "switcher",
+          "help": "Applies at the next frame (the engine reads these switches every frame).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bCutHbao:Stereo",
+          "text": "Cut HBAO",
+          "type": "switcher",
+          "help": "Applies at the next frame (the engine reads these switches every frame).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bCutSao:Stereo",
+          "text": "Cut SAO",
+          "type": "switcher",
+          "help": "Applies at the next frame (the engine reads these switches every frame).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bCutTiledLighting:Stereo",
+          "text": "Cut tiled lighting",
+          "type": "switcher",
+          "help": "Applies at the next frame (the engine reads these switches every frame).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "text": "Threading",
+          "type": "section"
+        },
+        {
+          "id": "bMainThreadQueue:General",
+          "text": "Game work on the main thread",
+          "type": "switcher",
+          "help": "Our game / menu / scene changes run on the game's main thread between frames (where console commands run). 0 = F4SE's task queue (any thread) and polls at Present, as before 20 Nov.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bGpuQueueLimit:General",
+          "text": "Limit the GPU frame queue",
+          "type": "switcher",
+          "help": "When the GPU is the bottleneck, wait for it before the next head pose is predicted, so frames are not drawn with a pose meant for an earlier display time (laggy / unstable head under GPU load). No wait when the GPU keeps up.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "iGpuQueueFrames:General",
+          "text": "GPU frames queued at most",
+          "type": "slider",
+          "help": "Frames still unfinished on the GPU when the next head pose is predicted. 1 = default; 0 = lowest latency, lower frame rate when GPU-bound; 2 = more frame rate headroom, more latency.",
+          "valueOptions": {
+            "min": 0,
+            "max": 2,
+            "step": 1,
+            "sourceType": "ModSettingInt"
+          }
+        },
+        {
+          "text": "DLSS",
+          "type": "section"
+        },
+        {
+          "id": "bEnabled:DLSS",
+          "text": "DLSS (per-eye DLAA)",
+          "type": "switcher",
+          "help": "NVIDIA DLSS at native resolution per eye, in place of the game's TAA (the TAA cut is lifted while it runs). 0 = the game's TAA / bCutTaa as before.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bPerEye:DLSS",
+          "text": "One DLSS instance per eye",
+          "type": "switcher",
+          "help": "0 = one shared instance over both eyes (test: one history over the double-wide image).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "iPreset:DLSS",
+          "text": "DLSS preset",
+          "type": "dropdown",
+          "help": "Render preset hint. K (default): NVIDIA's DLAA preset, measured 1.6 ms for both eyes and the steadiest. L is what the DLSS 5 Feed sends (it found fewer NR speckles on bright text with L / M) but costs about 7.4 ms here.",
+          "valueOptions": {
+            "sourceType": "ModSettingInt",
+            "options": [
+              "Feed default (L)",
+              "Driver default",
+              "E",
+              "F",
+              "J",
+              "K",
+              "L",
+              "M"
+            ]
+          }
+        },
+        {
+          "id": "iQuality:DLSS",
+          "text": "Quality mode",
+          "type": "dropdown",
+          "help": "Sent at creation (DLSS accepts every mode at the eye size; measured 20 Nov). The input stays at the eye size: rendering below it is not part of this build. A mode DLSS refuses falls back to DLAA (logged).",
+          "valueOptions": {
+            "sourceType": "ModSettingInt",
+            "options": [
+              "DLAA",
+              "Ultra quality",
+              "Quality",
+              "Balanced",
+              "Performance",
+              "Ultra performance"
+            ]
+          }
+        },
+        {
+          "id": "fSharpness:DLSS",
+          "text": "Sharpness",
+          "type": "slider",
+          "help": "NGX sharpness (the Feed's work_sharpness); current DLSS presets ignore it.",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "bJitter:DLSS",
+          "text": "Sub-pixel jitter",
+          "type": "switcher",
+          "help": "The game's TAA camera jitter stays on so DLSS gets sub-pixel detail. 0 = no jitter (TAA stays active for DLSS).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bGpuTimers:DLSS",
+          "text": "GPU timers",
+          "type": "switcher",
+          "help": "GPU cost line in the log every 600 frames (DLSS, NR, D3D12 NR per eye).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "text": "DLSS: advanced",
+          "type": "section"
+        },
+        {
+          "id": "iJitterFlipX:DLSS",
+          "text": "Jitter sign X",
+          "type": "dropdown",
+          "help": "The Feed's jitter_sign, per axis.",
+          "valueOptions": {
+            "sourceType": "ModSettingInt",
+            "options": [
+              "Normal",
+              "Flipped"
+            ]
+          }
+        },
+        {
+          "id": "iJitterFlipY:DLSS",
+          "text": "Jitter sign Y",
+          "type": "dropdown",
+          "help": "",
+          "valueOptions": {
+            "sourceType": "ModSettingInt",
+            "options": [
+              "Normal",
+              "Flipped"
+            ]
+          }
+        },
+        {
+          "id": "fMvScaleX:DLSS",
+          "text": "Motion vector scale X",
+          "type": "slider",
+          "help": "The Feed's mv_scale_x (multiplier).",
+          "valueOptions": {
+            "min": -2.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fMvScaleY:DLSS",
+          "text": "Motion vector scale Y",
+          "type": "slider",
+          "help": "The Feed's mv_scale_y (multiplier).",
+          "valueOptions": {
+            "min": -2.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "iDepthInverted:DLSS",
+          "text": "Depth inverted",
+          "type": "dropdown",
+          "help": "The Feed's depth_inverted (the game's depth is not inverted).",
+          "valueOptions": {
+            "sourceType": "ModSettingInt",
+            "options": [
+              "Auto (not inverted)",
+              "Not inverted",
+              "Inverted"
+            ]
+          }
+        },
+        {
+          "id": "bAutoExposure:DLSS",
+          "text": "Auto exposure",
+          "type": "switcher",
+          "help": "NGX auto exposure flag.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "iCreateFlags:DLSS",
+          "text": "Create flags override",
+          "type": "slider",
+          "help": "The Feed's flags: raw NGX create flags, -1 = ours.",
+          "valueOptions": {
+            "min": -1,
+            "max": 255,
+            "step": 1,
+            "sourceType": "ModSettingInt"
+          }
+        },
+        {
+          "id": "bBiasMask:DLSS",
+          "text": "TAA mask as bias mask",
+          "type": "switcher",
+          "help": "Pass the game's TAA mask (RT 0x1E) as DLSS's bias-current-colour mask.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bCopyHistory:DLSS",
+          "text": "Write the TAA history too",
+          "type": "switcher",
+          "help": "Also copy the result into the game's TAA history target, so turning DLSS off resumes without a stale frame.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "iResetEvery:DLSS",
+          "text": "Reset every N frames",
+          "type": "slider",
+          "help": "The Feed's reset_every (0 = never).",
+          "valueOptions": {
+            "min": 0,
+            "max": 600,
+            "step": 1,
+            "sourceType": "ModSettingInt"
+          }
+        },
+        {
+          "id": "iCreateDelay:DLSS",
+          "text": "Create after N frames",
+          "type": "slider",
+          "help": "The Feed's create_delay.",
+          "valueOptions": {
+            "min": 0,
+            "max": 600,
+            "step": 1,
+            "sourceType": "ModSettingInt"
+          }
+        },
+        {
+          "id": "iWarmupRebuild:DLSS",
+          "text": "Rebuild once after N frames",
+          "type": "slider",
+          "help": "The Feed's warmup_rebuild (0 = off).",
+          "valueOptions": {
+            "min": 0,
+            "max": 1000,
+            "step": 10,
+            "sourceType": "ModSettingInt"
+          }
+        },
+        {
+          "id": "iLogFrames:DLSS",
+          "text": "Log the first N evaluates",
+          "type": "slider",
+          "help": "The Feed's log_frames.",
+          "valueOptions": {
+            "min": 0,
+            "max": 60,
+            "step": 1,
+            "sourceType": "ModSettingInt"
+          }
+        },
+        {
+          "text": "Neural rendering",
+          "type": "section"
+        },
+        {
+          "id": "bEnabled:NeuralRendering",
+          "text": "Neural rendering (DLSS 5)",
+          "type": "switcher",
+          "help": "NVIDIA's neural rendering model per eye (RTX 50). Runs after DLSS (or on the game's TAA when DLSS is off).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bPerEye:NeuralRendering",
+          "text": "One NR instance per eye",
+          "type": "switcher",
+          "help": "0 = one shared instance over both eyes side by side (test for eye-to-eye consistency).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "fIntensity:NeuralRendering",
+          "text": "Intensity",
+          "type": "slider",
+          "help": "The model's intensity (NRIntensity).",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fColorStrength:NeuralRendering",
+          "text": "Colour strength",
+          "type": "slider",
+          "help": "1 = NR's colour and brightness, 0 = its brightness change only (NRColorStrength).",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fTransferStrength:NeuralRendering",
+          "text": "Transfer strength",
+          "type": "slider",
+          "help": "Fades NR's result toward the input (NRTransferStrength; 1 = all of it).",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fResolutionScale:NeuralRendering",
+          "text": "NR resolution",
+          "type": "slider",
+          "help": "Working size per eye (NRResolutionScale); the model's edit is carried back to full resolution.",
+          "valueOptions": {
+            "min": 0.33,
+            "max": 1.0,
+            "step": 0.01,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "bFollowInputRes:NeuralRendering",
+          "text": "NR at the render resolution",
+          "type": "switcher",
+          "help": "NRFollowInputRes: the eye size (= scale 1 here).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "iHookPoint:NeuralRendering",
+          "text": "Where NR runs",
+          "type": "dropdown",
+          "help": "After DLSS (RenoDX's default) or on the game's raw (jittered) colour before DLSS (NRHookPoint).",
+          "valueOptions": {
+            "sourceType": "ModSettingInt",
+            "options": [
+              "After DLSS",
+              "Before DLSS"
+            ]
+          }
+        },
+        {
+          "id": "iSdrBlackRestore:NeuralRendering",
+          "text": "Black level restore",
+          "type": "dropdown",
+          "help": "Gives back NR's lift in near-black 32x32 blocks (NRSdrBlackRestore).",
+          "valueOptions": {
+            "sourceType": "ModSettingInt",
+            "options": [
+              "Off",
+              "Auto (dark blocks)",
+              "Every block",
+              "Smooth (dark blocks, tapered)"
+            ]
+          }
+        },
+        {
+          "id": "iDetailStability:NeuralRendering",
+          "text": "Detail stability",
+          "type": "dropdown",
+          "help": "NRDetailStability: NR's edit is filtered over time (reprojected with the motion vectors, clipped to its neighbourhood). Auto = on after DLSS.",
+          "valueOptions": {
+            "sourceType": "ModSettingInt",
+            "options": [
+              "Auto",
+              "Off",
+              "Always"
+            ]
+          }
+        },
+        {
+          "id": "fDetailStabilityAlpha:NeuralRendering",
+          "text": "Detail stability weight",
+          "type": "slider",
+          "help": "Share of the new frame's edit (RenoDX: 0.15; 1 = no filtering).",
+          "valueOptions": {
+            "min": 0.02,
+            "max": 1.0,
+            "step": 0.01,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "iDepthMode:NeuralRendering",
+          "text": "Depth",
+          "type": "dropdown",
+          "help": "NRDepthMode.",
+          "valueOptions": {
+            "sourceType": "ModSettingInt",
+            "options": [
+              "Auto (not inverted)",
+              "Normal",
+              "Inverted"
+            ]
+          }
+        },
+        {
+          "id": "fMvScaleX:NeuralRendering",
+          "text": "NR motion vector scale X",
+          "type": "slider",
+          "help": "NRMVecScaleX.",
+          "valueOptions": {
+            "min": -2.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fMvScaleY:NeuralRendering",
+          "text": "NR motion vector scale Y",
+          "type": "slider",
+          "help": "NRMVecScaleY.",
+          "valueOptions": {
+            "min": -2.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "text": "Neural rendering: model",
+          "type": "section"
+        },
+        {
+          "id": "iPreset:NeuralRendering",
+          "text": "NR preset",
+          "type": "dropdown",
+          "help": "The runtime's model presets (NRPreset).",
+          "valueOptions": {
+            "sourceType": "ModSettingInt",
+            "options": [
+              "Default",
+              "Preset #1",
+              "Preset #2",
+              "Preset #3"
+            ]
+          }
+        },
+        {
+          "id": "iStyle:NeuralRendering",
+          "text": "Style",
+          "type": "dropdown",
+          "help": "NRStyle.",
+          "valueOptions": {
+            "sourceType": "ModSettingInt",
+            "options": [
+              "Default",
+              "Natural",
+              "Cinematic"
+            ]
+          }
+        },
+        {
+          "id": "fLocalTone:NeuralRendering",
+          "text": "Local tone",
+          "type": "slider",
+          "help": "NRLocalTone.",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fLocalStructure:NeuralRendering",
+          "text": "Structure",
+          "type": "slider",
+          "help": "NRLocalStructure.",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fSkinStructure:NeuralRendering",
+          "text": "Character / skin",
+          "type": "slider",
+          "help": "NRSkinStructure: -1 = stock; read only with the character mask.",
+          "valueOptions": {
+            "min": -1.0,
+            "max": 1.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "bAutoMask:NeuralRendering",
+          "text": "Character mask",
+          "type": "switcher",
+          "help": "NRAutoMask.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bSkinIndependent:NeuralRendering",
+          "text": "Skin independent of structure",
+          "type": "switcher",
+          "help": "NRSkinIndependent.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bUiCorrection:NeuralRendering",
+          "text": "UI correction",
+          "type": "switcher",
+          "help": "NRUICorrection.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "text": "Neural rendering: passes 2-4",
+          "type": "section"
+        },
+        {
+          "id": "iPasses:NeuralRendering",
+          "text": "NR passes",
+          "type": "slider",
+          "help": "NRPasses: chained NR passes (each one more model evaluate per eye).",
+          "valueOptions": {
+            "min": 1,
+            "max": 4,
+            "step": 1,
+            "sourceType": "ModSettingInt"
+          }
+        },
+        {
+          "id": "bChainedHistory:NeuralRendering",
+          "text": "Passes 2-4 keep history",
+          "type": "switcher",
+          "help": "NRChainedHistory (0 = passes 2-4 reset every frame).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "Pass2bFollowPass1:NeuralRendering",
+          "text": "Pass 2: same as pass 1",
+          "type": "switcher",
+          "help": "Model steering (style, tone, structure, skin, mask, UI) from pass 1.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "Pass2fIntensity:NeuralRendering",
+          "text": "Pass 2: intensity",
+          "type": "slider",
+          "help": "NRPass2 (RenoDX).",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "Pass2fColorStrength:NeuralRendering",
+          "text": "Pass 2: colour strength",
+          "type": "slider",
+          "help": "NRPass2 (RenoDX).",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "Pass2fTransferStrength:NeuralRendering",
+          "text": "Pass 2: transfer strength",
+          "type": "slider",
+          "help": "NRPass2 (RenoDX).",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "Pass2iStyle:NeuralRendering",
+          "text": "Pass 2: style",
+          "type": "dropdown",
+          "help": "NRPass2 (RenoDX).",
+          "valueOptions": {
+            "sourceType": "ModSettingInt",
+            "options": [
+              "Default",
+              "Natural",
+              "Cinematic"
+            ]
+          }
+        },
+        {
+          "id": "Pass2fLocalTone:NeuralRendering",
+          "text": "Pass 2: local tone",
+          "type": "slider",
+          "help": "NRPass2 (RenoDX).",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "Pass2fLocalStructure:NeuralRendering",
+          "text": "Pass 2: structure",
+          "type": "slider",
+          "help": "NRPass2 (RenoDX).",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "Pass2fSkinStructure:NeuralRendering",
+          "text": "Pass 2: character / skin",
+          "type": "slider",
+          "help": "NRPass2 (RenoDX).",
+          "valueOptions": {
+            "min": -1.0,
+            "max": 1.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "Pass2bAutoMask:NeuralRendering",
+          "text": "Pass 2: character mask",
+          "type": "switcher",
+          "help": "NRPass2 (RenoDX).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "Pass2bUiCorrection:NeuralRendering",
+          "text": "Pass 2: UI correction",
+          "type": "switcher",
+          "help": "NRPass2 (RenoDX).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "Pass3bFollowPass1:NeuralRendering",
+          "text": "Pass 3: same as pass 1",
+          "type": "switcher",
+          "help": "Model steering (style, tone, structure, skin, mask, UI) from pass 1.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "Pass3fIntensity:NeuralRendering",
+          "text": "Pass 3: intensity",
+          "type": "slider",
+          "help": "NRPass3 (RenoDX).",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "Pass3fColorStrength:NeuralRendering",
+          "text": "Pass 3: colour strength",
+          "type": "slider",
+          "help": "NRPass3 (RenoDX).",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "Pass3fTransferStrength:NeuralRendering",
+          "text": "Pass 3: transfer strength",
+          "type": "slider",
+          "help": "NRPass3 (RenoDX).",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "Pass3iStyle:NeuralRendering",
+          "text": "Pass 3: style",
+          "type": "dropdown",
+          "help": "NRPass3 (RenoDX).",
+          "valueOptions": {
+            "sourceType": "ModSettingInt",
+            "options": [
+              "Default",
+              "Natural",
+              "Cinematic"
+            ]
+          }
+        },
+        {
+          "id": "Pass3fLocalTone:NeuralRendering",
+          "text": "Pass 3: local tone",
+          "type": "slider",
+          "help": "NRPass3 (RenoDX).",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "Pass3fLocalStructure:NeuralRendering",
+          "text": "Pass 3: structure",
+          "type": "slider",
+          "help": "NRPass3 (RenoDX).",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "Pass3fSkinStructure:NeuralRendering",
+          "text": "Pass 3: character / skin",
+          "type": "slider",
+          "help": "NRPass3 (RenoDX).",
+          "valueOptions": {
+            "min": -1.0,
+            "max": 1.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "Pass3bAutoMask:NeuralRendering",
+          "text": "Pass 3: character mask",
+          "type": "switcher",
+          "help": "NRPass3 (RenoDX).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "Pass3bUiCorrection:NeuralRendering",
+          "text": "Pass 3: UI correction",
+          "type": "switcher",
+          "help": "NRPass3 (RenoDX).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "Pass4bFollowPass1:NeuralRendering",
+          "text": "Pass 4: same as pass 1",
+          "type": "switcher",
+          "help": "Model steering (style, tone, structure, skin, mask, UI) from pass 1.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "Pass4fIntensity:NeuralRendering",
+          "text": "Pass 4: intensity",
+          "type": "slider",
+          "help": "NRPass4 (RenoDX).",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "Pass4fColorStrength:NeuralRendering",
+          "text": "Pass 4: colour strength",
+          "type": "slider",
+          "help": "NRPass4 (RenoDX).",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "Pass4fTransferStrength:NeuralRendering",
+          "text": "Pass 4: transfer strength",
+          "type": "slider",
+          "help": "NRPass4 (RenoDX).",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "Pass4iStyle:NeuralRendering",
+          "text": "Pass 4: style",
+          "type": "dropdown",
+          "help": "NRPass4 (RenoDX).",
+          "valueOptions": {
+            "sourceType": "ModSettingInt",
+            "options": [
+              "Default",
+              "Natural",
+              "Cinematic"
+            ]
+          }
+        },
+        {
+          "id": "Pass4fLocalTone:NeuralRendering",
+          "text": "Pass 4: local tone",
+          "type": "slider",
+          "help": "NRPass4 (RenoDX).",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "Pass4fLocalStructure:NeuralRendering",
+          "text": "Pass 4: structure",
+          "type": "slider",
+          "help": "NRPass4 (RenoDX).",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "Pass4fSkinStructure:NeuralRendering",
+          "text": "Pass 4: character / skin",
+          "type": "slider",
+          "help": "NRPass4 (RenoDX).",
+          "valueOptions": {
+            "min": -1.0,
+            "max": 1.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "Pass4bAutoMask:NeuralRendering",
+          "text": "Pass 4: character mask",
+          "type": "switcher",
+          "help": "NRPass4 (RenoDX).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "Pass4bUiCorrection:NeuralRendering",
+          "text": "Pass 4: UI correction",
+          "type": "switcher",
+          "help": "NRPass4 (RenoDX).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "text": "Neural rendering: look",
+          "type": "section"
+        },
+        {
+          "id": "bLook:NeuralRendering",
+          "text": "Look stage",
+          "type": "switcher",
+          "help": "RenoDX's NR look stage: the gains below, the edge-aware upsampling and detail stability in the log domain. Off = the earlier pipeline (area-mean input, bilinear edit, its own detail-stability pass).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bLookMode:NeuralRendering",
+          "text": "Adjust NR's look",
+          "type": "switcher",
+          "help": "NRLookMode: applies the look gains below (all at their identity by default). Off = gains ignored; upsampling and detail stability still run.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "fLookStrength:NeuralRendering",
+          "text": "Strength",
+          "type": "slider",
+          "help": "NRLookStrength: multiplies NR's whole edit (stops).",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fLookBrighten:NeuralRendering",
+          "text": "Brighten",
+          "type": "slider",
+          "help": "NRLookBrighten: gain on the parts NR brightens.",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fLookDarken:NeuralRendering",
+          "text": "Darken",
+          "type": "slider",
+          "help": "NRLookDarken: gain on the parts NR darkens.",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fLookMaxBrighten:NeuralRendering",
+          "text": "Max brighten (stops)",
+          "type": "slider",
+          "help": "NRLookMaxBrighten: soft limit on brightening, 0 = off.",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 4.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fLookMaxDarken:NeuralRendering",
+          "text": "Max darken (stops)",
+          "type": "slider",
+          "help": "NRLookMaxDarken: soft limit on darkening, 0 = off.",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 4.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fLookColour:NeuralRendering",
+          "text": "Colour",
+          "type": "slider",
+          "help": "NRLookColour: NR's saturation change (toward / away from grey).",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fLookHue:NeuralRendering",
+          "text": "Hue",
+          "type": "slider",
+          "help": "NRLookHue: NR's tint change.",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fLookMaxColour:NeuralRendering",
+          "text": "Max colour",
+          "type": "slider",
+          "help": "NRLookMaxColour: soft limit on the colour change, 0 = off.",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fLookShadows:NeuralRendering",
+          "text": "Shadows",
+          "type": "slider",
+          "help": "NRLookShadows: edit gain in dark zones.",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fLookMidtones:NeuralRendering",
+          "text": "Midtones",
+          "type": "slider",
+          "help": "NRLookMidtones: edit gain in mid zones.",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fLookHighlights:NeuralRendering",
+          "text": "Highlights",
+          "type": "slider",
+          "help": "NRLookHighlights: edit gain in bright zones.",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fLookTone:NeuralRendering",
+          "text": "Tone (large scale)",
+          "type": "slider",
+          "help": "NRLookTone: gain on the edit's broad band (guided filter split).",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fLookDetail:NeuralRendering",
+          "text": "Detail (fine scale)",
+          "type": "slider",
+          "help": "NRLookDetail: gain on the edit's fine band.",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fLookDetailRadius:NeuralRendering",
+          "text": "Detail radius (%)",
+          "type": "slider",
+          "help": "NRLookDetailRadius: band split radius, percent of the NR height.",
+          "valueOptions": {
+            "min": 0.25,
+            "max": 4.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fLookHalo:NeuralRendering",
+          "text": "Halo suppression",
+          "type": "slider",
+          "help": "NRLookHalo: lifts NR's darkening next to brighter pixels.",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fLookHaloBrightSide:NeuralRendering",
+          "text": "Halo suppression (bright side)",
+          "type": "slider",
+          "help": "NRLookHaloBrightSide: lifts the dark skirt on the bright side of dark objects.",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "iLookStabilize:NeuralRendering",
+          "text": "Stabilize",
+          "type": "dropdown",
+          "help": "NRLookStabilize: temporal filter on the edit's bands (time constant below). Off = detail stability decides.",
+          "valueOptions": {
+            "sourceType": "ModSettingInt",
+            "options": [
+              "Off",
+              "Static",
+              "Motion-compensated"
+            ]
+          }
+        },
+        {
+          "id": "fLookStabilizeMs:NeuralRendering",
+          "text": "Stabilize time (ms)",
+          "type": "slider",
+          "help": "NRLookStabilizeMs.",
+          "valueOptions": {
+            "min": 10.0,
+            "max": 250.0,
+            "step": 5.0,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "bLookStabilizeDetail:NeuralRendering",
+          "text": "Stabilize the fine band too",
+          "type": "switcher",
+          "help": "NRLookStabilizeDetail (off = the broad band and colour only).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "iLookUpsample:NeuralRendering",
+          "text": "Upsampling",
+          "type": "dropdown",
+          "help": "NRLookUpsample, when NR runs below the eye size: Auto / Edge-aware = joint-bilateral transport of the edit with a point-sampled model input; Classic = bilinear edit; Area input = edge-aware with an area-mean input. A change of input restarts NR's history.",
+          "valueOptions": {
+            "sourceType": "ModSettingInt",
+            "options": [
+              "Auto",
+              "Edge-aware",
+              "Classic",
+              "Edge-aware (area input)"
+            ]
+          }
+        },
+        {
+          "text": "1 more settings of this page (camera views, keyboard keys) are only in the VR panel.",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "pageDisplayName": "Height / roomscale",
+      "content": [
+        {
+          "text": "These values are also in the VR settings panel (hold the left menu button, or the gesture). MCM shows its own default until a value is changed here or in the panel; the panel shows the value in effect (fo4flatvr.ini, then these MCM changes).",
+          "type": "text"
+        },
+        {
+          "text": "Height",
+          "type": "section"
+        },
+        {
+          "id": "fHeightOffsetCm:General",
+          "text": "Height offset (cm)",
+          "type": "slider",
+          "help": "Raises (+) or lowers (-) the view on top of your real head height.",
+          "valueOptions": {
+            "min": -60,
+            "max": 60,
+            "step": 1,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fUnitsPerMeter:General",
+          "text": "World scale (units per metre)",
+          "type": "slider",
+          "help": "How far the view moves per metre of head movement (head, hands, roomscale, stereo eyes, FRIK, scene views).",
+          "valueOptions": {
+            "min": 50,
+            "max": 100,
+            "step": 1,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "bNoScaling:General",
+          "text": "Game's default scale (no scaling)",
+          "type": "switcher",
+          "help": "Nothing of ours scales the body or the world: FRIK body at scale 1 (no PlayerHeight / auto body height / arm-length scaling), 70 units per metre. Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bRecentreOnPoseJump:OpenXR",
+          "text": "Re-anchor on a start-up pose jump",
+          "type": "switcher",
+          "help": "VirtualDesktopXR's first pose is a placeholder; a > 0.5 m jump re-anchors until the first recentre.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "text": "Roomscale",
+          "type": "section"
+        },
+        {
+          "id": "bRoomscale:Roomscale",
+          "text": "Roomscale walking",
+          "type": "switcher",
+          "help": "Walking in the room moves the player.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "fDeadzoneCm:Roomscale",
+          "text": "Dead zone (cm)",
+          "type": "slider",
+          "help": "Head movement within this stays a lean, beyond it the body follows.",
+          "valueOptions": {
+            "min": 2,
+            "max": 40,
+            "step": 1,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fMaxResidualCm:Roomscale",
+          "text": "Wall residual (cm)",
+          "type": "slider",
+          "help": "How far the view may stay ahead of a blocked body.",
+          "valueOptions": {
+            "min": 5,
+            "max": 100,
+            "step": 5,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "text": "Body turning",
+          "type": "section"
+        },
+        {
+          "id": "bBodyFollowsHead:Roomscale",
+          "text": "Body follows the head",
+          "type": "switcher",
+          "help": "",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "fBodyYawThresholdDeg:Roomscale",
+          "text": "Turn the body after (deg)",
+          "type": "slider",
+          "help": "",
+          "valueOptions": {
+            "min": 10,
+            "max": 120,
+            "step": 5,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fBodyYawRateDeg:Roomscale",
+          "text": "Body turn speed (deg/s)",
+          "type": "slider",
+          "help": "",
+          "valueOptions": {
+            "min": 30,
+            "max": 720,
+            "step": 10,
             "sourceType": "ModSettingFloat"
           }
         }
       ]
     },
     {
-      "pageDisplayName": "Right stick gestures",
+      "pageDisplayName": "Gestures",
       "content": [
         {
-          "text": "Right stick click + hand movement. Each gesture does nothing until you pick an action. 'Key press' sends the chosen key (with an optional modifier) to the game while its window has the focus, so it can trigger any game key, any MCM hotkey of another mod, or fo4flatvr's own keys (F2 camera view cycle, F3 first/third person, F8 recentre).",
-          "type": "text"
+          "text": "Gestures",
+          "type": "section"
         },
         {
-          "text": "Press (no movement)",
+          "id": "bEnabled:Gestures",
+          "text": "Gestures",
+          "type": "switcher",
+          "help": "Master switch.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bRightHand:Gestures",
+          "text": "Right stick gestures",
+          "type": "switcher",
+          "help": "",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bLeftHand:Gestures",
+          "text": "Left stick gestures",
+          "type": "switcher",
+          "help": "The left click is also sprint: sprint starts after the button delay.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "text": "Right stick: Press (no movement)",
           "type": "section"
         },
         {
           "id": "iRTapAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the right 'Press (no movement)' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -185,7 +2165,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -193,7 +2174,7 @@
           "id": "iRTapKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -294,7 +2275,7 @@
           "id": "iRTapMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -306,14 +2287,14 @@
           }
         },
         {
-          "text": "Up",
+          "text": "Right stick: Up",
           "type": "section"
         },
         {
           "id": "iRUpAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the right 'Up' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -321,7 +2302,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -329,7 +2311,7 @@
           "id": "iRUpKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -430,7 +2412,7 @@
           "id": "iRUpMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -442,14 +2424,14 @@
           }
         },
         {
-          "text": "Down",
+          "text": "Right stick: Down",
           "type": "section"
         },
         {
           "id": "iRDownAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the right 'Down' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -457,7 +2439,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -465,7 +2448,7 @@
           "id": "iRDownKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -566,7 +2549,7 @@
           "id": "iRDownMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -578,14 +2561,14 @@
           }
         },
         {
-          "text": "Left",
+          "text": "Right stick: Left",
           "type": "section"
         },
         {
           "id": "iRLeftAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the right 'Left' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -593,7 +2576,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -601,7 +2585,7 @@
           "id": "iRLeftKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -702,7 +2686,7 @@
           "id": "iRLeftMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -714,14 +2698,14 @@
           }
         },
         {
-          "text": "Right",
+          "text": "Right stick: Right",
           "type": "section"
         },
         {
           "id": "iRRightAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the right 'Right' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -729,7 +2713,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -737,7 +2722,7 @@
           "id": "iRRightKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -838,7 +2823,7 @@
           "id": "iRRightMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -850,14 +2835,14 @@
           }
         },
         {
-          "text": "Back (toward you)",
+          "text": "Right stick: Back (toward you)",
           "type": "section"
         },
         {
           "id": "iRBackAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the right 'Back (toward you)' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -865,7 +2850,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -873,7 +2859,7 @@
           "id": "iRBackKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -974,7 +2960,7 @@
           "id": "iRBackMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -986,14 +2972,14 @@
           }
         },
         {
-          "text": "Forward",
+          "text": "Right stick: Forward",
           "type": "section"
         },
         {
           "id": "iRFwdAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the right 'Forward' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -1001,7 +2987,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -1009,7 +2996,7 @@
           "id": "iRFwdKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -1110,7 +3097,7 @@
           "id": "iRFwdMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -1122,14 +3109,14 @@
           }
         },
         {
-          "text": "Up, then down",
+          "text": "Right stick: Up, then down",
           "type": "section"
         },
         {
           "id": "iRUpDownAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the right 'Up, then down' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -1137,7 +3124,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -1145,7 +3133,7 @@
           "id": "iRUpDownKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -1246,7 +3234,7 @@
           "id": "iRUpDownMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -1258,14 +3246,14 @@
           }
         },
         {
-          "text": "Down, then up",
+          "text": "Right stick: Down, then up",
           "type": "section"
         },
         {
           "id": "iRDownUpAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the right 'Down, then up' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -1273,7 +3261,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -1281,7 +3270,7 @@
           "id": "iRDownUpKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -1382,7 +3371,7 @@
           "id": "iRDownUpMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -1394,14 +3383,14 @@
           }
         },
         {
-          "text": "Left, then right",
+          "text": "Right stick: Left, then right",
           "type": "section"
         },
         {
           "id": "iRLeftRightAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the right 'Left, then right' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -1409,7 +3398,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -1417,7 +3407,7 @@
           "id": "iRLeftRightKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -1518,7 +3508,7 @@
           "id": "iRLeftRightMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -1530,14 +3520,14 @@
           }
         },
         {
-          "text": "Right, then left",
+          "text": "Right stick: Right, then left",
           "type": "section"
         },
         {
           "id": "iRRightLeftAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the right 'Right, then left' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -1545,7 +3535,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -1553,7 +3544,7 @@
           "id": "iRRightLeftKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -1654,7 +3645,7 @@
           "id": "iRRightLeftMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -1666,14 +3657,14 @@
           }
         },
         {
-          "text": "Back, then forward",
+          "text": "Right stick: Back, then forward",
           "type": "section"
         },
         {
           "id": "iRBackFwdAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the right 'Back, then forward' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -1681,7 +3672,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -1689,7 +3681,7 @@
           "id": "iRBackFwdKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -1790,7 +3782,7 @@
           "id": "iRBackFwdMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -1802,14 +3794,14 @@
           }
         },
         {
-          "text": "Forward, then back",
+          "text": "Right stick: Forward, then back",
           "type": "section"
         },
         {
           "id": "iRFwdBackAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the right 'Forward, then back' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -1817,7 +3809,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -1825,7 +3818,7 @@
           "id": "iRFwdBackKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -1926,7 +3919,7 @@
           "id": "iRFwdBackMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -1936,25 +3929,16 @@
               "Alt"
             ]
           }
-        }
-      ]
-    },
-    {
-      "pageDisplayName": "Left stick gestures",
-      "content": [
-        {
-          "text": "Left stick click + hand movement. Each gesture does nothing until you pick an action. 'Key press' sends the chosen key (with an optional modifier) to the game while its window has the focus, so it can trigger any game key, any MCM hotkey of another mod, or fo4flatvr's own keys (F2 camera view cycle, F3 first/third person, F8 recentre).",
-          "type": "text"
         },
         {
-          "text": "Press (no movement)",
+          "text": "Left stick: Press (no movement)",
           "type": "section"
         },
         {
           "id": "iLTapAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the left 'Press (no movement)' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -1962,7 +3946,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -1970,7 +3955,7 @@
           "id": "iLTapKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -2071,7 +4056,7 @@
           "id": "iLTapMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -2083,14 +4068,14 @@
           }
         },
         {
-          "text": "Up",
+          "text": "Left stick: Up",
           "type": "section"
         },
         {
           "id": "iLUpAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the left 'Up' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -2098,7 +4083,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -2106,7 +4092,7 @@
           "id": "iLUpKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -2207,7 +4193,7 @@
           "id": "iLUpMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -2219,14 +4205,14 @@
           }
         },
         {
-          "text": "Down",
+          "text": "Left stick: Down",
           "type": "section"
         },
         {
           "id": "iLDownAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the left 'Down' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -2234,7 +4220,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -2242,7 +4229,7 @@
           "id": "iLDownKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -2343,7 +4330,7 @@
           "id": "iLDownMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -2355,14 +4342,14 @@
           }
         },
         {
-          "text": "Left",
+          "text": "Left stick: Left",
           "type": "section"
         },
         {
           "id": "iLLeftAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the left 'Left' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -2370,7 +4357,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -2378,7 +4366,7 @@
           "id": "iLLeftKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -2479,7 +4467,7 @@
           "id": "iLLeftMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -2491,14 +4479,14 @@
           }
         },
         {
-          "text": "Right",
+          "text": "Left stick: Right",
           "type": "section"
         },
         {
           "id": "iLRightAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the left 'Right' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -2506,7 +4494,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -2514,7 +4503,7 @@
           "id": "iLRightKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -2615,7 +4604,7 @@
           "id": "iLRightMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -2627,14 +4616,14 @@
           }
         },
         {
-          "text": "Back (toward you)",
+          "text": "Left stick: Back (toward you)",
           "type": "section"
         },
         {
           "id": "iLBackAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the left 'Back (toward you)' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -2642,7 +4631,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -2650,7 +4640,7 @@
           "id": "iLBackKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -2751,7 +4741,7 @@
           "id": "iLBackMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -2763,14 +4753,14 @@
           }
         },
         {
-          "text": "Forward",
+          "text": "Left stick: Forward",
           "type": "section"
         },
         {
           "id": "iLFwdAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the left 'Forward' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -2778,7 +4768,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -2786,7 +4777,7 @@
           "id": "iLFwdKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -2887,7 +4878,7 @@
           "id": "iLFwdMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -2899,14 +4890,14 @@
           }
         },
         {
-          "text": "Up, then down",
+          "text": "Left stick: Up, then down",
           "type": "section"
         },
         {
           "id": "iLUpDownAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the left 'Up, then down' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -2914,7 +4905,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -2922,7 +4914,7 @@
           "id": "iLUpDownKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -3023,7 +5015,7 @@
           "id": "iLUpDownMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -3035,14 +5027,14 @@
           }
         },
         {
-          "text": "Down, then up",
+          "text": "Left stick: Down, then up",
           "type": "section"
         },
         {
           "id": "iLDownUpAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the left 'Down, then up' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -3050,7 +5042,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -3058,7 +5051,7 @@
           "id": "iLDownUpKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -3159,7 +5152,7 @@
           "id": "iLDownUpMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -3171,14 +5164,14 @@
           }
         },
         {
-          "text": "Left, then right",
+          "text": "Left stick: Left, then right",
           "type": "section"
         },
         {
           "id": "iLLeftRightAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the left 'Left, then right' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -3186,7 +5179,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -3194,7 +5188,7 @@
           "id": "iLLeftRightKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -3295,7 +5289,7 @@
           "id": "iLLeftRightMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -3307,14 +5301,14 @@
           }
         },
         {
-          "text": "Right, then left",
+          "text": "Left stick: Right, then left",
           "type": "section"
         },
         {
           "id": "iLRightLeftAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the left 'Right, then left' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -3322,7 +5316,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -3330,7 +5325,7 @@
           "id": "iLRightLeftKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -3431,7 +5426,7 @@
           "id": "iLRightLeftMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -3443,14 +5438,14 @@
           }
         },
         {
-          "text": "Back, then forward",
+          "text": "Left stick: Back, then forward",
           "type": "section"
         },
         {
           "id": "iLBackFwdAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the left 'Back, then forward' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -3458,7 +5453,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -3466,7 +5462,7 @@
           "id": "iLBackFwdKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -3567,7 +5563,7 @@
           "id": "iLBackFwdMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -3579,14 +5575,14 @@
           }
         },
         {
-          "text": "Forward, then back",
+          "text": "Left stick: Forward, then back",
           "type": "section"
         },
         {
           "id": "iLFwdBackAction:Gestures",
           "text": "Action",
           "type": "dropdown",
-          "help": "What the left 'Forward, then back' gesture does.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -3594,7 +5590,8 @@
               "Key press",
               "Recentre view",
               "First / third person",
-              "Camera view cycle (SCENE / TRACK / CINEMA)"
+              "Camera view cycle (SCENE / TRACK / CINEMA)",
+              "VR settings panel (open / close)"
             ]
           }
         },
@@ -3602,7 +5599,7 @@
           "id": "iLFwdBackKey:Gestures",
           "text": "Key",
           "type": "dropdown",
-          "help": "The key sent when the action is 'Key press'.",
+          "help": "Sent when the action is 'Key press'.",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -3703,7 +5700,7 @@
           "id": "iLFwdBackMod:Gestures",
           "text": "Modifier",
           "type": "dropdown",
-          "help": "Held together with the key (as an MCM hotkey's modifier).",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -3713,16 +5710,130 @@
               "Alt"
             ]
           }
+        },
+        {
+          "text": "Detection",
+          "type": "section"
+        },
+        {
+          "id": "fMoveCm:Gestures",
+          "text": "Movement threshold (cm)",
+          "type": "slider",
+          "help": "",
+          "valueOptions": {
+            "min": 5.0,
+            "max": 30.0,
+            "step": 0.5,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fDominance:Gestures",
+          "text": "Direction clarity",
+          "type": "slider",
+          "help": "",
+          "valueOptions": {
+            "min": 1.0,
+            "max": 3.0,
+            "step": 0.1,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fMaxHoldS:Gestures",
+          "text": "Longest press (s)",
+          "type": "slider",
+          "help": "",
+          "valueOptions": {
+            "min": 0.5,
+            "max": 5.0,
+            "step": 0.1,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fCooldownS:Gestures",
+          "text": "Cooldown (s)",
+          "type": "slider",
+          "help": "",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fButtonDelayS:Gestures",
+          "text": "Button delay (s)",
+          "type": "slider",
+          "help": "",
+          "valueOptions": {
+            "min": 0.2,
+            "max": 2.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fKeyHoldMs:Gestures",
+          "text": "Key press length (ms)",
+          "type": "slider",
+          "help": "",
+          "valueOptions": {
+            "min": 30.0,
+            "max": 500.0,
+            "step": 10.0,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fHapticAmp:Gestures",
+          "text": "Pulse strength",
+          "type": "slider",
+          "help": "",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fHapticS:Gestures",
+          "text": "Pulse length (s)",
+          "type": "slider",
+          "help": "",
+          "valueOptions": {
+            "min": 0.01,
+            "max": 0.3,
+            "step": 0.01,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "bHaptics:Gestures",
+          "text": "Haptic pulse",
+          "type": "switcher",
+          "help": "",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bAllViews:Gestures",
+          "text": "Everywhere (views and menus)",
+          "type": "switcher",
+          "help": "Gestures everywhere: every camera view, menus, Pip-Boy, dialogue, VATS, workshop (0 = first-person gameplay only).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
         }
       ]
     },
     {
       "pageDisplayName": "Selfie",
       "content": [
-        {
-          "text": "VRIK's selfie mode with FRIK's body: raise your hands above your head to put a mirror image of your body in front of you. While your hands stay up, roll your wrist to turn it. Raise them again to end it. It also ends on any menu or when the camera leaves first person. Needs FRIK-flat's body.",
-          "type": "text"
-        },
         {
           "text": "Selfie",
           "type": "section"
@@ -3740,7 +5851,7 @@
           "id": "iHands:Selfie",
           "text": "Hands to raise",
           "type": "dropdown",
-          "help": "Which hands must be raised (VRIK selfieModeHands). The wrist that turns the body is the off hand for 'Off hand', else the main hand.",
+          "help": "",
           "valueOptions": {
             "sourceType": "ModSettingInt",
             "options": [
@@ -3751,10 +5862,19 @@
           }
         },
         {
+          "id": "bKeepInMenus:Selfie",
+          "text": "Keep in menus",
+          "type": "switcher",
+          "help": "Pause, Pip-Boy and menus keep it.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
           "id": "fHandsUpCm:Selfie",
           "text": "Height above the head (cm)",
           "type": "slider",
-          "help": "How far above the headset the hands must be (VRIK: about 26 cm).",
+          "help": "",
           "valueOptions": {
             "min": 10.0,
             "max": 50.0,
@@ -3766,7 +5886,7 @@
           "id": "fHoldS:Selfie",
           "text": "Hold time (s)",
           "type": "slider",
-          "help": "How long the hands must stay up before it toggles.",
+          "help": "",
           "valueOptions": {
             "min": 0.1,
             "max": 2.0,
@@ -3778,7 +5898,7 @@
           "id": "fDistanceM:Selfie",
           "text": "Distance (m)",
           "type": "slider",
-          "help": "How far in front of you the body stands (VRIK: 1.4 m).",
+          "help": "",
           "valueOptions": {
             "min": 0.6,
             "max": 4.0,
@@ -3790,7 +5910,7 @@
           "id": "fRollGain:Selfie",
           "text": "Wrist turn gain",
           "type": "slider",
-          "help": "Body turn per wrist turn (1 = the same angle, as VRIK; negative = reversed).",
+          "help": "",
           "valueOptions": {
             "min": -3.0,
             "max": 3.0,
@@ -3802,13 +5922,320 @@
           "id": "fRollDeadzoneDeg:Selfie",
           "text": "Wrist dead zone (deg)",
           "type": "slider",
-          "help": "Wrist turns smaller than this are ignored (VRIK: none).",
+          "help": "",
           "valueOptions": {
             "min": 0.0,
             "max": 20.0,
             "step": 1.0,
             "sourceType": "ModSettingFloat"
           }
+        }
+      ]
+    },
+    {
+      "pageDisplayName": "FRIK",
+      "content": [
+        {
+          "text": "These values are also in the VR settings panel (hold the left menu button, or the gesture). MCM shows its own default until a value is changed here or in the panel; the panel shows the value in effect (fo4flatvr.ini, then these MCM changes).",
+          "type": "text"
+        },
+        {
+          "text": "FRIK-flat",
+          "type": "section"
+        },
+        {
+          "id": "bEnable:FRIK",
+          "text": "FRIK-flat",
+          "type": "switcher",
+          "help": "FRIK.dll active at all. Restart: FRIK.dll asks for the bridge and installs its hooks and code patches when it loads.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bBody:FRIK",
+          "text": "FRIK body",
+          "type": "switcher",
+          "help": "0 = smooth movement only. Restart: FRIK.dll installs its body hooks and first-person arm patches and builds its skeleton when it loads; it has no path back to the engine's own first-person body while running.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "text": "Movement",
+          "type": "section"
+        },
+        {
+          "id": "bSmoothMovement:FRIK",
+          "text": "Smooth movement",
+          "type": "switcher",
+          "help": "FRIK's camera height smoothing.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bSmoothHorizontal:FRIK",
+          "text": "Smooth horizontally too",
+          "type": "switcher",
+          "help": "Fights roomscale; off = height only.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "text": "Body",
+          "type": "section"
+        },
+        {
+          "id": "bPausedFrame:FRIK",
+          "text": "Body runs while paused",
+          "type": "switcher",
+          "help": "Pip-Boy, Pause, terminals.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bAutoBodyHeight:FRIK",
+          "text": "Body height follows the camera",
+          "type": "switcher",
+          "help": "",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bBodyHeightOnRecentre:FRIK",
+          "text": "Re-seed body height on recentre",
+          "type": "switcher",
+          "help": "On: measured at the next recentre.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bLegChainIK:FRIK",
+          "text": "Leg IK over skeleton chains",
+          "type": "switcher",
+          "help": "CBBE / DFS leg bones.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bBodyGraph:FRIK",
+          "text": "Body animation graph in first person",
+          "type": "switcher",
+          "help": "Runs the game's third-person locomotion (walk, run, strafe, sneak) on the FRIK body in first person. Needed by VRIK-style legs. Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bBodyGraphSpeedContour:FRIK",
+          "text": "Body graph: own walk speed",
+          "type": "switcher",
+          "help": "The body animation gets its own speed and the game's walk / run pacing (speed contour), as in third person. Off: it reuses the first-person value (walk cycle can play too slowly). Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bPovSwitchSync:FRIK",
+          "text": "Keep view switches in step with the body",
+          "type": "switcher",
+          "help": "VATS playback / third person switches run completely with the FRIK body shown (animated VATS body, VATS shots from the real muzzle, no stuck crouch height after VATS). Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bAnimatedLegs:FRIK",
+          "text": "VRIK-style legs",
+          "type": "switcher",
+          "help": "Moving: the legs follow the game's walk / run / strafe animation (needs Body animation graph). Standing: planted feet with short steps. Off: FRIK's walk.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bHeadlessFirstPerson:FRIK",
+          "text": "Headless first person",
+          "type": "switcher",
+          "help": "",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bRestoreEngineBody:FRIK",
+          "text": "Restore the engine body pose",
+          "type": "switcher",
+          "help": "",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bNoScaling:General",
+          "text": "Game's default scale (no scaling)",
+          "type": "switcher",
+          "help": "FRIK body at scale 1: no PlayerHeight, no auto body height, no arm-length scaling; 70 units per metre. Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bFrikPipboy:FRIK",
+          "text": "FRIK's wrist Pip-Boy opening",
+          "type": "switcher",
+          "help": "Look at the wrist / FRIK's button opens the game's Pip-Boy (off: fo4flatvr's Pip-Boy panel only).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bConfigShortcut:FRIK",
+          "text": "FRIK's both-sticks config shortcut",
+          "type": "switcher",
+          "help": "FRIK's own config does not render on flat yet: leave off.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "text": "ROCK-flat",
+          "type": "section"
+        },
+        {
+          "id": "bEnable:ROCK",
+          "text": "ROCK-flat (physics hands)",
+          "type": "switcher",
+          "help": "ROCK.dll active at all (needs FRIK.dll). Restart: ROCK.dll decides at load whether it installs its hooks and patches and registers with FRIK-flat.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bInputClaims:ROCK",
+          "text": "ROCK input claims",
+          "type": "switcher",
+          "help": "Inputs ROCK takes (grip to grab ...) are kept from the game, gestures and glyphs in gameplay; menus keep them. Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bGrab:ROCK",
+          "text": "ROCK grabbing",
+          "type": "switcher",
+          "help": "ROCK's hands grab, pull and catch objects (grip). Off: no new grab starts and the grip goes back to the game; a held object stays until released. Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        }
+      ]
+    },
+    {
+      "pageDisplayName": "Keys / panel",
+      "content": [
+        {
+          "text": "These values are also in the VR settings panel (hold the left menu button, or the gesture). MCM shows its own default until a value is changed here or in the panel; the panel shows the value in effect (fo4flatvr.ini, then these MCM changes).",
+          "type": "text"
+        },
+        {
+          "text": "Keyboard (game window focused)",
+          "type": "section"
+        },
+        {
+          "id": "iConfigMenuMod:Keys",
+          "text": "Panel key modifier",
+          "type": "dropdown",
+          "help": "",
+          "valueOptions": {
+            "sourceType": "ModSettingInt",
+            "options": [
+              "No modifier",
+              "Shift",
+              "Ctrl",
+              "Alt"
+            ]
+          }
+        },
+        {
+          "text": "VR settings panel",
+          "type": "section"
+        },
+        {
+          "id": "bMenuHold:ConfigUI",
+          "text": "Hold the left menu button to open",
+          "type": "switcher",
+          "help": "A tap still opens Pause (on release).",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "fMenuHoldS:ConfigUI",
+          "text": "Menu button hold (s)",
+          "type": "slider",
+          "help": "",
+          "valueOptions": {
+            "min": 0.5,
+            "max": 3.0,
+            "step": 0.1,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fDistanceM:ConfigUI",
+          "text": "Panel distance (m)",
+          "type": "slider",
+          "help": "",
+          "valueOptions": {
+            "min": 0.4,
+            "max": 1.5,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fWidthM:ConfigUI",
+          "text": "Panel width (m)",
+          "type": "slider",
+          "help": "",
+          "valueOptions": {
+            "min": 0.5,
+            "max": 1.6,
+            "step": 0.05,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "fHeightM:ConfigUI",
+          "text": "Panel height (m)",
+          "type": "slider",
+          "help": "Centre below (-) eye level.",
+          "valueOptions": {
+            "min": -0.6,
+            "max": 0.3,
+            "step": 0.02,
+            "sourceType": "ModSettingFloat"
+          }
+        },
+        {
+          "id": "bHaptics:ConfigUI",
+          "text": "Panel haptics",
+          "type": "switcher",
+          "help": "",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "text": "5 more settings of this page (camera views, keyboard keys) are only in the VR panel.",
+          "type": "text"
         }
       ]
     }

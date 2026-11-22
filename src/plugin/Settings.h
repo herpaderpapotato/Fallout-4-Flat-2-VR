@@ -19,8 +19,11 @@ namespace fo4flatvr
         float       heightOffsetCm{ 0.0f };   // added to head height (negative = lower camera)
         bool        headAuthority{ true };    // [Roomscale] bHeadAuthority: 1st-person camera = capsule + eye height + head (not the animated camera node)
         float       eyeHeightTauS{ 0.6f };    // [Roomscale] fEyeHeightSmoothS: low-pass of the game's eye height (removes bob/sway)
+        bool        sneakHeightStep{ true };  // [Roomscale] bSneakHeightStep: eye height steps at once on a sneak toggle (FO4VR), 20 Nov
         bool        poseSync{ true };         // [General] bPoseSync: game job threads wait for this frame's head pose (HeadPose.h)
         float       poseSyncTimeoutMs{ 50.0f };  // [General] fPoseSyncTimeoutMs: upper bound of that wait
+        bool        gpuQueueLimit{ true };    // [General] bGpuQueueLimit: wait for the GPU before the head pose is predicted (Presenter GpuQueueLimit), 20 Nov
+        int         gpuQueueFrames{ 1 };      // [General] iGpuQueueFrames: frames left unfinished on the GPU at that point (0-2)
         bool        poseTrace{ false };       // [Debug] bPoseTrace: continuous per-event pose trace CSVs (HeadPose.h htrace)
         int         poseTraceFrames{ 3000 };  // [Debug] iPoseTraceFrames: frames per CSV file
         int         poseTraceFiles{ 20 };     // [Debug] iPoseTraceFiles: stop after this many files
@@ -33,6 +36,7 @@ namespace fo4flatvr
         int         stereoSeamGuard{ 32 };      // [Stereo] iSeamGuard: minimum guard px per eye before the alignment (32: run5 all-on 99.03 -> 99.36 %, +2.4 % px)  // game units per real metre (head position scale)
         std::string xrRuntimeJson;          // optional: forces XR_RUNTIME_JSON for this process
         bool        preferStageSpace{ false };
+        bool        recentreOnPoseJump{ true };  // [OpenXR] bRecentreOnPoseJump: re-anchor on a start-up placeholder-pose jump (HeadPose.cpp)
         float       quadWidthMeters{ 3.0f };
         float       quadDistanceMeters{ 2.5f };
         float       quadHeightMeters{ 0.0f };
@@ -49,6 +53,7 @@ namespace fo4flatvr
         bool        suppressCameraRecoil{ true }; // [Controllers] bSuppressCameraRecoil: recoil does not turn the view
         bool        handAutoAimOverride{ true };  // [Controllers] bHandAutoAimOverride: hand pick beats the camera auto-aim actor
         bool        clampHandToCamera{ true };    // [Controllers] bClampHandToCamera: P not behind walls seen from the camera
+        bool        aimThrowsWithController{ true };  // [Controllers] bAimThrowsWithController: grenades/mines fly where the hand points
         bool        noSpread{ true };             // [Weapon] bNoSpread: no cone of fire for the player's shots outside VATS
         bool        noSpreadPellets{ false };     // [Weapon] bNoSpreadPellets: also for multi-projectile weapons (shotguns)
         bool        separateHud{ true };        // [HUD] bSeparateHud: HUD on its own head-locked layer in world view
@@ -100,6 +105,8 @@ namespace fo4flatvr
         float       menuWorkshopHandUpMeters{ 0.13f };   // [Menus] fWorkshopHandUpMeters (along the grip's +Y)
         float       menuWorkshopHandBackMeters{ 0.03f }; // [Menus] fWorkshopHandBackMeters (along the grip's +Z, toward the user)
         float       menuWorkshopHandPitchDeg{ -25.0f };  // [Menus] fWorkshopHandPitchDeg (negative = face tilted up toward the eyes)
+        bool        menuWorkshopHandCrop{ true };        // [Menus] bWorkshopHandCrop: hand panel = the build area of the Workshop movie only (21 Nov)
+        float       menuWorkshopCropTop{ 0.45f };        // [Menus] fWorkshopCropTop: that area starts this far down the 16:9 stage (0..0.9)
         float       menuVatsLabelScale{ 2.0f }; // [Menus] fVatsLabelScale: VATS overlay magnified about the selected target (1 = off)
         bool        menuVatsNoVignette{ true }; // [Menus] bVatsNoVignette: no flat VATS VignetteMenu over the live world
         bool        pipboyFloating{ false };    // [Pipboy] bFloating: FO4VR projected Pip-Boy in front of the head instead of the wrist
@@ -153,6 +160,7 @@ namespace fo4flatvr
         bool        stereoSplit{ true };        // [Stereo] bSplitDraws
         bool        stereoSaoPerEye{ true };    // [Stereo] bSaoPerEye
         bool        stereoTaaPerEye{ true };    // [Stereo] bTaaPerEye (per-eye motion vectors + jitter for TAA)
+        bool        stereoHiddenAreaMask{ true };  // [Stereo] bHiddenAreaMask (22 Nov: lens-hidden pixels stamped into depth)
         bool        stereoCutTaa{ false };      // [Stereo] bCutTaa (TAA off, FXAA on; off by default: per-eye TAA)
         bool        stereoCutMotionBlur{ false }; // [Stereo] bCutMotionBlur (per-eye motion blur since session 3)
         bool        stereoCutDof{ false };      // [Stereo] bCutDof (DOF runs per eye: blur kernels only)
@@ -180,6 +188,8 @@ namespace fo4flatvr
         float       paPipboyFollowSeconds{ 0.30f };  // [PowerArmor] fPipboyFollowSeconds (0 = head-locked)
 
         static Settings Load();
+        // 20 Nov: the merged settings file every module reads (ConfigStore.h: fo4flatvr.ini < MCM < VR-panel previews)
         static std::string Path();
+        static std::string UserPath();  // the user's fo4flatvr.ini itself (never written)
     };
 }

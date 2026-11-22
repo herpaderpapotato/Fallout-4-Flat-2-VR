@@ -25,6 +25,8 @@
 
 #include "StereoPoC.h"
 #include "StereoInternal.h"
+#include "plugin/ThreadQueues.h"
+#include "plugin/Dlss.h"
 
 #include <F4SE/F4SE.h>
 
@@ -135,13 +137,10 @@ namespace fo4flatvr::stereo::internal
             if (*ssr == a_want || g_ssrPending.load() == a_want) {
                 return;
             }
-            const auto tasks = F4SE::GetTaskInterface();
-            if (!tasks) {
-                REX::WARN("stereo cuts: no F4SE task interface - SSR flag left at {}", *ssr);
-                return;
-            }
+            // 20 Nov (threading audit): our main-idle queue (ThreadQueues.h; where console commands run, after WaitForThreads),
+            // not an F4SE task (those run on whichever thread drains them, job threads included)
             g_ssrPending.store(a_want);
-            tasks->AddTask([a_want]() {
+            const bool queued = tq::RunOnMain([a_want]() {
                 auto* const flag = Base() + kSsrFlag;
                 const std::uint8_t old = *flag;
                 *flag = a_want;
@@ -153,6 +152,10 @@ namespace fo4flatvr::stereo::internal
                 }
                 g_ssrPending.store(-1);
             });
+            if (!queued) {
+                g_ssrPending.store(-1);
+                REX::WARN("stereo cuts: no main-thread queue - SSR flag left at {}", *ssr);
+            }
         }
 
         void ClearAllRenderPasses()
@@ -187,7 +190,10 @@ namespace fo4flatvr::stereo::internal
 
         void ApplyTaa(const Config& c, bool a_want)
         {
-            const bool on = a_want && c.cutTaa;
+            // 20 Nov (DLSS agent): DLSS / neural rendering replace the engine's TAA draw (Dlss.h), so the TAA effect must run:
+            // the cut is lifted and FXAA forced off while they are on and usable (WantsTaa); lifted again when they fail.
+            const bool dlssTaa = a_want && dlss::WantsTaa();
+            const bool on = a_want && c.cutTaa && !dlssTaa;
             g_taaApplied.store(on);
             std::uint8_t* const fx = Effect(kFxaaIndex);
             if (g_fxaaVerified < 0 && fx) {
@@ -201,11 +207,11 @@ namespace fo4flatvr::stereo::internal
             if (g_fxaaVerified != 1 || !fx) {
                 return;
             }
-            if (on) {
+            if (on || dlssTaa) {
                 if (g_fxaaSaved < 0) {
                     g_fxaaSaved = fx[8];
                 }
-                fx[8] = 1;
+                fx[8] = on ? 1 : 0;  // TAA cut: FXAA instead; DLSS: no FXAA over its result
             } else if (g_fxaaSaved >= 0) {
                 fx[8] = static_cast<std::uint8_t>(g_fxaaSaved);
                 g_fxaaSaved = -1;

@@ -29,6 +29,8 @@ namespace fo4flatvr::game::camtweak
 
     void   Configure(const Config& a_cfg);  // any thread; settings are (re)applied on the next Tick
     Config Current();
+    // [Camera] bLockFirstPerson (CameraDirector): forces bFirstPersonDialogue, bNoKillCams and bNoIdleOrbit on while set
+    void SetForced(bool a_on);
 
     // Main thread. Writes the engine settings for the current config (logs every change).
     void ApplySettings(const char* a_when);

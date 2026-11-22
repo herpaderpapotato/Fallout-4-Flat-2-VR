@@ -1,11 +1,15 @@
+#include "plugin/Dlss.h"
 #include "plugin/CommandChannel.h"
 #include "plugin/FloatingGun.h"
 #include "plugin/FrikBridge.h"
 #include "plugin/ControllerBindings.h"
 #include "plugin/Gestures.h"
+#include "plugin/FaceDiag.h"
 
 #include "plugin/CameraDirector.h"
 #include "plugin/CameraTweaks.h"
+#include "plugin/ConfigStore.h"
+#include "plugin/ConfigUI.h"
 #include "plugin/Comfort.h"
 #include "plugin/ComfortEffects.h"
 #include "plugin/Dialogue.h"
@@ -13,15 +17,19 @@
 #include "plugin/GameHud.h"
 #include "plugin/HudLayer.h"
 #include "plugin/MenuPointer.h"
+#include "plugin/PointerBeam.h"
 #include "plugin/GameMenuPointer.h"
 #include "plugin/PipboyLayer.h"
 #include "plugin/GameWindow.h"
 #include "plugin/HeadPose.h"
+#include "plugin/Haptics.h"
 #include "plugin/VirtualPad.h"
 #include "plugin/Presenter.h"
 #include "plugin/Roomscale.h"
 #include "plugin/StereoPoC.h"
 #include "plugin/VatsWindow.h"
+#include "plugin/ThreadQueues.h"
+#include "plugin/WorkshopHand.h"
 
 #include <REX/LOG.h>
 #include <F4SE/F4SE.h>
@@ -219,6 +227,46 @@ namespace fo4flatvr::command
                 present::RequestMode(arg == "afr" ? 2 : arg == "mono" ? 1 : 0);
                 return "requested " + arg;
             }
+            if (verb == "haptic") {
+                // 22 Nov (FO4VR parity suite, diagnostic): one pulse through the haptics queue (Haptics.h), so a test can show
+                // its haptic detector (vremu's per-hand counter) sees a pulse the plugin sends. haptic <L|R> [amplitude] [seconds]
+                char  hand = 'R';
+                float amp = 0.3f, sec = 0.01f;
+                if (sscanf_s(arg.c_str(), " %c %f %f", &hand, 1u, &amp, &sec) < 1 || (hand != 'L' && hand != 'R' && hand != 'l' && hand != 'r')) {
+                    return "error: haptic <L|R> [amplitude] [seconds]";
+                }
+                const int h = (hand == 'L' || hand == 'l') ? 0 : 1;
+                haptics::Request(h, amp, sec);
+                return std::format("haptic queued hand={} amp={:.2f} sec={:.3f}", h ? "R" : "L", amp, sec);
+            }
+            if (verb == "aim" && arg == "weapon") {
+                // 22 Nov (FO4VR parity suite, diagnostic, read-only): the equipped weapon instance - form, instance flags
+                // (WEAPON_FLAGS; kHasScope 0x200000 = what FO4VR EF7B00 tests for raise-to-eye scoping), zoom data, ammo
+                // count; and whether ScopeMenu is open. Read on the main thread. Lets a test confirm its fixed test data.
+                return tq::RunOnMainWait([]() -> std::string {
+                    auto* p = RE::PlayerCharacter::GetSingleton();
+                    auto* mh = p && p->currentProcess ? p->currentProcess->middleHigh : nullptr;
+                    std::string out = "weapon";
+                    int         n = 0;
+                    if (mh) {
+                        for (auto& it : mh->equippedItems) {
+                            auto* obj = it.item.object;
+                            if (!obj || !obj->IsWeapon()) continue;
+                            auto* inst = static_cast<RE::TESObjectWEAP::InstanceData*>(it.item.instanceData.get());
+                            auto* base = static_cast<RE::TESObjectWEAP*>(obj);
+                            const auto* d = inst ? inst : static_cast<RE::TESObjectWEAP::InstanceData*>(&base->weaponData);
+                            const auto flags = d->flags.underlying();
+                            const std::string nm(RE::TESFullName::GetFullName(*obj));
+                            out += std::format(" | form={:08X} name='{}' instance={} flags=0x{:08X} hasScope={} zoom={:08X}", obj->GetFormID(),
+                                nm, inst ? 1 : 0, flags, (flags & 0x00200000u) ? 1 : 0, d->zoomData ? d->zoomData->GetFormID() : 0u);
+                            ++n;
+                        }
+                    }
+                    auto* ui = RE::UI::GetSingleton();
+                    out += std::format(" | weapons={} scopeMenu={}", n, ui && ui->GetMenuOpen("ScopeMenu") ? 1 : 0);
+                    return out;
+                }, std::chrono::milliseconds(1000), "aim weapon: main thread busy");
+            }
             if (verb == "aim") {
                 // aim            -> report (hand ray P/D, camera, engine pick ray, pick ref, fire/projectile)
                 // aim on|off     -> runtime switch (hooks must have been installed at load)
@@ -231,8 +279,8 @@ namespace fo4flatvr::command
                     game::SetAimConvention(arg.back() - '0');
                     return "aim " + arg;
                 }
-                // aim lof|recoil|autoaim|clamp on|off -> runtime switches of the follow-ups; aim probe -> wall distances
-                for (const char* f : { "lof", "recoil", "autoaim", "clamp" }) {
+                // aim lof|recoil|autoaim|clamp|throw on|off -> runtime switches of the follow-ups; aim probe -> wall distances
+                for (const char* f : { "lof", "recoil", "autoaim", "clamp", "throw", "vatsshot" }) {
                     const std::string pre = std::string(f) + " ";
                     if (arg == pre + "on" || arg == pre + "off") {
                         return game::SetAimFeature(f, arg == pre + "on");
@@ -291,10 +339,21 @@ namespace fo4flatvr::command
                     hud::SetClearHudTargets(arg == "clear on");
                     return "hud " + arg;
                 }
-                if (!arg.empty()) {
-                    return "error: hud [on|off|src 3e|src 3f|premul 0|premul 1|crosshair 0|crosshair 1|clear on|off]";
+                if (arg == "split") {  // 20 Nov: FO4VR HUD split (hand HUD, chin compass): config, clip rectangles, counters
+                    return hud::SplitStatus();
                 }
-                return hud::Status();
+                if (arg.rfind("set ", 0) == 0) {  // hud set <[HUD] key> <value>: live (config panel / MCM apply)
+                    const std::string kv = arg.substr(4);
+                    const auto        kvSp = kv.find(' ');
+                    if (kvSp == std::string::npos) {
+                        return "error: hud set <key> <value>";
+                    }
+                    return hud::SetSplitValue(kv.substr(0, kvSp), kv.substr(kvSp + 1));
+                }
+                if (!arg.empty()) {
+                    return "error: hud [on|off|src 3e|src 3f|premul 0|premul 1|crosshair 0|crosshair 1|clear on|off|split|set <key> <value>]";
+                }
+                return hud::Status() + " | " + hud::SplitStatus();
             }
             if (verb == "pipboy") {
                 // pipboy             -> status (state, capture counts, quad pose, last pointer hit uv, game side)
@@ -369,6 +428,22 @@ namespace fo4flatvr::command
                 }
                 return menuptr::Status();
             }
+            if (verb == "wshand") {
+                // wshand [on|off|ini] -> workshop placement / highlight along the hand ray (WorkshopHand.h)
+                return wshand::Command(arg);
+            }
+            if (verb == "beam") {
+                // beam         -> pointer beam (PointerBeam.h): offers per source, world mode, last beam per hand
+                // beam on|off  -> runtime switch ([Beam] bBeam)
+                if (arg == "on" || arg == "off") {
+                    beam::SetEnabled(arg == "on");
+                    return std::format("beam {}", beam::Enabled() ? "on" : "off");
+                }
+                if (!arg.empty()) {
+                    return "error: beam [on|off]";
+                }
+                return beam::Status();
+            }
             if (verb == "menus") {
                 return game::MenusReport();
             }
@@ -376,6 +451,11 @@ namespace fo4flatvr::command
                 // menupanel [on|off] -> [Menus] bPanel: Pause/Favorites/MessageBox over the live world view
                 if (arg == "clear on" || arg == "clear off") {  // [Menus] bClearMenuTargets (pause-menu decal fix)
                     hud::SetClearMenuTargets(arg == "clear on");
+                    return "menupanel " + arg;
+                }
+                if (arg == "modmenus on" || arg == "modmenus off" || arg == "modmenus ini" || arg == "modmenus 1" || arg == "modmenus 0") {
+                    // 20 Nov: [Menus] bPanelModMenus live (mod / F4SE menus on the anchored panel; "ini" = back to the file)
+                    game::SetModPanelMenus(arg == "modmenus ini" ? -1 : (arg == "modmenus on" || arg == "modmenus 1") ? 1 : 0);
                     return "menupanel " + arg;
                 }
                 if (arg == "on" || arg == "off") {
@@ -390,11 +470,10 @@ namespace fo4flatvr::command
                 const auto spc = arg.find(' ');
                 const std::string menu = arg.substr(0, spc);
                 const std::string what = spc == std::string::npos ? "show" : arg.substr(spc + 1);
-                const auto tasks = F4SE::GetTaskInterface();
-                if (menu.empty() || !tasks || (what != "show" && what != "hide")) {
+                if (menu.empty() || (what != "show" && what != "hide")) {
                     return "error: uimsg <MenuName> show|hide";
                 }
-                tasks->AddTask([menu, show = what == "show"]() {
+                tq::RunOnMain([menu, show = what == "show"]() {  // main-idle queue (ThreadQueues.h)
                     if (auto* q = RE::UIMessageQueue::GetSingleton()) {
                         REX::INFO("uimsg: {} {}", menu, show ? "show" : "hide");
                         q->AddMessage(RE::BSFixedString(menu.c_str()), show ? RE::UI_MESSAGE_TYPE::kShow : RE::UI_MESSAGE_TYPE::kHide);
@@ -402,9 +481,18 @@ namespace fo4flatvr::command
                 });
                 return "queued";
             }
+            if (verb == "threads") {
+                return tq::Status();  // 20 Nov: main-idle / render queues (ThreadQueues.h, analysis/threading.md)
+            }
             if (verb == "camdir") {
                 // camera step 1: camdir [on|off|table|policy <state> <policy>|fadetest [holdMs]]
                 return camdir::Command(arg);
+            }
+            if (verb == "facediag") {
+                return facediag::Command(arg);  // player's FaceGen head: geometry, shader flags, textures (GPU read-back)
+            }
+            if (verb == "sneakstep") {
+                return game::SneakStepCommand(arg);  // 20 Nov: sneak eye height step [on|off] + learned levels
             }
             if (verb == "gesture") {
                 return gestures::Command(arg);  // VR gestures + selfie: gesture [status|reload|on|off|test <R|L> <slot>|selfie on|off]
@@ -523,6 +611,16 @@ namespace fo4flatvr::command
                 present::RequestRecenter();
                 return "requested";
             }
+            if (verb == "dlss") {
+                return dlss::Command(arg);  // 20 Nov: DLSS / neural rendering (Dlss.h)
+            }
+            if (verb == "cfgui") {
+                return configui::Command(arg);  // 20 Nov: VR settings panel (ConfigUI.h)
+            }
+            if (verb == "cfg") {
+                if (arg == "subs") return cfgstore::SubscribersStatus();  // 20 Nov: live-settings reloads (ConfigStore.h)
+                return cfgstore::Status();  // 20 Nov: settings layers (ConfigStore.h)
+            }
             return "error: unknown command '" + verb + "'";
         }
 
@@ -584,6 +682,11 @@ namespace fo4flatvr::command
                 ::CloseHandle(pipe);
             }
         }
+    }
+
+    std::string Execute(const std::string& a_line)
+    {
+        return Handle(a_line);
     }
 
     void Start()

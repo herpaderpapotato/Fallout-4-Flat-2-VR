@@ -4,6 +4,7 @@
 #include "plugin/CameraDirector.h"
 #include "plugin/CameraTweaks.h"
 #include "plugin/Comfort.h"
+#include "plugin/ConfigUI.h"
 #include "plugin/ControllerBindings.h"
 #include "plugin/Dialogue.h"
 #include "plugin/GameBridge.h"
@@ -13,20 +14,25 @@
 #include "plugin/GameMenuPointer.h"
 #include "plugin/GamePipboy.h"
 #include "plugin/PipboyLayer.h"
+#include "plugin/PointerBeam.h"
 #include "plugin/VirtualPad.h"
 #include "plugin/Presenter.h"
 #include "plugin/Roomscale.h"
 #include "plugin/StereoPoC.h"
 #include "plugin/VatsWindow.h"
 #include "plugin/FloatingGun.h"
+#include "plugin/FaceDiag.h"
+#include "plugin/Dlss.h"
 #include "plugin/FrikBridge.h"
 #include "plugin/Gestures.h"
 #include "plugin/Haptics.h"
+#include "plugin/ThreadQueues.h"
 #include "xr/XrRuntime.h"
 
 #include <Windows.h>
 #undef ERROR
 #include <d3d11.h>
+#include <d3d11_4.h>
 #include <dxgi.h>
 
 #include <algorithm>
@@ -79,6 +85,7 @@ namespace fo4flatvr::present
             // Menus like FO4VR (UprightHmdLagNode, frozen while a menu is open): the quad (flat fallback or menu panel)
             // is anchored in front of the user when it starts showing, then world-locked.
             std::string lastPanel;                // menu shown as a panel over the live world view ("" = none)
+            std::string modPanel;                 // 20 Nov: mod menu taken by the mod-menu panel rule this frame (game::ModPanelMenu)
             bool        vatsOverlay{ false };     // a FlatScreenModel menu (VATSMenu with the camera gate, ...) laid head-locked over the live world
             float       vatsPivotU{ -1.0f }, vatsPivotV{ -1.0f };  // last VATS label magnification pivot (status)
             std::string overlayMenu;              // its name ("" = none)
@@ -94,6 +101,7 @@ namespace fo4flatvr::present
             bool          workbenchGeometry{ false };  // round 6: the last anchor used FO4VR's workbench panel geometry
             bool          workshopOnHand{ false };     // round 6: the WorkshopMenu panel follows the off-hand grip this frame
             std::uint64_t workshopHandFrames{ 0 };
+            bool          workshopCropOn{ false };     // 21 Nov: the hand panel shows only the build area (SetCinemaQuadCrop)
             // round 7: a terminal on its own monitor in the live world (FO4VR), "" = none; panel geometry source of the last anchor
             std::string   worldScreen;
             std::uint64_t worldScreenFrames{ 0 };
@@ -112,6 +120,7 @@ namespace fo4flatvr::present
             xr::Pose renderPose;
             xr::Fov  renderFov;
             xr::SessionState lastState{ xr::SessionState::kNone };
+            std::uint64_t    hamSerial{ ~0ull };          // 22 Nov: hidden-area mesh version handed to stereo (~0 = nothing yet)
         };
 
         State*         g_state = nullptr;
@@ -124,6 +133,9 @@ namespace fo4flatvr::present
             LARGE_INTEGER last{};
             double        sum{ 0 }, max{ 0 }, waitSum{ 0 }, waitMax{ 0 };
             int           n{ 0 }, slow{ 0 };
+            // 20 Nov (frame-timing agent): GPU frame queue (GpuQueueLimit) and the other places the CPU can block
+            double gpuWaitSum{ 0 }, gpuWaitMax{ 0 }, behindSum{ 0 }, endSum{ 0 }, endMax{ 0 }, presentSum{ 0 }, presentMax{ 0 };
+            int    gpuWaits{ 0 }, gpuTimeouts{ 0 }, behindMax{ 0 }, behindN{ 0 }, presentN{ 0 };
         };
         Pacing g_pacing;
 
@@ -134,6 +146,80 @@ namespace fo4flatvr::present
                 ::QueryPerformanceFrequency(&f);
             }
             return static_cast<double>(b.QuadPart - a.QuadPart) * 1000.0 / static_cast<double>(f.QuadPart);
+        }
+
+        // 20 Nov (frame-timing agent; work/handoff/head-timing.md "GPU frame queue"): GPU-bound frames (DLSS-NR, a ReShade
+        // DLSS tool, a high render size) let the CPU run up to DXGI's frame-latency limit (3 presents) ahead of the GPU:
+        // the runtime's xrWaitFrame no longer holds the CPU back (user log 20 Nov 23:20-23:28: wait 0.1-2 ms per frame), the
+        // CPU blocks in Present instead, and every frame is rendered with a head pose predicted for a display time that the
+        // GPU only reaches 1-3 frames later (lag, and jitter as the queue depth changes; reprojection covers the difference).
+        // Fix: a D3D11 fence marks the end of each frame's GPU work; before xrWaitFrame (= before the head pose of the next
+        // frame is predicted) the CPU waits until at most [General] iGpuQueueFrames frames are still unfinished on the GPU.
+        // Not GPU-bound = the frame is long done = no wait. [General] bGpuQueueLimit=0 = off (diagnostics still logged).
+        struct GpuQueue
+        {
+            ID3D11Fence*          fence{ nullptr };
+            ID3D11DeviceContext4* ctx4{ nullptr };
+            HANDLE                event{ nullptr };
+            std::uint64_t         value{ 0 };
+            bool                  tried{ false };
+            bool                  ok{ false };
+        };
+        GpuQueue g_gpuq;
+
+        // Render thread, right before BeginFrame (xrWaitFrame + the head pose of the next frame).
+        void GpuQueueLimit(ID3D11Device* a_device, ID3D11DeviceContext* a_ctx, bool a_limit, int a_frames, double a_periodMs)
+        {
+            auto& q = g_gpuq;
+            if (!q.tried) {
+                q.tried = true;
+                ID3D11Device5* dev5 = nullptr;
+                if (a_device && a_ctx && SUCCEEDED(a_device->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void**>(&dev5))) && dev5 &&
+                    SUCCEEDED(a_ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void**>(&q.ctx4))) && q.ctx4 &&
+                    SUCCEEDED(dev5->CreateFence(0, D3D11_FENCE_FLAG_NONE, __uuidof(ID3D11Fence), reinterpret_cast<void**>(&q.fence))) &&
+                    q.fence) {
+                    q.event = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                    q.ok = q.event != nullptr;
+                }
+                if (dev5) {
+                    dev5->Release();
+                }
+                REX::INFO("gpu queue: {} (limit {}, {} frame(s) queued on the GPU at most)", q.ok ? "fence ready" : "NO D3D11 fence: limit off",
+                    a_limit ? "on" : "off", a_frames);
+            }
+            if (!q.ok) {
+                return;
+            }
+            const std::uint64_t v = ++q.value;
+            q.ctx4->Signal(q.fence, v);  // after this frame's eye copies / layers: the end of frame v's GPU work
+            const std::uint64_t done = q.fence->GetCompletedValue();
+            if (done == UINT64_MAX) {
+                return;  // device removed
+            }
+            const int behind = static_cast<int>((std::min)(v - (std::min)(done, v), std::uint64_t{ 16 }));  // incl. this frame
+            g_pacing.behindSum += behind;
+            g_pacing.behindMax = (std::max)(g_pacing.behindMax, behind);
+            ++g_pacing.behindN;
+            const int           keep = std::clamp(a_frames, 0, 2);
+            const std::uint64_t target = v > static_cast<std::uint64_t>(keep) ? v - keep : 0;
+            if (!a_limit || done >= target) {
+                return;
+            }
+            // the tail of the queued frames (post-processing, our copies) goes to the GPU now, not at the real Present
+            a_ctx->Flush();
+            LARGE_INTEGER t0{}, t1{};
+            ::QueryPerformanceCounter(&t0);
+            DWORD r = WAIT_OBJECT_0;
+            if (SUCCEEDED(q.fence->SetEventOnCompletion(target, q.event))) {
+                const double cap = std::clamp(3.0 * (a_periodMs > 0.0 ? a_periodMs : 11.1), 20.0, 40.0);
+                r = ::WaitForSingleObject(q.event, static_cast<DWORD>(cap));
+            }
+            ::QueryPerformanceCounter(&t1);
+            const double ms = QpcMs(t0, t1);
+            ++g_pacing.gpuWaits;
+            g_pacing.gpuWaitSum += ms;
+            g_pacing.gpuWaitMax = (std::max)(g_pacing.gpuWaitMax, ms);
+            g_pacing.gpuTimeouts += r == WAIT_TIMEOUT ? 1 : 0;
         }
 
 
@@ -407,6 +493,7 @@ namespace fo4flatvr::present
             s.xrOk = s.runtime.Init(s.device, cfg);
             if (s.xrOk) {
                 REX::INFO("OpenXR up: {}", s.runtime.runtimeName());
+                REX::INFO("OpenXR API layers: {}", s.runtime.apiLayers());  // 20 Nov: e.g. the dlss5-autopilot ReShade layer
             } else {
                 REX::ERROR("OpenXR init failed: {} (VR disabled for this session)", s.runtime.lastError());
             }
@@ -593,6 +680,7 @@ namespace fo4flatvr::present
             if (!s.xrTried) {
                 InitXr(s);
             }
+            configui::Tick();  // 20 Nov: settings layers poll + live re-apply of edits made in MCM / an editor (ConfigUI.h)
             // Camera state and view-taking menus are tracked (and logged) even without XR so tests can
             // see transitions. World view only in first person with no such menu open.
             // Wrist Pip-Boy (D3): a directly opened PipboyMenu keeps the world view (its screen is on the hand quad).
@@ -642,6 +730,15 @@ namespace fo4flatvr::present
                 camdir::WorldView(game::CurrentCameraState()) && game::MenuOpen("DialogueMenu")) {
                 panel = "DialogueMenu";
             }
+            // 20 Nov: mod / F4SE menus that take input (Silhouette's picker, SAM, F4SE CustomMenu menus) on the same anchored panel
+            // with the pointer, instead of the head-locked frustum overlay below (game::ModPanelMenu; [Menus] bPanelModMenus).
+            s.modPanel.clear();
+            if (!menu && !panel && s.mono && hud::MenuPanelEnabled() && camdir::WorldView(game::CurrentCameraState())) {
+                s.modPanel = game::ModPanelMenu();
+                if (!s.modPanel.empty()) {
+                    panel = s.modPanel.c_str();
+                }
+            }
             if (std::string(panel ? panel : "") != s.lastPanel) {
                 REX::INFO("menu panel {} -> {}", s.lastPanel.empty() ? "-" : s.lastPanel, panel ? panel : "-");
                 s.lastPanel = panel ? panel : "";
@@ -677,9 +774,12 @@ namespace fo4flatvr::present
                 s.lastMenu = menu ? menu : "";
             }
             s.hudLayer = false;
-            dlg::Tick();  // VR dialogue: UI / MenuTopicManager poll, weapon cull, haptic edge (main thread)
-            camdir::PollWorkbenchBody();
-            camdir::PollHeadHide();  // AAF POV: the head the view sits in is hidden (main thread)  // furniture gate: first-person body back after a workbench
+            // 20 Nov (threading audit, analysis/threading.md): dlg::Tick (dialogue WEAPON cull), camdir::PollWorkbenchBody
+            // (Show1stPerson), camdir::PollHeadHide (actor head-node culls) and game::AimTick (equip / raycast test helpers)
+            // change scene-graph / actor state; here at Present the job threads run the player update concurrently. They
+            // run once per OnIdle at the main-idle point now (ThreadQueues.h); only without that hook here, as before.
+            tq::PresentFallbackTicks();
+            camdir::PollNotify();    // 20 Nov: HUD message on camera state / view mode changes ([Camera] bCameraHudNotify)
             // [Camera] step 0: no ADS zoom while the head-tracked world view is shown; settings upkeep.
             game::camtweak::Tick(s.xrOk && s.mono && camdir::WorldView(s.lastCamState) && s.lastMenu.empty());
             if (!s.xrOk) {
@@ -700,12 +800,14 @@ namespace fo4flatvr::present
                 DWORD fgPid = 0;
                 ::GetWindowThreadProcessId(::GetForegroundWindow(), &fgPid);
                 const bool focused = fgPid == ::GetCurrentProcessId();
-                const bool cyc = KeyPressed(s.settings.cameraCycleKey, s.cameraCycleDown) && focused;
+                // 20 Nov: Ctrl+F2 (same key + the panel's modifier) is the VR settings panel's, not the cycle
+                const bool cyc = KeyPressed(s.settings.cameraCycleKey, s.cameraCycleDown) && focused &&
+                                 !configui::HotkeyClaims(s.settings.cameraCycleKey);
                 const bool pov = KeyPressed(s.settings.povToggleKey, s.povToggleDown) && focused;
                 if (cyc || pov) {
                     const std::string r = camdir::Command(cyc ? "cycle" : "pov");
                     REX::INFO("hotkey {}: {}", cyc ? "camera cycle" : "pov toggle", r);
-                    game::HudMessage("VR: " + r);
+                    if (camdir::CallerShouldShow(r)) game::HudMessage("VR: " + r);  // else PollNotify announces the change
                 }
             }
 
@@ -734,7 +836,13 @@ namespace fo4flatvr::present
             // (controller bindings context, comfort turn/direction, menu pointer, gun/FRIK hand feeds) keeps exactly what it
             // had there before, when state 3 was the flat screen: no controls change in the free camera.
             // 15 Nov: every SCENE state (third person, animated, ... the same method) keeps its flat-screen input mapping too.
-            const bool inputWorld = worldView && !camdir::SceneView(camState);
+            // 20 Nov (user: "If they change from one camera type to another, they shouldn't ignore keyboard inputs or change control
+            // styles"): [Camera] bSameInputAllViews (default 1) - every head-tracked view (SCENE included) takes the same hand
+            // input as first person (comfort, pointer, beams, hand feeds), and the controller bindings keep the gameplay
+            // mapping in every camera view, CINEMA included, while no menu is open (gameInput below). 0 = the 15 Nov mapping.
+            const bool sameInput = camdir::SameInputAllViews();
+            const bool inputWorld = worldView && (sameInput || !camdir::SceneView(camState));
+            const bool gameInput = sameInput ? s.lastMenu.empty() : inputWorld;  // bindings: gameplay context unless a menu is shown
             const float fadeAlpha = camdir::FadeAlpha();
             // round 5: VATS camera window ([Menus] bVatsCameraWindow, VatsWindow.h): VATS keeps the live world view (camera
             // gate) and the anchored window shows our own targeting camera with the VATS UI on top
@@ -810,15 +918,51 @@ namespace fo4flatvr::present
                             q.w * tilt.y - q.x * tilt.z + q.y * tilt.w + q.z * tilt.x,
                             q.w * tilt.z + q.x * tilt.y - q.y * tilt.x + q.z * tilt.w,
                             q.w * tilt.w - q.x * tilt.x - q.y * tilt.y - q.z * tilt.z };
-                        const xr::Vec3 off = RotXr(q, { 0.0f, s.settings.menuWorkshopHandUpMeters, s.settings.menuWorkshopHandBackMeters });
+                        // 20 Nov (controls agent): FO4VR's X minimises the build menu (hidden: no layer, a vanishing quad
+                        // for the pointer) and the held off stick click shows the settlement stats (panel enlarged, raised
+                        // so it stays clear of the hand) - ControllerBindings.h WorkshopPanelHidden / WorkshopPanelScale
+                        const float wsScale = bindings::WorkshopPanelScale();
+                        const float wsW = s.settings.menuWorkshopHandWidthMeters * wsScale;
+                        const float wsUp = s.settings.menuWorkshopHandUpMeters + (wsScale - 1.0f) * s.settings.menuWorkshopHandWidthMeters * 0.3f;
+                        const xr::Vec3 off = RotXr(q, { 0.0f, wsUp, s.settings.menuWorkshopHandBackMeters });
                         const xr::Pose hp{ o, { g.position.x + off.x, g.position.y + off.y, g.position.z + off.z } };
-                        s.runtime.SetCinemaQuadOverride(&hp, s.settings.menuWorkshopHandWidthMeters);
+                        s.runtime.SetCinemaQuadOverride(&hp, bindings::WorkshopPanelHidden() ? 0.001f : wsW);
                         handQuad = true;
                         ++s.workshopHandFrames;
+                        // 21 Nov (workshop agent; user: "the build selection view is not visible ... hidden at the bottom"): the
+                        // whole FlatScreenModel image on a 0.40 m hand panel put flat's build bar (bottom 25 % of the 16:9 stage,
+                        // 60 % of its width) as a thin strip at the panel's lower edge, at the hand. FO4VR's WS_InvWand.nif maps
+                        // only parts of its Workshop movie onto the wand (UV strips). Ours: only the build area of the stage
+                        // (stage v >= fWorkshopCropTop, full stage width) on the hand panel; the whole image while the
+                        // settlement stats are held (they are the stage's top bar). [Menus] bWorkshopHandCrop.
+                        if (s.settings.menuWorkshopHandCrop && wsScale <= 1.0f) {
+                            const float stageAspect = 16.0f / 9.0f;
+                            const float sw = aspect > stageAspect ? stageAspect / aspect : 1.0f;  // stage width / image width
+                            const float sh = aspect > stageAspect ? 1.0f : aspect / stageAspect;  // stage height / image height
+                            const float top = std::clamp(s.settings.menuWorkshopCropTop, 0.0f, 0.9f);
+                            const float crop[4] = { 0.5f - 0.5f * sw, 0.5f - 0.5f * sh + sh * top, 0.5f + 0.5f * sw, 0.5f + 0.5f * sh };
+                            s.runtime.SetCinemaQuadCrop(crop);
+                            s.workshopCropOn = true;
+                        } else {
+                            s.runtime.SetCinemaQuadCrop(nullptr);
+                            s.workshopCropOn = false;
+                        }
+                    } else if (s.workshopOnHand) {
+                        REX::INFO("workshop hand panel: {} grip pose not valid (controllers active {}) -> the panel in front of you until it returns",
+                            offRight ? "right" : "left", c.active ? 1 : 0);
                     }
                 }
                 if (!handQuad) {
                     s.runtime.SetCinemaQuadOverride(nullptr, 0.0f);
+                    s.runtime.SetCinemaQuadCrop(nullptr);
+                    s.workshopCropOn = false;
+                }
+                if (handQuad != s.workshopOnHand && handQuad) {
+                    float qwl = 0.0f, qhl = 0.0f;
+                    xr::Pose qpl;
+                    s.runtime.CinemaQuadPose(qpl, qwl, qhl);
+                    REX::INFO("workshop hand panel: on the {} hand, {:.2f}x{:.2f} m, build area only {} (stage from v {:.2f}; image aspect {:.3f})",
+                        s.settings.leftHanded ? "right" : "left", qwl, qhl, s.workshopCropOn ? "yes" : "no", s.settings.menuWorkshopCropTop, aspect);
                 }
                 s.workshopOnHand = handQuad;
             }
@@ -936,7 +1080,9 @@ namespace fo4flatvr::present
                             // Menu panel: the FlatScreenModel copy of this frame on the (anchored) cinema quad, alpha-blended
                             // over the live world; pointer + cursor dot as on the flat fallback.
                             bool premul = true;
-                            if (auto* menuTex = static_cast<ID3D11Texture2D*>(hud::MenuPanelTexture(premul))) {
+                            // 20 Nov: FO4VR workshop, build menu minimised with X (ControllerBindings.h) = no panel layer
+                            const bool wsHidden = s.lastPanel == "WorkshopMenu" && bindings::WorkshopPanelHidden();
+                            if (auto* menuTex = static_cast<ID3D11Texture2D*>(hud::MenuPanelTexture(premul)); menuTex && !wsHidden) {
                                 s.runtime.SubmitQuad(s.context, menuptr::PrepareCinema(s.context, menuTex), true, premul);
                             }
                         } else if (vatsWin) {
@@ -1012,12 +1158,24 @@ namespace fo4flatvr::present
                         }
                         s.runtime.SubmitQuad(s.context, menuptr::PrepareCinema(s.context, backBuffer));  // D2: + pointer cursor
                     }
+                    // 20 Nov: VR settings panel (ConfigUI.h) on the top world quad, over menu panels and the flat window
+                    configui::Submit(s.runtime, s.context);
+                    // pointer beam + end dot (PointerBeam.h): over the menus/panels it ends on, below the fade
+                    beam::Submit(s.runtime, s.context);
                     // camera step 1: director fade (black quad over every layer); never over a view-taking menu
                     if (fadeAlpha > 0.0f && s.lastMenu.empty()) {
                         s.runtime.SubmitFade(s.context, fadeAlpha);
                     }
                 }
-                s.runtime.EndFrame();
+                {
+                    LARGE_INTEGER e0{}, e1{};
+                    ::QueryPerformanceCounter(&e0);
+                    s.runtime.EndFrame();
+                    ::QueryPerformanceCounter(&e1);
+                    const double ms = QpcMs(e0, e1);  // pacing diagnostic: time blocked in xrEndFrame
+                    g_pacing.endSum += ms;
+                    g_pacing.endMax = (std::max)(g_pacing.endMax, ms);
+                }
                 s.frameOpen = false;
                 comfort::NoteFrame(vigSent, s.runtime.LastLayerCount(), s.runtime.VignetteUploads());
                 if (!eyeCapStem.empty()) {
@@ -1049,9 +1207,16 @@ namespace fo4flatvr::present
                     ++g_pacing.slow;
                 }
                 if (++g_pacing.n == 600) {
-                    REX::INFO("pacing: frame avg {:.2f} ms max {:.2f} ms; >1.5x period ({:.2f} ms): {}/600; wait avg {:.2f} max {:.2f} ms; {}",
-                        g_pacing.sum / 600.0, g_pacing.max, s.periodMs, g_pacing.slow, g_pacing.waitSum / 600.0, g_pacing.waitMax,
-                        head::PoseSyncStats(true));
+                    const auto& g = g_pacing;
+                    // 20 Nov: gpuq = GPU frame queue at the mark before xrWaitFrame (frames unfinished incl. this one; GpuQueueLimit)
+                    // and the CPU-side waits for it; end = xrEndFrame; present = the real Present after our hook (DXGI throttle)
+                    REX::INFO("pacing: frame avg {:.2f} ms max {:.2f} ms; >1.5x period ({:.2f} ms): {}/600; wait avg {:.2f} max {:.2f} ms; {}; "
+                              "gpuq {} behind avg {:.2f} max {} waits {} avg {:.2f} max {:.2f} ms timeouts {}; end avg {:.2f} max {:.2f} ms; "
+                              "present avg {:.2f} max {:.2f} ms",
+                        g.sum / 600.0, g.max, s.periodMs, g.slow, g.waitSum / 600.0, g.waitMax, head::PoseSyncStats(true),
+                        s.settings.gpuQueueLimit ? std::format("on({})", s.settings.gpuQueueFrames) : std::string("off"),
+                        g.behindN ? g.behindSum / g.behindN : 0.0, g.behindMax, g.gpuWaits, g.gpuWaits ? g.gpuWaitSum / g.gpuWaits : 0.0,
+                        g.gpuWaitMax, g.gpuTimeouts, g.endSum / 600.0, g.endMax, g.presentN ? g.presentSum / g.presentN : 0.0, g.presentMax);
                     g_pacing = Pacing{};
                 }
             }
@@ -1062,10 +1227,30 @@ namespace fo4flatvr::present
                 REX::INFO("XR session state {} -> {}", static_cast<int>(s.lastState), static_cast<int>(st));
                 s.lastState = st;
             }
+            // 22 Nov (hidden-area agent): XR_KHR_visibility_mask mesh -> stereo (HiddenArea.inl) whenever the runtime gave a new one
+            if (s.xrOk) {
+                if (const std::uint64_t ser = s.runtime.VisibilityMaskSerial(); ser != s.hamSerial) {
+                    if (s.hamSerial == ~0ull) {
+                        REX::INFO("OpenXR: XR_KHR_visibility_mask {}", s.runtime.VisibilityMaskSupported() ?
+                            "present (hidden-area mask: [Stereo] bHiddenAreaMask)" : "not offered by the runtime: no hidden-area mask");
+                    }
+                    std::vector<float>         xy[2];
+                    std::vector<std::uint32_t> idx[2];
+                    for (int e = 0; e < 2; ++e) {
+                        s.runtime.VisibilityMask(e, xy[e], idx[e]);
+                    }
+                    stereo::SetHiddenAreaMask(s.runtime.VisibilityMaskSupported(), ser, xy, idx);
+                    s.hamSerial = ser;
+                }
+            }
 
             // 2. Begin the next XR frame now, before the game updates/renders it: xrWaitFrame paces the
             //    game to the headset, and the predicted pose is for the display time of the frame the
             //    game is about to render.
+            // 20 Nov: GPU frame queue bounded before the pose is predicted (GpuQueueLimit; HIGH IMPACT: head-path timing)
+            if (s.xrOk && s.runtime.running()) {
+                GpuQueueLimit(s.device, s.context, s.settings.gpuQueueLimit, s.settings.gpuQueueFrames, s.periodMs);
+            }
             xr::FrameInfo fi;
             LARGE_INTEGER w0{}, w1{};
             ::QueryPerformanceCounter(&w0);
@@ -1091,7 +1276,20 @@ namespace fo4flatvr::present
             }
             // Wrist Pip-Boy: a direct open needs the XR world view; quad pose + pointer from this frame's poses.
             game::SetPipboyWorldViewAvailable(s.xrOk && s.mono && s.runtime.running() && s.submitting);
+            // Pointer beam (PointerBeam.h): this frame's offers start here (Pip-Boy / menu pointer below, world beams at submit).
+            // World beams (FO4VR: workshop / companion command) only while the world view takes hand input.
+            beam::BeginFrame(began && fi.headValid ? &fi.head : nullptr,
+                inputWorld && (!panelNow || s.lastPanel == "WorkshopMenu") && !vatsWin && !s.vatsOverlay && !game::PipboyWristOpen() &&
+                    !(worldView && !panelNow && !s.worldScreen.empty() && s.lastMenu.empty()));
+            {
+                // 20 Nov: VR settings panel (ConfigUI.h): open/close, ray, ImGui frame into its texture; first, so its ray wins
+                DWORD fgPid = 0;
+                ::GetWindowThreadProcessId(::GetForegroundWindow(), &fgPid);
+                configui::UpdateFrame(s.runtime, s.device, s.context, began, began && fi.headValid ? &fi.head : nullptr,
+                    fgPid == ::GetCurrentProcessId());
+            }
             const bool pipPointer = pipboy::UpdateFrame(s.runtime, began, began && fi.headValid ? &fi.head : nullptr);  // head: projected PA Pip-Boy
+            hud::UpdateFrame(s.runtime, began, began && fi.headValid ? &fi.head : nullptr);  // 20 Nov: HUD split (chin compass frame, raise gesture)
             // Menu laser pointer (D2): aim ray onto the cinema quad, which shows the next frame when not in world view.
             // Menu panels use the same (anchored) cinema quad.
             // round 7: terminal on its monitor in the world - the aim ray in the camera-local frame of the camera root on screen
@@ -1116,7 +1314,11 @@ namespace fo4flatvr::present
                 // the pointer targets TerminalMenu (a holotape game on the terminal takes the pad only)
                 menuptr::SetWorldScreen(ok && s.worldScreen == "TerminalMenu", "TerminalMenu", lp, ld, s.settings.unitsPerMeter);
             }
-            const bool menuPointer = menuptr::UpdateFrame(s.runtime, began, (!inputWorld || panelNow || vatsWin) && s.submitting && s.runtime.running());
+            const bool menuPointer = menuptr::UpdateFrame(s.runtime, began,
+                // bSameInputAllViews: on the flat window only while it shows a menu (a CINEMA camera view without one keeps the
+                // gameplay trigger)
+                ((sameInput ? !worldView && (!s.lastMenu.empty() || game::MenuOpen("DialogueMenu")) : !inputWorld) || panelNow || vatsWin) &&
+                    s.submitting && s.runtime.running() && !configui::OwnsPointer());
             dlg::UpdateXr(s.runtime, began);  // dialogue: haptic pulse when the options appear
             if (began) {
                 haptics::Drain(s.runtime);  // gesture pulses + FRIK-flat's Vibrate (Haptics.h)
@@ -1124,7 +1326,10 @@ namespace fo4flatvr::present
             {
                 // VR controllers -> the game's gamepad (Fallout 4 Xbox layout). Inactive (session not
                 // focused, e.g. Quest system menu) maps to a neutral pad.
-                const auto& c = s.runtime.Controllers();
+                // 20 Nov: the VR settings panel keeps its pointing hand's trigger / stick / face buttons (ConfigUI.h)
+                xr::ControllerState cmask = s.runtime.Controllers();
+                configui::MaskControllers(cmask);
+                const auto& c = cmask;
                 pad::State  p;
                 p.active = began && c.active;
                 if (p.active) {
@@ -1132,8 +1337,12 @@ namespace fo4flatvr::present
                     // a menu panel is a menu context (pad navigation, A accept, B back), not gameplay
                     // round 7: a terminal on its monitor is a menu context too (stick/A/B navigate the terminal)
                     // gestures (Gestures.h) run inside Map: they need this frame's head pose and the camera state
-                    bindings::Map(c, { inputWorld && !panelNow && !worldScreenNow, game::PipboyWristOpen(), pipPointer, menuPointer, menuptr::LeftHand(),
-                                         s.settings.leftHanded, began && fi.headValid ? &fi.head : nullptr, s.lastCamState },
+                    // 20 Nov: no view-taking menu / panel / terminal screen and no load, whatever the camera view (gestures in
+                    // every view: CINEMA, third person, SCENE)
+                    const bool noMenu = s.lastMenu.empty() && s.lastPanel.empty() && s.worldScreen.empty() && !s.vatsOverlay &&
+                                        !game::MenuOpen("LoadingMenu") && !game::MenuOpen("MainMenu");
+                    bindings::Map(c, { gameInput && !panelNow && !worldScreenNow, game::PipboyWristOpen(), pipPointer, menuPointer, menuptr::LeftHand(),
+                                         s.settings.leftHanded, began && fi.headValid ? &fi.head : nullptr, s.lastCamState, noMenu },
                         p);
                     if (gestures::TakeRecentre() && s.xrOk) {
                         s.runtime.Recenter();
@@ -1295,8 +1504,8 @@ namespace fo4flatvr::present
                     if (s.xrOk) {
                         s.runtime.CinemaQuadPose(qp, qw, qh);
                     }
-                    return std::format(" wbGeom={} wsHand={} wsHandFrames={} quadPos={:.3f},{:.3f},{:.3f} quadSize={:.2f}x{:.2f} panelGeom='{}' worldScreen='{}' worldScreenFrames={}",
-                        s.workbenchGeometry ? 1 : 0, s.workshopOnHand ? 1 : 0, s.workshopHandFrames, qp.position.x, qp.position.y,
+                    return std::format(" wbGeom={} wsHand={} wsHandFrames={} wsCrop={} quadPos={:.3f},{:.3f},{:.3f} quadSize={:.2f}x{:.2f} panelGeom='{}' worldScreen='{}' worldScreenFrames={}",
+                        s.workbenchGeometry ? 1 : 0, s.workshopOnHand ? 1 : 0, s.workshopHandFrames, s.workshopCropOn ? 1 : 0, qp.position.x, qp.position.y,
                         qp.position.z, qw, qh, s.panelGeometry, s.worldScreen, s.worldScreenFrames);
                 }() +
                 std::format(" panoShown={} panoFailed={} {}", s.panoShown, s.panoFailed, s.xrOk ? s.runtime.PanoramaReport() : std::string{});
@@ -1317,6 +1526,7 @@ namespace fo4flatvr::present
                 head::TraceSetFrame(s->frames.load());
                 game::TraceWorldCamera();  // htrace C: the camera this frame was rendered with (if nothing updated it since)
                 stereo::OnPresent();  // stereo PoC: stats, stereocap write-out, latch the stereo-frame flag
+                dlss::OnPresent();    // 20 Nov: DLSS/NR frame counter, GPU timer read-back, NR toggle key (render thread)
                 std::string capturePath;
                 bool        recenter = false;
                 {
@@ -1370,8 +1580,9 @@ namespace fo4flatvr::present
                 hud::OnPresent(s->hudLayer);
                 dlg::OnPresent(s->hudLayer);  // same gate as the HUD layer: world view, session running, submitting
                 pipboy::OnPresent();
-                game::AimTick();
                 gun::OnPresent();  // floating gun: P vs fire node at Present
+                facediag::OnPresent();  // 20 Nov: facediag dumps + GPU read-backs on the render thread (was an F4SE task: selfie crash)
+                tq::OnPresent();        // 20 Nov: render-thread queue (tq::RunOnRender); game::AimTick moved to the main ticks
                 if (s->frames % 30 == 1) {
                     UpdateStatus(*s);
                 }
@@ -1381,8 +1592,15 @@ namespace fo4flatvr::present
             if (a_this == s->swapChain && s->xrOk && s->runtime.running()) {
                 a_sync = 0;
             }
+            LARGE_INTEGER p0{}, p1{};
+            ::QueryPerformanceCounter(&p0);
             const HRESULT hr = s->original(a_this, a_sync, a_flags);
             if (a_this == s->swapChain && !(a_flags & DXGI_PRESENT_TEST)) {
+                ::QueryPerformanceCounter(&p1);
+                const double ms = QpcMs(p0, p1);  // pacing diagnostic: the real Present (DXGI frame-latency throttle)
+                g_pacing.presentSum += ms;
+                g_pacing.presentMax = (std::max)(g_pacing.presentMax, ms);
+                ++g_pacing.presentN;
                 stereo::AfterPresent();
             }
             return hr;
@@ -1477,5 +1695,60 @@ namespace fo4flatvr::present
     {
         std::scoped_lock l(g_reqLock);
         g_recenterRequested = true;
+    }
+
+    void ApplySettings(const Settings& a_new)
+    {
+        auto* s = g_state;
+        if (!s) {
+            return;
+        }
+        const Settings keep = s->settings;
+        Settings&      n = s->settings;
+        n = a_new;
+        // start-up-only values stay as the Presenter started with them
+        n.enabled = keep.enabled;
+        n.headTracking = keep.headTracking;
+        n.positionTracking = keep.positionTracking;
+        n.mono = keep.mono;
+        n.afr = keep.afr;
+        n.xrRuntimeJson = keep.xrRuntimeJson;
+        n.preferStageSpace = keep.preferStageSpace;
+        n.renderWidth = keep.renderWidth;
+        n.renderHeight = keep.renderHeight;
+        n.renderScale = keep.renderScale;
+        n.stereoSeamAlign = keep.stereoSeamAlign;
+        n.stereoSeamGuard = keep.stereoSeamGuard;
+        n.stereoInstallHooks = keep.stereoInstallHooks;
+        n.stereoShaderDir = keep.stereoShaderDir;
+        n.poseSync = keep.poseSync;
+        n.poseSyncTimeoutMs = keep.poseSyncTimeoutMs;
+        n.headAuthority = keep.headAuthority;
+        n.eyeHeightTauS = keep.eyeHeightTauS;
+        if (n.menuWindowMenus != keep.menuWindowMenus) {
+            g_windowList.clear();  // re-parsed at the top of the next VrFrame
+        }
+        REX::INFO("present: settings re-read (live): leftHanded={} aim={} cinema {:.2f}m@{:.2f}m panel FO4VR={} anchor={} backdrop={}/{:.2f} "
+                  "panorama={} workbench={} workshopOnHand={} geometry overrides={} windowMenus='{}' keys 0x{:X}/0x{:X}/0x{:X}/0x{:X}",
+            n.leftHanded ? 1 : 0, n.aimWithController ? 1 : 0, n.quadWidthMeters, n.quadDistanceMeters, n.menuPanelFO4VR ? 1 : 0,
+            n.menuAnchor ? 1 : 0, n.menuBackdrop ? 1 : 0, n.menuBackdropDim, n.menuBackdropPanorama ? 1 : 0, n.menuWorkbenchPanel ? 1 : 0,
+            n.menuWorkshopOnHand ? 1 : 0, n.menuGeometry.size(), n.menuWindowMenus, n.recenterKey, n.toggleKey, n.cameraCycleKey,
+            n.povToggleKey);
+    }
+
+    void ReloadHotkeys()
+    {
+        auto* s = g_state;
+        if (!s) {
+            return;
+        }
+        const auto p = Settings::Path();
+        auto       rd = [&](const char* k, int d) { return static_cast<int>(::GetPrivateProfileIntA("Keys", k, d, p.c_str())); };
+        s->settings.recenterKey = rd("iRecenter", s->settings.recenterKey);
+        s->settings.toggleKey = rd("iToggle", s->settings.toggleKey);
+        s->settings.cameraCycleKey = rd("iCameraCycle", s->settings.cameraCycleKey);
+        s->settings.povToggleKey = rd("iPovToggle", s->settings.povToggleKey);
+        REX::INFO("hotkeys re-read: recentre 0x{:X} toggle 0x{:X} cycle 0x{:X} pov 0x{:X}", s->settings.recenterKey, s->settings.toggleKey,
+            s->settings.cameraCycleKey, s->settings.povToggleKey);
     }
 }

@@ -2,11 +2,14 @@
 #include <F4SE/F4SE.h>  // CommonLib before any Windows header
 #include <RE/Fallout.h>
 
+#include "plugin/ConfigStore.h"
+#include "plugin/ControllerBindings.h"
 #include "plugin/FloatingGun.h"
 #include "plugin/FrikBridge.h"
 #include "plugin/FrikBridgeApi.h"
 #include "plugin/Gestures.h"
 #include "plugin/Haptics.h"
+#include "plugin/HeadPose.h"
 #include "plugin/Settings.h"
 #include "xr/XrRuntime.h"
 
@@ -18,6 +21,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
@@ -351,14 +355,75 @@ namespace fo4flatvr::frikbridge
             return g_smooth.load() ? 1 : 0;
         }
 
+        // v5: recentre counter (FRIK-flat C36 calibrate-only body height)
+        std::uint32_t RecentreCount() { return head::RecenterCount(); }
+
+        // v6: [General] bNoScaling, re-read at most once a second (any thread)
+        std::atomic<int>                     g_noScaling{ -1 };
+        std::atomic<std::int64_t>            g_noScalingNext{ 0 };
+        std::uint8_t NoScalingC()
+        {
+            const std::int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
+            if (g_noScaling.load(std::memory_order_relaxed) < 0 || now >= g_noScalingNext.load(std::memory_order_relaxed)) {
+                g_noScalingNext.store(now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(1)).count(),
+                    std::memory_order_relaxed);
+                const int v = ::GetPrivateProfileIntA("General", "bNoScaling", 0, IniPath().c_str()) != 0 ? 1 : 0;
+                if (g_noScaling.exchange(v) != v) {
+                    REX::INFO("[FRIK] [General] bNoScaling={}: {}", v,
+                        v ? "the game's default scale (FRIK body scale 1, no PlayerHeight / auto body height / arm-length scaling; 70 units per metre)"
+                          : "our scaling on (FRIK PlayerHeight + C36 calibrated body height, fUnitsPerMeter)");
+                }
+            }
+            return static_cast<std::uint8_t>(g_noScaling.load(std::memory_order_relaxed) > 0 ? 1 : 0);
+        }
+
+        // v6: FRIK.dll's config table (VR settings panel)
+        std::atomic<const FO4FlatVR_FrikConfigApi*> g_cfgApi{ nullptr };
+        void SetFrikConfigApiC(const FO4FlatVR_FrikConfigApi* a_api)
+        {
+            g_cfgApi.store(a_api && a_api->size >= sizeof(FO4FlatVR_FrikConfigApi) ? a_api : nullptr, std::memory_order_release);
+            REX::INFO("[FRIK] FRIK.dll config table {} (VR settings panel FRIK pages)", g_cfgApi.load() ? "registered" : a_api ? "REFUSED (size)" : "cleared");
+        }
+
+        // v7: settings revision (ConfigStore.h)
+        std::uint64_t ConfigRevisionC() { return cfgstore::Revision(); }
+
+        // v8: input claims (ROCK-flat; ControllerBindings.h SetClaims)
+        std::uint8_t SetInputClaimsC(std::uint32_t a_owner, std::uint32_t a_left, std::uint32_t a_right)
+        {
+            return bindings::SetClaims(a_owner, a_left, a_right) ? 1 : 0;
+        }
+
         constexpr FO4FlatVR_FrikBridge kBridge{ FO4FLATVR_FRIK_BRIDGE_VERSION, 0, &GetFrame, &Vibrate, &SetFrikActive, &IniPathC, &SetFrameCallback,
-            &BodyEnabled, &SetCameraOffsetCallback, &GetSelfie };
+            &BodyEnabled, &SetCameraOffsetCallback, &GetSelfie, &RecentreCount, &NoScalingC, &SetFrikConfigApiC, &ConfigRevisionC, &SetInputClaimsC };
     }
 
     bool BodyActive() { return g_frikActive.load(); }
+    const FO4FlatVR_FrikConfigApi* ConfigApi() { return g_cfgApi.load(std::memory_order_acquire); }
+    bool NoScaling() { return NoScalingC() != 0; }
 
     void Install()
     {
+        // 20 Nov (live settings): fUnitsPerMeter goes to FRIK-flat in every frame snapshot (a change applies at the next frame);
+        // bPausedFrame gates the paused-frame hook; bGunStepsAside re-decides the floating gun's role while FRIK is active.
+        // FRIK-flat's own [FRIK] switches follow the bridge v7 settings revision (vrshim iniIntLive).
+        cfgstore::Subscribe("frikbridge", "General/fUnitsPerMeter,FRIK/bPausedFrame,FRIK/bGunStepsAside", [](const cfgstore::Changes& a_ch) {
+            if (a_ch.Has("General", "fUnitsPerMeter")) {
+                char buf[64]{};
+                ::GetPrivateProfileStringA("General", "fUnitsPerMeter", "70", buf, sizeof(buf), IniPath().c_str());
+                const float u = std::strtof(buf, nullptr);
+                g_unitsPerMeter = u > 1.0f ? u : 70.0f;
+                REX::INFO("[FRIK] unitsPerMeter -> {} (live)", g_unitsPerMeter);
+            }
+            if (a_ch.Has("FRIK", "bPausedFrame")) {
+                g_pausedFrame = ::GetPrivateProfileIntA("FRIK", "bPausedFrame", 1, IniPath().c_str()) != 0;
+                REX::INFO("[FRIK] paused frame {} (live{})", g_pausedFrame.load() ? "on" : "off", g_idleHooked ? "" : "; C33E62 not hooked");
+            }
+            if (a_ch.Has("FRIK", "bGunStepsAside") && g_frikActive.load()) {
+                gun::StepAside(false);  // undo a full step-aside first; ApplyGunRole sets the role the switch asks for
+                ApplyGunRole(true);
+            }
+        });
         g_installed = true;
         const bool en = Enabled();
         g_body = en && IniBody();
@@ -376,10 +441,10 @@ namespace fo4flatvr::frikbridge
                 REX::ERROR("[FRIK] C351F3 not hookable: {} - FRIK-flat would get no frame", g_hookWhy);
             }
             // pause-time frame (FO4VR's OnIdle slot): the same callback while the game is paused
+            // 20 Nov (live settings): hooked whatever bPausedFrame says (HkIdleDemote passes through while it is off), so the
+            // switch ("frik paused", the VR panel, the ini) applies live
             g_pausedFrame = ::GetPrivateProfileIntA("FRIK", "bPausedFrame", 1, IniPath().c_str()) != 0;
-            if (!g_pausedFrame.load()) {
-                g_idleWhy = "bPausedFrame=0";
-            } else if (callchain::Hookable(base + kIdleCallSite, base + kDemoteQueuedActors, g_idleWhy)) {
+            if (callchain::Hookable(base + kIdleCallSite, base + kDemoteQueuedActors, g_idleWhy)) {
                 auto& tramp = REL::GetTrampoline();
                 if (tramp.empty()) tramp.create(64);
                 g_origDemote = reinterpret_cast<Demote_t>(tramp.write_call<5>(base + kIdleCallSite, &HkIdleDemote));
@@ -401,6 +466,16 @@ namespace fo4flatvr::frikbridge
 
     void PublishXr(const xr::ControllerState& a_c, const xr::Pose& a_head, bool a_headValid, bool a_worldView, bool a_leftHanded)
     {
+        {  // HeadPose.cpp start-up pose jump re-anchor (logged here: HeadPose has no logger)
+            static unsigned s_seen = 0;
+            float           jm = 0.0f;
+            if (const unsigned n = head::PoseJumpRecentres(&jm); n != s_seen) {
+                s_seen = n;
+                REX::INFO("head: re-anchored on a {:.2f} m head pose jump before any recentre (#{}; runtime placeholder pose; [OpenXR] "
+                          "bRecentreOnPoseJump)",
+                    jm, n);
+            }
+        }
         FO4FlatVR_Frame f{};
         f.size = sizeof(f);
         f.active = a_c.active;
@@ -489,23 +564,44 @@ namespace fo4flatvr::frikbridge
         } else if (a_arg == "paused on" || a_arg == "paused off") {
             g_pausedFrame = a_arg == "paused on";
             REX::INFO("[FRIK] pipe: paused frame {}", g_pausedFrame.load() ? "on" : "off");
+        } else if (a_arg == "noscale") {  // [General] bNoScaling (the VR panel's live row; FRIK re-reads it within 1 s)
+            g_noScalingNext = 0;
+            return std::format("noscale={} (FRIK body: {}; units per metre {}, live)", NoScaling() ? 1 : 0,
+                NoScaling() ? "the game's default scale" : "FRIK PlayerHeight / C36", g_unitsPerMeter);
+        } else if (a_arg == "reread") {  // a [FRIK] key FRIK-flat re-reads by itself (bFrikPipboy): nothing to do here
+            return "FRIK-flat re-reads it within 1 s";
+        } else if (a_arg == "cfg" || a_arg.rfind("cfg ", 0) == 0) {  // FRIK.dll's config table (VR panel FRIK pages)
+            const auto* api = ConfigApi();
+            if (!api) return "frikcfg: none (FRIK.dll not loaded or older than bridge v6)";
+            if (a_arg.size() > 4) {
+                char sec[96]{}, key[96]{};
+                if (sscanf_s(a_arg.c_str() + 4, "%95s %95s", sec, static_cast<unsigned>(sizeof(sec)), key, static_cast<unsigned>(sizeof(key))) == 2) {
+                    char v[256]{};
+                    const bool have = api->Get(sec, key, v, sizeof(v)) != 0;
+                    return std::format("frikcfg {}.{} = {}", sec, key, have ? v : "(not in the file)");
+                }
+            }
+            char st[512]{};
+            api->Status(st, sizeof(st));
+            return st;
         } else if (!a_arg.empty() && a_arg != "status") {
-            return "error: frik [status|smooth on|off|smooth xy on|off|reset|perf|cb on|off|paused on|off]";
+            return "error: frik [status|smooth on|off|smooth xy on|off|reset|perf|cb on|off|paused on|off|noscale|cfg [<Section> <Key>]]";
         }
         return std::format("frik v={} enable={} body={} smooth={} xy={} frikdll={} camcb={} steps={} valid={} off=({:.3f},{:.3f},{:.3f}) maxz={:.3f} "
-                           "maxxy={:.3f} framecb={} frames={} active={} paused={}/{} pausedFrames={} pausedSkipFirst={}",
+                           "maxxy={:.3f} framecb={} frames={} active={} paused={}/{} pausedFrames={} pausedSkipFirst={} noscale={} frikcfg={}",
             FO4FLATVR_FRIK_BRIDGE_VERSION, Enabled() ? 1 : 0, g_body.load() ? 1 : 0, g_smooth.load() ? 1 : 0, g_smoothXY.load() ? 1 : 0,
             ::GetModuleHandleW(L"FRIK.dll") ? 1 : 0, g_camCb.load() ? 1 : 0, g_camSteps.load(), g_camValidSteps.load(),
             g_camX.load(), g_camY.load(), g_camZ.load(), g_camMaxAbsZ.load(), g_camMaxAbsXY.load(), g_frameCb.load() ? 1 : 0,
             g_frameCalls.load(), g_frikActive.load() ? 1 : 0, g_idleHooked ? 1 : 0, g_pausedFrame.load() ? 1 : 0, g_pausedCalls.load(),
-            g_pausedSkipStall.load());
+            g_pausedSkipStall.load(), NoScaling() ? 1 : 0, ConfigApi() ? 1 : 0);
     }
 }
 
 extern "C" __declspec(dllexport) const FO4FlatVR_FrikBridge* FO4FLATVR_GetFrikBridge(std::uint32_t a_version)
 {
     using namespace fo4flatvr::frikbridge;
-    // v4 appends GetSelfie: a v3 FRIK.dll gets the same table (it never reads past v3's fields)
+    // v4 appends GetSelfie, v5 RecentreCount, v6 NoScaling + SetFrikConfigApi, v7 ConfigRevision, v8 SetInputClaims: an older FRIK.dll gets the same table (it never
+    // reads past its own fields)
     if (a_version < FO4FLATVR_FRIK_BRIDGE_MIN_VERSION || a_version > FO4FLATVR_FRIK_BRIDGE_VERSION) {
         REX::WARN("[FRIK] FRIK.dll asked for bridge v{}, have v{}..v{}: FRIK-flat stays dormant", a_version, FO4FLATVR_FRIK_BRIDGE_MIN_VERSION,
             FO4FLATVR_FRIK_BRIDGE_VERSION);

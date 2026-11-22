@@ -77,6 +77,20 @@ namespace fo4flatvr::head
         float      g_targetFov{ 0.0f };
         std::atomic<unsigned> g_recenterCount{ 0 };  // bumped on every re-anchor (roomscale resets on change)
         unsigned long long g_seq{ 0 };   // PublishXr count (g_lock)
+        // Start-up pose jump (19 Nov, user: "the initial height is wrong, too high but a large factor. recalibrating with a
+        // gesture brings you to the right size"): VirtualDesktopXR's first located head pose of a session is a placeholder
+        // (x 0, z 0, yaw 0, y -1.22 / -1.31 / -1.61 / -1.62 m in the user's four logs: `menu quad anchored (shown: 'MainMenu')`),
+        // flagged valid; the next frames carry the tracked head near y 0. The automatic neutral took the placeholder, so the
+        // head offset was +1.2..1.6 m (camera 93 u too high, FRIK body scaled to its 1.45 clamp) until the user recentred.
+        // While the neutral is the automatic one (no explicit Recenter yet), a valid pose that jumps more than
+        // g_jumpM from the previous valid pose (> 35 m/s at 72 Hz: not a head movement) re-anchors. An explicit recentre
+        // ends it, so scripted head steps after a recentre (vremu tests) keep working. [OpenXR] bRecentreOnPoseJump.
+        bool       g_autoNeutral{ true };
+        float      g_jumpM{ 0.5f };     // <= 0: off
+        bool       g_prevValid{ false };
+        Vec3       g_prevP;
+        std::atomic<unsigned> g_jumpRecentres{ 0 };
+        float      g_lastJumpM{ 0.0f };
 
         void RecenterLocked()
         {
@@ -85,6 +99,21 @@ namespace fo4flatvr::head
             g_haveNeutral = true;
             ++g_recenterCount;
         }
+    }
+
+    void SetRecentreOnPoseJump(float a_metres)
+    {
+        std::scoped_lock l(g_lock);
+        g_jumpM = a_metres;
+    }
+
+    unsigned PoseJumpRecentres(float* a_lastJumpM)
+    {
+        std::scoped_lock l(g_lock);
+        if (a_lastJumpM) {
+            *a_lastJumpM = g_lastJumpM;
+        }
+        return g_jumpRecentres.load();
     }
 
     unsigned RecenterCount()
@@ -103,6 +132,19 @@ namespace fo4flatvr::head
         ++g_seq;
         if (a_valid && !g_haveNeutral) {
             RecenterLocked();
+            g_autoNeutral = true;
+        } else if (a_valid && g_autoNeutral && g_jumpM > 0.0f && g_prevValid) {
+            const float dx = g_xrP.x - g_prevP.x, dy = g_xrP.y - g_prevP.y, dz = g_xrP.z - g_prevP.z;
+            const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (d > g_jumpM) {
+                RecenterLocked();  // still the automatic neutral: a later placeholder/tracking jump re-anchors again
+                g_lastJumpM = d;
+                ++g_jumpRecentres;
+            }
+        }
+        if (a_valid) {
+            g_prevP = g_xrP;
+            g_prevValid = true;
         }
     }
 
@@ -111,6 +153,7 @@ namespace fo4flatvr::head
         std::scoped_lock l(g_lock);
         if (g_xrValid) {
             RecenterLocked();
+            g_autoNeutral = false;  // the user's (or a script's) anchor: no automatic re-anchor from now on
         }
     }
 

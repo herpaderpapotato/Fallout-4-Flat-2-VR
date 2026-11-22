@@ -45,7 +45,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 MO2_EXE = r"C:\Modding\MO2\ModOrganizer.exe"
 MO2_INSTANCE = "Fallout 4"                       # global instance
 MO2_DIR = os.path.expandvars(r"%LOCALAPPDATA%\ModOrganizer\Fallout 4")
-MO2_PROFILE = "TestProfile"   # MO2 "test profile": the ONLY profile used for testing (user, 16 Nov); never Default
+MO2_PROFILE = "TestProfileVR"   # 19 Nov (user): TestProfileVR = TestProfile + our VR mods; the ONLY test profile (never Default/TestProfile)
 MO2_EXECUTABLE = "F4SE"                          # custom executable (f4se_loader.exe) in ModOrganizer.ini
 MODS = os.path.join(MO2_DIR, "mods")
 OVERWRITE = os.path.join(MO2_DIR, "overwrite")
@@ -57,13 +57,27 @@ MOD_DIR = os.path.join(MODS, MOD_FO4FLATVR)
 FRIK_MOD_DIR = os.path.join(MODS, MOD_FRIK)
 PLUG = os.path.join(MOD_DIR, "F4SE", "Plugins")            # = Data/F4SE/Plugins in the VFS (fo4flatvr.dll/.ini, flag files)
 FRIK_PLUG = os.path.join(FRIK_MOD_DIR, "F4SE", "Plugins")   # FRIK.dll/.pdb
+MOD_ROCK = "ROCK-flat"
+ROCK_MOD_DIR = os.path.join(MODS, MOD_ROCK)
+ROCK_PLUG = os.path.join(ROCK_MOD_DIR, "F4SE", "Plugins")   # ROCK.dll/.pdb (ROCK-flat, rock-flat/; 21 Nov)
 MOD_INI = os.path.join(PLUG, "fo4flatvr.ini")
 INI_REL = r"F4SE\Plugins\fo4flatvr.ini"
 DEPLOY_BACKUP = os.path.join(ROOT, "work", "deploy-backup")
 BUILD = os.path.join(ROOT, "plugin", "build", "windows", "x64", "releasedbg")
 FRIK_BUILD = os.path.join(ROOT, "frik-flat", "build", "windows", "x64", "releasedbg")
+ROCK_BUILD = os.path.join(ROOT, "rock-flat", "build", "windows", "x64", "releasedbg")
 DOC_SAVES = os.path.expandvars(r"%USERPROFILE%\Documents\My Games\Fallout4\Saves")
 TEST_SAVES = ("vrtest_sanctuary", "vrtest_container")
+
+
+def latest_save():
+    """19 Nov (user): test with the MOST RECENT save in the test profile (the TestNora character). Returns the
+    save name for `console load` (file name without .fos)."""
+    d = os.path.join(PROFILE_DIR, "saves")
+    fos = [f for f in os.listdir(d) if f.lower().endswith(".fos")]
+    if not fos:
+        raise SystemExit(f"no saves in {d}")
+    return os.path.splitext(max(fos, key=lambda f: os.path.getmtime(os.path.join(d, f))))[0]
 
 
 def say(msg):
@@ -174,7 +188,7 @@ def check_base_clean():
         names = os.listdir(BASE_PLUG)
     except OSError:
         return
-    bad = [n for n in names if n.lower() in ("fo4flatvr.dll", "frik.dll")]
+    bad = [n for n in names if n.lower() in ("fo4flatvr.dll", "frik.dll", "rock.dll")]
     if bad:
         raise SystemExit(f"REFUSING: {', '.join(bad)} found in the base game folder {BASE_PLUG}. Since 15 Nov 21:16 the "
                          f"plugins live only in the MO2 mods ({MOD_DIR}, {FRIK_MOD_DIR}); a base copy would load twice or "
@@ -348,9 +362,23 @@ def deploy_plugin(build=BUILD, need=None, tag=""):
     deploy_files([dll, os.path.join(build, "fo4flatvr.pdb")], PLUG, tag)
 
 
+def deploy_mcm(tag=""):
+    """22 Nov: the generated MCM config (plugin/dist/Data/MCM/Config/fo4flatvr) into the fo4flatvr mod. Only the live files:
+    backups next to them (*.old-*, *.bak*) are skipped."""
+    src = os.path.join(ROOT, "plugin", "dist", "Data", "MCM", "Config", "fo4flatvr")
+    files = [os.path.join(src, f) for f in sorted(os.listdir(src))
+             if os.path.isfile(os.path.join(src, f)) and ".old-" not in f and ".bak" not in f]
+    deploy_files(files, os.path.join(MODS, "fo4flatvr", "MCM", "Config", "fo4flatvr"), tag)
+
+
 def deploy_frik(build=FRIK_BUILD, tag=""):
     """FRIK.dll + .pdb into the FRIK-flat mod."""
     deploy_files([os.path.join(build, "FRIK.dll"), os.path.join(build, "FRIK.pdb")], FRIK_PLUG, tag)
+
+
+def deploy_rock(build=ROCK_BUILD, tag=""):
+    """ROCK.dll + .pdb into the ROCK-flat mod (same refusals and backups as deploy_frik)."""
+    deploy_files([os.path.join(build, "ROCK.dll"), os.path.join(build, "ROCK.pdb")], ROCK_PLUG, tag)
 
 
 # -- ini per-line edits (the effective copy in the VFS) -----------------------------------------------------------
@@ -697,7 +725,7 @@ def main():
         print(__doc__)
         return
     # smoke [--no-xr | --steamvr] [--load SAVE]: launch via MO2, load the save, pipe check, where the DLLs came from, quit
-    save = args[args.index("--load") + 1] if "--load" in args else "vrtest_sanctuary"
+    save = args[args.index("--load") + 1] if "--load" in args else latest_save()
     kw = {"no_xr": True} if "--no-xr" in args else ({"runtime_json": STEAMVR_JSON} if "--steamvr" in args else {})
     with Game(**kw) as g:
         g.cmd("status")

@@ -1,6 +1,8 @@
 #pragma once
 // Game window helpers (Win32 only; no RE types).
 
+#include <string>
+
 namespace fo4flatvr::window
 {
     // Put the game window at the bottom of the z-order without activating anything, so the user's
@@ -19,5 +21,12 @@ namespace fo4flatvr::window
     // render targets from those globals. The CreateWindowExA hook rewrites them to this size, so the
     // scene targets and the camera aspect follow the render size. 0 = leave.
     void SetEngineRenderSize(int a_width, int a_height);
+
+    // 20 Nov (live settings): [Window] iWidth / iHeight while the game runs. The window is only a desktop mirror (the render
+    // size is the swapchain's, kept by the ResizeBuffers hook; GetClientRect reports the render size), so its client area
+    // can change at any time: SetWindowPos (async, no activation). The game window is the one CreateWindowExA made, else the
+    // swapchain's output window (SetGameWindow). 0 = leave. Any thread.
+    void SetGameWindow(void* a_hwnd);
+    std::string ResizeClient(int a_clientWidth, int a_clientHeight);
 
 }

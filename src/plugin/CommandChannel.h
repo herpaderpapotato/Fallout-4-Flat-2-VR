@@ -31,7 +31,14 @@
 //   stereoeyecap <stem>  -> next stereo frame: <stem>_bb.bmp (back buffer) + <stem>_eye0/1.bmp (submitted XR eye images)
 //   stereostat           -> stereo status line (per-frame draw statistics go to the log every iLogEveryFrames)
 
+//   cfgui [status|open|close|...] -> VR settings panel (ConfigUI.h); cfg -> settings layers (ConfigStore.h)
+
+#include <string>
+
 namespace fo4flatvr::command
 {
     void Start();
+    // 20 Nov: run one command line in-process (the VR settings panel applies live rows with the pipe's own commands).
+    // Same handlers and reply as the pipe; any thread.
+    std::string Execute(const std::string& a_line);
 }

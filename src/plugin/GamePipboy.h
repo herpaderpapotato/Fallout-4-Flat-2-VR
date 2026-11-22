@@ -60,4 +60,16 @@ namespace fo4flatvr::game
 
     // Pipe "pipboy": game-side line (hooks, wrist state, page/tab, movie viewport, injected events).
     std::string PipboyGameReport();
+
+    // 20 Nov (controls): the PipboyMenu's current page (0 STAT, 1 INV, 2 DATA, 3 MAP, 4 RADIO), -1 = PipboyMenu not open.
+    // Any thread (plain read of the menu's page global).
+    int PipboyPage();
+
+    // 20 Nov (controls, user: "pipboy light hasnt worked"): FO4VR's hold-L-grip Pip-Boy light as the engine does it once
+    // PipboyHandler's hold passes: PlayerCharacter::TogglePipboyLight (D76930: UIPipBoyLightOn/Off sound + ShowPipboyLight +
+    // pad light bar) on the main-idle queue, with PipboyHandler's own gates (fighting controls enabled 1668D20(mgr, 0x40); in
+    // power armour only with the light-override keyword). Logs the light state before / after. False = engine bytes differ
+    // (the caller falls back to the pad B hold). Any thread.
+    bool RequestTogglePipboyLight(const char* a_why);
+    std::string PipboyLightReport();  // pipe "bindings light"
 }

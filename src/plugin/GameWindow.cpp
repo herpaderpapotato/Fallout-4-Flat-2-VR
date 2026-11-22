@@ -5,7 +5,9 @@
 #include <Windows.h>
 #undef ERROR
 
+#include <atomic>
 #include <cstdint>
+#include <format>
 
 
 namespace fo4flatvr::window
@@ -19,6 +21,7 @@ namespace fo4flatvr::window
         bool              g_done = false;
         int               g_renderW = 0, g_renderH = 0;
         constexpr std::uintptr_t kScreenGlobals[4] = { 0x3D87218, 0x3D8721C, 0x3D87220, 0x3D87224 };  // w,h,w,h
+        std::atomic<HWND>        g_hwnd{ nullptr };  // the game window (20 Nov: live [Window] size)
 
         HWND WINAPI HkCreateWindowExA(DWORD a_ex, LPCSTR a_class, LPCSTR a_name, DWORD a_style, int a_x, int a_y,
             int a_w, int a_h, HWND a_parent, HMENU a_menu, HINSTANCE a_inst, LPVOID a_param)
@@ -43,8 +46,10 @@ namespace fo4flatvr::window
                 ::AdjustWindowRectEx(&rc, style, FALSE, a_ex & ~WS_EX_TOPMOST);
                 REX::INFO("game window: '{}' asked {}x{} style {:X}; forcing client {}x{} style {:X}",
                     a_name ? a_name : "?", a_w, a_h, a_style, g_clientW, g_clientH, style);
-                return g_createWindowExA(a_ex & ~WS_EX_TOPMOST, a_class, a_name, style, a_x < 0 ? 0 : a_x,
+                const HWND h = g_createWindowExA(a_ex & ~WS_EX_TOPMOST, a_class, a_name, style, a_x < 0 ? 0 : a_x,
                     a_y < 0 ? 0 : a_y, rc.right - rc.left, rc.bottom - rc.top, a_parent, a_menu, a_inst, a_param);
+                g_hwnd = h;
+                return h;
             }
             return g_createWindowExA(a_ex, a_class, a_name, a_style, a_x, a_y, a_w, a_h, a_parent, a_menu, a_inst, a_param);
         }
@@ -76,6 +81,34 @@ namespace fo4flatvr::window
     {
         g_renderW = a_width;
         g_renderH = a_height;
+    }
+
+    void SetGameWindow(void* a_hwnd)
+    {
+        HWND expected = nullptr;
+        g_hwnd.compare_exchange_strong(expected, static_cast<HWND>(a_hwnd));
+    }
+
+    std::string ResizeClient(int a_clientWidth, int a_clientHeight)
+    {
+        const HWND hwnd = g_hwnd.load();
+        if (a_clientWidth <= 0 || a_clientHeight <= 0) {
+            return "window: size 0 = the game's own; left as it is";
+        }
+        if (!hwnd || !::IsWindow(hwnd)) {
+            return "window: game window not known yet";
+        }
+        const DWORD style = static_cast<DWORD>(::GetWindowLongPtrA(hwnd, GWL_STYLE));
+        const DWORD ex = static_cast<DWORD>(::GetWindowLongPtrA(hwnd, GWL_EXSTYLE));
+        RECT        rc{ 0, 0, a_clientWidth, a_clientHeight };
+        ::AdjustWindowRectEx(&rc, style, FALSE, ex);
+        const BOOL ok = ::SetWindowPos(hwnd, nullptr, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+        g_clientW = a_clientWidth;
+        g_clientH = a_clientHeight;
+        const auto r = std::format("window: client -> {}x{} ({})", a_clientWidth, a_clientHeight, ok ? "SetWindowPos ok" : "SetWindowPos FAILED");
+        REX::INFO("{} (live [Window] size; render size unchanged)", r);
+        return r;
     }
 
     void SendToBack(void* a_hwnd)

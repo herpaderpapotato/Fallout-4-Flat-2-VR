@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
@@ -72,6 +73,7 @@ namespace fo4flatvr::stereo
         bool        keepMonoDepthClip{ true };  // VS twins clamp eye z to [0, w] where mono z was inside (sky / pinned passes)        // eye far plane = x * mono far (StereoMath g_eyeFarScale)
         bool        cutTiled{ false };         // bComputeShaderDeferredTiledLighting:Display (lights -> volume draws)
         bool        saoPixelShader{ true };    // SAO through its PS variant (splittable) instead of the CS variant
+        bool        hiddenAreaMask{ true };    // 22 Nov: lens-hidden area (XR_KHR_visibility_mask) stamped into depth (HiddenArea.inl)
         bool        cutSao{ true };            // SAO off in stereo (FO4VR forces AO off); 0 = per-eye SAO option
         int         forceCuts{ 0 };            // diagnostic: 0 auto (stereo frames only), 1 always, -1 never
     };
@@ -106,6 +108,10 @@ namespace fo4flatvr::stereo
 
     void PublishEyes(const EyeFrame& a_eyes);
 
+    // 22 Nov (hidden-area agent): the runtime's XR_KHR_visibility_mask state and, when a_serial is new, the hidden-triangle
+    // mesh per eye (view-space tangents x, y on z = -1; three indices per triangle). Presenter, after PollEvents.
+    void SetHiddenAreaMask(bool a_extension, std::uint64_t a_serial, const std::vector<float> a_xy[2], const std::vector<std::uint32_t> a_indices[2]);
+
     // Stereo modes with test eyes: horizontal FOV (deg) the world NiCamera needs so that its frustum (aspect =
     // back-buffer aspect a_aspect) contains both synthetic eyes; 0 otherwise.
     float TestEyesRenderHFovDeg(float a_aspect);
@@ -126,6 +132,13 @@ namespace fo4flatvr::stereo
     // VATS camera window (VatsWindow.cpp): set around its own second-camera render so the frame-level hooks (per-eye
     // MV fix, post split, shadow signatures) leave it alone; its draws are gate 0 (own NiCamera) anyway.
     void SetSecondCameraPass(bool a_on);
+    // Engine off-screen renders that are not a view of the world (FaceGen customization textures, 19 Nov black-face fix):
+    // while one runs, no draw is converted whatever camera the gate still holds from the last SetCameraData.
+    // a_mode: 0 bypass (default), 1 pass as before (measure only), 2 force the world-camera gate (diagnostic).
+    void BeginEngineOffscreen();
+    void EndEngineOffscreen();
+    void SetEngineOffscreenMode(int a_mode);
+    std::string EngineOffscreenStatus();
     bool StereoSubmitActive();  // mode 2/3 and a stereo world camera was built for the frame being presented
 
     // Capture render target 0 as it stands after the last converted draw of the next frame (BMP).

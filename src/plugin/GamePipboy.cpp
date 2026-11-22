@@ -3,6 +3,7 @@
 #include "plugin/GameHud.h"
 #include "plugin/GameMenuPointer.h"
 #include "plugin/PipboyLayer.h"
+#include "plugin/ThreadQueues.h"
 
 #include <atomic>
 #include <cmath>
@@ -498,12 +499,122 @@ namespace fo4flatvr::game
         g_last = keep;
         g_lastValid = a_p.onQuad || g_lastValid;
         if (queued && !g_taskPending.exchange(true)) {
-            if (const auto tasks = F4SE::GetTaskInterface()) {
-                tasks->AddUITask([]() { DrainEvents(); });
-            } else {
+            // 20 Nov (threading audit): main-idle queue (ThreadQueues.h: UI thread after UI::AdvanceMenus, before Swap renders
+            // the Pip-Boy); the F4SE UI task ran on job threads too
+            if (!tq::RunOnUI([]() { DrainEvents(); })) {
                 g_taskPending = false;
             }
         }
+    }
+
+    int PipboyPage()
+    {
+        auto* ui = RE::UI::GetSingleton();
+        if (!ui || !ui->GetMenuOpen("PipboyMenu")) {
+            return -1;
+        }
+        const std::uint32_t page = *reinterpret_cast<const std::uint32_t*>(Base() + kPageIndex);
+        return page < 5 ? static_cast<int>(page) : -1;
+    }
+
+    namespace
+    {
+        // Pip-Boy light (flat 1.11.240, read in Ghidra 20 Nov). PipboyHandler::HandleEvent (1077010): Pipboy button held
+        // >= 0.3 s (2F3B0F8) with fighting controls enabled (1668D20(mgr, 0x40)) and, in power armour, the light-override
+        // keyword worn -> TaskQueueInterface::QueueTogglePipboyLight (task 0x67) -> PlayerCharacter::TogglePipboyLight.
+        constexpr std::uintptr_t kTogglePipboyLight = 0xD76930;   // PlayerCharacter::TogglePipboyLight(player)
+        constexpr std::uintptr_t kIsPipboyLightOn = 0xD769A0;     // PlayerCharacter::IsPipboyLightOn(player): player+0xC38 != 0
+        constexpr std::uintptr_t kInputEnabled2 = 0x1668D20;      // BSInputEnableManager (2268249)(mgr, flags)
+        constexpr std::uintptr_t kInputEnableMgr = 0x30E88B0;     // BSInputEnableManager*
+        constexpr std::uintptr_t kLightOverrideKw = 0x374850;     // PowerArmor::GetPipboyLightOverrideKeyword()
+        constexpr std::uintptr_t kWornHasKeyword = 0x507940;      // TESObjectREFR::WornHasKeyword(ref, kw)
+        struct LightCheck
+        {
+            std::uintptr_t rva;
+            std::uint8_t   b[8];
+            const char*    what;
+        };
+        constexpr LightCheck kLightChecks[] = {
+            { kTogglePipboyLight, { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B }, "TogglePipboyLight" },
+            { kIsPipboyLightOn, { 0x48, 0x83, 0xB9, 0x38, 0x0C, 0x00, 0x00, 0x00 }, "IsPipboyLightOn" },
+            { kInputEnabled2, { 0x40, 0x57, 0x41, 0x57, 0x48, 0x83, 0xEC, 0x28 }, "BSInputEnableManager check" },
+            { kLightOverrideKw, { 0x48, 0x8B, 0x05, 0x41, 0x1A, 0xD8, 0x02, 0x48 }, "GetPipboyLightOverrideKeyword" },
+            { kWornHasKeyword, { 0x48, 0x83, 0xEC, 0x58, 0x33, 0xC0, 0x48, 0x89 }, "WornHasKeyword" },
+            { kActorInPowerArmor, { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74 }, "ActorInPowerArmor" },
+        };
+        std::atomic<int>           g_lightOk{ -1 };
+        std::atomic<std::uint64_t> g_lightReq{ 0 }, g_lightToggles{ 0 }, g_lightRefused{ 0 };
+        std::mutex                 g_lightLock;
+        std::string                g_lightLast{ "-" };  // under g_lightLock
+
+        bool LightFnsOk()
+        {
+            int ok = g_lightOk.load();
+            if (ok < 0) {
+                ok = 1;
+                for (const auto& c : kLightChecks) {
+                    if (!BytesMatch(c.rva, c.b, sizeof(c.b), c.what)) ok = 0;
+                }
+                g_lightOk = ok;
+                REX::INFO("pipboy light: engine calls {}", ok ? "verified (direct toggle)" : "differ: the pad B hold is used");
+            }
+            return ok != 0;
+        }
+    }
+
+    bool RequestTogglePipboyLight(const char* a_why)
+    {
+        if (!LightFnsOk()) {
+            return false;
+        }
+        ++g_lightReq;
+        tq::RunOnMain([why = std::string(a_why ? a_why : "")]() {  // main-idle queue: the engine runs it as a main-thread task too
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            if (!player) return;
+            const auto b = Base();
+            void*      mgr = *reinterpret_cast<void**>(b + kInputEnableMgr);
+            using En_t = bool (*)(void*, std::uint32_t);
+            const bool fighting = mgr && reinterpret_cast<En_t>(b + kInputEnabled2)(mgr, 0x40);
+            const bool pa = Fn<ActorBool_t>(kActorInPowerArmor)(player);
+            bool       paKw = true;
+            if (pa) {
+                void* kw = reinterpret_cast<void* (*)()>(b + kLightOverrideKw)();
+                paKw = kw && reinterpret_cast<bool (*)(void*, void*)>(b + kWornHasKeyword)(player, kw);
+            }
+            using On_t = bool (*)(void*);
+            const bool before = reinterpret_cast<On_t>(b + kIsPipboyLightOn)(player);
+            std::string line;
+            if (!fighting || !paKw) {
+                ++g_lightRefused;
+                line = std::format("{}: not toggled (fighting controls {}, power armour {} light keyword {}) light {}", why, fighting ? "on" : "off",
+                    pa ? 1 : 0, paKw ? 1 : 0, before ? "on" : "off");
+            } else {
+                reinterpret_cast<void (*)(void*)>(b + kTogglePipboyLight)(player);
+                ++g_lightToggles;
+                const bool after = reinterpret_cast<On_t>(b + kIsPipboyLightOn)(player);
+                const auto* raw = reinterpret_cast<const std::uint8_t*>(player);
+                line = std::format("{}: TogglePipboyLight light {} -> {} (BSLight {} node {}){}", why, before ? "on" : "off", after ? "on" : "off",
+                    *reinterpret_cast<void* const*>(raw + 0xC38), *reinterpret_cast<void* const*>(raw + 0xC40),
+                    before == after ? " - NO CHANGE: the light form / 3D was not found (ShowPipboyLight made no light)" : "");
+            }
+            REX::INFO("pipboy light: {}", line);
+            std::scoped_lock l(g_lightLock);
+            g_lightLast = std::move(line);
+        });
+        return true;
+    }
+
+    std::string PipboyLightReport()
+    {
+        bool on = false;
+        if (LightFnsOk()) {
+            if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+                on = reinterpret_cast<bool (*)(void*)>(Base() + kIsPipboyLightOn)(player);
+            }
+        }
+        std::scoped_lock l(g_lightLock);
+        return std::format("light engine={} on={} requests={} toggles={} refused={} last: {}", g_lightOk.load(), on ? 1 : 0, g_lightReq.load(),
+            g_lightToggles.load(), g_lightRefused.load(), g_lightLast);
     }
 
     std::string PipboyGameReport()

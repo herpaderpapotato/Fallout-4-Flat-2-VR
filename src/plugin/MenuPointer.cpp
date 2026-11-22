@@ -4,6 +4,7 @@
 #include "plugin/MenuPointer.h"
 #include "plugin/ControllerBindings.h"
 #include "plugin/GameMenuPointer.h"
+#include "plugin/PointerBeam.h"
 #include "plugin/VirtualPad.h"
 #include "xr/XrRuntime.h"
 
@@ -185,6 +186,13 @@ namespace fo4flatvr::menuptr
                     if (u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f) {
                         hit = true;
                         g_u = u, g_v = v, g_dist = t;
+                        // 21 Nov (workshop agent): the cinema quad may show a sub-rectangle of its image (the workshop build
+                        // area on the off hand, XrRuntime::SetCinemaQuadCrop): quad uv -> image uv
+                        float crop[4];
+                        if (!panel && a_rt.CinemaQuadCrop(crop)) {
+                            g_u = crop[0] + u * (crop[2] - crop[0]);
+                            g_v = crop[1] + v * (crop[3] - crop[1]);
+                        }
                         ++g_hits;
                     }
                 }
@@ -192,6 +200,16 @@ namespace fo4flatvr::menuptr
         }
         g_onQuad = hit && !panel && !world;  // PrepareCinema draws the dot only on the cinema image
         g_onPanel = hit && panel;
+        // Pointer beam (PointerBeam.h): while the pointer is live, from the pointing hand to the hit (end dot) or out to the
+        // beam's full length. A terminal on its monitor: the engine pick distance along the same aim ray.
+        if (g_active && (aimOk || world)) {
+            beam::Ray br;
+            br.src = beam::Source::kMenu;
+            br.hit = hit;
+            br.length = g_dist;
+            br.pressed = g_trigDown;
+            beam::Offer(left ? 0 : 1, br);
+        }
         // Trigger with hysteresis; a click must start on the quad.
         const bool wasDown = g_trigDown;
         if (!g_trigDown && trig > 0.6f && hit) {
@@ -245,7 +263,8 @@ namespace fo4flatvr::menuptr
 
     ID3D11Texture2D* PrepareCinema(ID3D11DeviceContext* a_ctx, ID3D11Texture2D* a_bb)
     {
-        if (!a_bb || !a_ctx || !g_active || !g_onQuad || !g_cfg.cursorDot) {
+        // (the pointer beam's end dot replaces this dot, and saves the full-size copy)
+        if (!a_bb || !a_ctx || !g_active || !g_onQuad || !g_cfg.cursorDot || beam::DotReplacesCursor(beam::Source::kMenu)) {
             return a_bb;
         }
         D3D11_TEXTURE2D_DESC sd{};

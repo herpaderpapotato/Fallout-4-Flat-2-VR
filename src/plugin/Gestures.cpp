@@ -5,6 +5,8 @@
 #include <RE/Fallout.h>
 
 #include "plugin/CameraDirector.h"
+#include "plugin/ConfigUI.h"
+#include "plugin/FaceDiag.h"
 #include "plugin/FrikBridge.h"
 #include "plugin/GameBridge.h"
 #include "plugin/GameMenuPointer.h"
@@ -44,9 +46,10 @@ namespace fo4flatvr::gestures
             kRecentre = 2,
             kPov = 3,
             kCycle = 4,
+            kConfig = 5,  // 20 Nov: the VR settings panel (ConfigUI.h), default on right Up+Down
             kActions
         };
-        constexpr const char* kActionNames[kActions] = { "none", "key", "recentre", "pov", "cycle" };
+        constexpr const char* kActionNames[kActions] = { "none", "key", "recentre", "pov", "cycle", "config" };
 
         // Key list of the MCM dropdowns (index -> virtual-key code). APPEND ONLY: the MCM ini stores the index.
         // plugin/tools/gen_mcm_config.py reads the names between the markers for config.json.
@@ -98,11 +101,13 @@ namespace fo4flatvr::gestures
             float cooldownS{ 0.3f };          // fCooldownS (VRIK 0.1)
             float keyHoldMs{ 100.0f };        // fKeyHoldMs
             float buttonDelayS{ 0.5f };       // fButtonDelayS (VRIK 0.5): a game-used click reaches the game after this, held still
+            bool  allViews{ true };           // bAllViews (20 Nov): every camera view, not only the first-person world view
             bool  haptics{ true };            // bHaptics
             float hapticAmp{ 0.5f };          // fHapticAmp
             float hapticS{ 0.06f };           // fHapticS
             // [Selfie]
             bool  selfie{ true };             // bEnabled
+            bool  selfieKeepInMenus{ true };  // bKeepInMenus: pause, Pip-Boy and menus keep it (19 Nov, user: to screenshot it)
             int   selfieHands{ 2 };           // iHands: 0 off hand, 1 main hand, 2 both hands (VRIK selfieModeHands)
             float handsUpCm{ 25.0f };         // fHandsUpCm (VRIK 18 u = 26 cm)
             float holdS{ 0.5f };              // fHoldS (VRIK 4 frames)
@@ -156,6 +161,8 @@ namespace fo4flatvr::gestures
             unsigned          fired[2][kSlots]{}, unassigned{ 0 }, rejected{ 0 }, aborts{ 0 }, keySends{ 0 }, keyNoFocus{ 0 },
                 delayPasses{ 0 }, selfieOn{ 0 }, selfieOff{ 0 }, selfieAutoOff{ 0 };
             std::string       last{ "none" };
+            bool              viewGameplay{ false }, viewAny{ false };  // last frame's Frame::gameplay / anyView (status)
+            int               viewCam{ -1 };
         };
         State g_s;
 
@@ -203,11 +210,12 @@ namespace fo4flatvr::gestures
             int I(const char* s, const char* k, int d) const
             {
                 d = static_cast<int>(::GetPrivateProfileIntA(s, k, d, a.c_str()));
-                return static_cast<int>(::GetPrivateProfileIntA(s, k, d, b.c_str()));
+                return b.empty() ? d : static_cast<int>(::GetPrivateProfileIntA(s, k, d, b.c_str()));
             }
             float F(const char* s, const char* k, float d) const
             {
                 for (const auto* p : { &a, &b }) {
+                    if (p->empty()) continue;  // (an empty path would be win.ini)
                     char buf[64]{};
                     ::GetPrivateProfileStringA(s, k, "", buf, sizeof(buf), p->c_str());
                     if (buf[0]) {
@@ -222,7 +230,9 @@ namespace fo4flatvr::gestures
 
         void Load(State& s)
         {
-            const Reader r{ Settings::Path(), McmPath() };
+            // 20 Nov: Settings::Path() is the merged file (fo4flatvr.ini < MCM < VR-panel previews, ConfigStore.h); reading MCM's
+            // file on top again would hide an unsaved panel preview of a key MCM also has
+            const Reader r{ Settings::Path(), std::string{} };
             Cfg          c;
             c.enabled = r.I("Gestures", "bEnabled", 1) != 0;
             c.hand[0] = r.I("Gestures", "bLeftHand", 0) != 0;
@@ -231,7 +241,9 @@ namespace fo4flatvr::gestures
                 for (int i = 0; i < kSlots; ++i) {
                     const std::string base = std::string("i") + kHandKey[h] + kSlotNames[i];
                     auto& sl = c.slot[h][i];
-                    sl.action = std::clamp(r.I("Gestures", (base + "Action").c_str(), 0), 0, kActions - 1);
+                    // 20 Nov: right Up+Down opens the VR settings panel unless assigned otherwise
+                    const int def = (h == 1 && std::string(kSlotNames[i]) == "UpDown") ? kConfig : kNone;
+                    sl.action = std::clamp(r.I("Gestures", (base + "Action").c_str(), def), 0, kActions - 1);
                     sl.key = std::clamp(r.I("Gestures", (base + "Key").c_str(), 0), 0, kKeyCount - 1);
                     sl.mod = std::clamp(r.I("Gestures", (base + "Mod").c_str(), 0), 0, 3);
                 }
@@ -242,10 +254,12 @@ namespace fo4flatvr::gestures
             c.cooldownS = std::clamp(r.F("Gestures", "fCooldownS", c.cooldownS), 0.0f, 3.0f);
             c.keyHoldMs = std::clamp(r.F("Gestures", "fKeyHoldMs", c.keyHoldMs), 20.0f, 1000.0f);
             c.buttonDelayS = std::clamp(r.F("Gestures", "fButtonDelayS", c.buttonDelayS), 0.1f, 3.0f);
+            c.allViews = r.I("Gestures", "bAllViews", 1) != 0;
             c.haptics = r.I("Gestures", "bHaptics", 1) != 0;
             c.hapticAmp = std::clamp(r.F("Gestures", "fHapticAmp", c.hapticAmp), 0.0f, 1.0f);
             c.hapticS = std::clamp(r.F("Gestures", "fHapticS", c.hapticS), 0.0f, 1.0f);
             c.selfie = r.I("Selfie", "bEnabled", 1) != 0;
+            c.selfieKeepInMenus = r.I("Selfie", "bKeepInMenus", 1) != 0;
             c.selfieHands = std::clamp(r.I("Selfie", "iHands", 2), 0, 2);
             c.handsUpCm = std::clamp(r.F("Selfie", "fHandsUpCm", c.handsUpCm), 5.0f, 80.0f);
             c.holdS = std::clamp(r.F("Selfie", "fHoldS", c.holdS), 0.0f, 5.0f);
@@ -360,11 +374,18 @@ namespace fo4flatvr::gestures
             case kRecentre: s.recentreReq = true; break;
             case kPov:
             case kCycle: {
+                // 20 Nov: gestures run everywhere; only a camera change waits while a load / the main menu is up (no player
+                // camera to switch there)
+                if (auto* ui = RE::UI::GetSingleton(); ui && (ui->GetMenuOpen("LoadingMenu") || ui->GetMenuOpen("MainMenu"))) {
+                    REX::INFO("gestures: camera action skipped (loading / main menu)");
+                    break;
+                }
                 const std::string r = camdir::Command(sl.action == kPov ? "pov" : "cycle");
                 REX::INFO("gestures: camdir {} -> {}", sl.action == kPov ? "pov" : "cycle", r);
-                game::HudMessage("VR: " + r);
+                if (camdir::CallerShouldShow(r)) game::HudMessage("VR: " + r);  // else camdir::PollNotify announces it
                 break;
             }
+            case kConfig: configui::RequestToggle("gesture"); break;
             default: break;
             }
         }
@@ -414,6 +435,10 @@ namespace fo4flatvr::gestures
             Press&     p = s.press[h];
             const bool on = s.cfg.enabled && !s.runtimeOff && s.cfg.hand[h];
             const int  offHand = f.leftHanded ? 1 : 0;  // the hand whose click the game uses (sprint)
+            // 20 Nov (user: "Gestures shouldn't be locked out in a menu or in any scenario"): bAllViews = every context and
+            // camera view, menus included; else first-person gameplay only (as before)
+            const bool allowed = f.gameplay || s.cfg.allViews;
+            const bool delayHand = h == offHand || f.primaryClickToGame;  // this hand's click is also the game's button
             if (!on) {
                 p = Press{};
                 return;
@@ -423,7 +448,7 @@ namespace fo4flatvr::gestures
                 p.down = true;
                 p.t0 = a_now;
                 p.latch = true;
-                p.ignored = !f.gameplay || !a_poseOk || !f.head || a_now < s.cooldownUntil;
+                p.ignored = !allowed || !a_poseOk || !f.head || a_now < s.cooldownUntil;
                 if (!p.ignored) {
                     YawFrame(*f.head, p.fwd, p.right);
                     Local(p, a_hand, *f.head, p.start);
@@ -434,7 +459,7 @@ namespace fo4flatvr::gestures
             if (p.down && a_click) {  // held
                 if (p.ignored || p.aborted || p.passed) return;
                 std::string why;
-                if (!f.gameplay) why = "left gameplay";
+                if (!allowed) why = s.cfg.allViews ? "menu / loading" : "left gameplay";
                 else if (a_grip) why = "grip";
                 else if (a_otherClick) why = "other stick click";
                 else if (!a_poseOk || !f.head) why = "pose lost";
@@ -452,7 +477,7 @@ namespace fo4flatvr::gestures
                     p.maxDist = std::max(p.maxDist, std::abs(p.last[i] - p.start[i]));
                 }
                 // VRIK button delay: the off hand's click (sprint) goes to the game once held still long enough
-                if (h == offHand && std::chrono::duration<float>(a_now - p.t0).count() >= s.cfg.buttonDelayS && p.maxDist <= 0.07f) {
+                if (delayHand && std::chrono::duration<float>(a_now - p.t0).count() >= s.cfg.buttonDelayS && p.maxDist <= 0.07f) {
                     p.passed = true;
                     p.latch = false;  // the press is the game's now (sprint): the stick moves again
                     ++s.delayPasses;
@@ -489,6 +514,9 @@ namespace fo4flatvr::gestures
             g_selfie.yawRad = 0.0f;
             ++g_selfie.seq;
             REX::INFO("gestures: selfie {} ({})", a_on ? "on" : "off", a_why);
+            if (a_on) {
+                facediag::AutoDump("selfie on");  // 19 Nov black-face report: face textures / shader state in the headset session
+            }
         }
         bool SteerAxis(const xr::Pose& a_grip, float o[3])
         {
@@ -509,9 +537,19 @@ namespace fo4flatvr::gestures
                 g_selfie.distanceM = cfg.distanceM;
             }
             const bool frik = frikbridge::BodyActive();
-            // automatic exit: a menu / Pip-Boy, a camera other than first person, FRIK gone, or selfie switched off
-            if (active && (!f.gameplay || f.camState != 0 || !frik || !cfg.selfie || s.runtimeOff)) {
-                SetSelfie(false, !f.gameplay ? "menu" : f.camState != 0 ? "camera change" : !frik ? "FRIK body inactive" : "switched off");
+            // automatic exit: a camera other than first person, a load (LoadingMenu / MainMenu), FRIK gone in gameplay, or selfie
+            // switched off. Pause, Pip-Boy and other menus keep it (19 Nov, user: "the selfie view disappears when I pause or
+            // load a menu, so it's hard to capture"); FRIK keeps placing the body while paused ([FRIK] bPausedFrame).
+            // [Selfie] bKeepInMenus=0: any menu ends it, as before.
+            bool loading = false;
+            if (active) {
+                if (auto* ui = RE::UI::GetSingleton()) {
+                    loading = ui->GetMenuOpen("LoadingMenu") || ui->GetMenuOpen("MainMenu");
+                }
+            }
+            const bool menuExit = !f.gameplay && !cfg.selfieKeepInMenus;
+            if (active && (loading || menuExit || f.camState != 0 || (!frik && f.gameplay) || !cfg.selfie || s.runtimeOff)) {
+                SetSelfie(false, loading ? "load" : menuExit ? "menu" : f.camState != 0 ? "camera change" : !frik ? "FRIK body inactive" : "switched off");
                 ++s.selfieAutoOff;
                 active = false;
                 s.upLatched = false;
@@ -536,8 +574,10 @@ namespace fo4flatvr::gestures
             const xr::Pose& steer = steerHand == 0 ? c.leftGripPose : c.rightGripPose;
 
             if (!s.upLatched) {
-                const bool gate = f.gameplay && f.camState == 0 && frik && a_now - s.lastRecentre > std::chrono::seconds(2) &&
-                                  a_now - s.lastNotGameplay > std::chrono::seconds(2) && a_now >= s.cooldownUntil;
+                // 20 Nov: with bAllViews also in menus / Pip-Boy / dialogue (no lockout); still needs FRIK's body and the
+                // first-person camera (the selfie IS FRIK's mirror body in first person, it ends in any other camera)
+                const bool ctxOk = cfg.allViews || (f.gameplay && a_now - s.lastNotGameplay > std::chrono::seconds(2));
+                const bool gate = ctxOk && f.camState == 0 && frik && a_now - s.lastRecentre > std::chrono::seconds(2) && a_now >= s.cooldownUntil;
                 if (up && gate) {
                     if (s.upFrames++ == 0) s.upSince = a_now;
                     if (std::chrono::duration<float>(a_now - s.upSince).count() >= cfg.holdS && s.upFrames > 3) {
@@ -594,6 +634,7 @@ namespace fo4flatvr::gestures
         Poll(s, now);
         ReleaseKeys(s, now, false);
         if (!a_f.gameplay) s.lastNotGameplay = now;
+        s.viewGameplay = a_f.gameplay, s.viewAny = a_f.anyView, s.viewCam = a_f.camState;
         if (!a_f.c) return;
         const auto& c = *a_f.c;
         const bool  ok = c.active;
@@ -602,6 +643,17 @@ namespace fo4flatvr::gestures
         HandUpdate(s, 1, a_f, ok && c.rightStickClick, ok && c.rightGrip > 0.6f, ok && c.leftStickClick, c.rightStickX, c.rightStickY,
             ok && c.rightGripPoseValid, c.rightGripPose, now);
         SelfieUpdate(s, a_f, now);
+    }
+
+    void AbortPress(int a_hand, const char* a_why)
+    {
+        if (a_hand < 0 || a_hand > 1) return;
+        State& s = g_s;
+        Press& p = s.press[a_hand];
+        if (!p.down || p.ignored || p.aborted || p.passed) return;
+        p.aborted = true;
+        ++s.aborts;
+        s.last = std::format("{} aborted ({})", kHandKey[a_hand], a_why ? a_why : "claimed");
     }
 
     bool StickHeld(int a_hand)
@@ -668,11 +720,12 @@ namespace fo4flatvr::gestures
         for (const auto& hs : s.fired)
             for (unsigned n : hs) fired += n;
         const auto sf = SelfieState();
-        return std::format("gesture enabled={} runtimeOff={} hands L={} R={} move={:.1f}cm dom={:.2f} maxHold={:.2f}s cooldown={:.2f}s "
+        return std::format("gesture enabled={} runtimeOff={} allViews={} (now: gameplay={} anyView={} cam={}) hands L={} R={} move={:.1f}cm dom={:.2f} maxHold={:.2f}s cooldown={:.2f}s "
                            "reloads={} mcmIni={} ({}) | fired={} unassigned={} rejected={} aborts={} keySends={} keyNoFocus={} delayPasses={} "
                            "| last: {} | assigned:{} | selfie cfg={} hands={} active={} follow={} yaw={:.1f}deg dist={:.2f}m on={} off={} autoOff={} "
                            "frikBody={} | {}",
-            s.cfg.enabled ? 1 : 0, s.runtimeOff ? 1 : 0, s.cfg.hand[0] ? 1 : 0, s.cfg.hand[1] ? 1 : 0, s.cfg.moveCm, s.cfg.dominance, s.cfg.maxHoldS,
+            s.cfg.enabled ? 1 : 0, s.runtimeOff ? 1 : 0, s.cfg.allViews ? 1 : 0, s.viewGameplay ? 1 : 0, s.viewAny ? 1 : 0, s.viewCam,
+            s.cfg.hand[0] ? 1 : 0, s.cfg.hand[1] ? 1 : 0, s.cfg.moveCm, s.cfg.dominance, s.cfg.maxHoldS,
             s.cfg.cooldownS, s.reloads, s.mcmExists ? "present" : "absent", McmPath(), fired, s.unassigned, s.rejected, s.aborts, s.keySends,
             s.keyNoFocus, s.delayPasses, s.last, assigned.empty() ? " none" : assigned, s.cfg.selfie ? 1 : 0, s.cfg.selfieHands, sf.active ? 1 : 0,
             sf.follow ? 1 : 0, sf.yawRad * 57.2958f, sf.distanceM, s.selfieOn, s.selfieOff, s.selfieAutoOff, frikbridge::BodyActive() ? 1 : 0,

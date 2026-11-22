@@ -31,11 +31,18 @@ namespace fo4flatvr::game
     bool InstallCameraHook();
     void SetUnitsPerMeter(float a_units);  // head position scale, default 70
     void SetHeightOffsetCm(float a_cm);    // added to camera height while head tracking is on
+    // 20 Nov (camera agent, [Camera] bBodyCamera): the first-person eye above the capsule as head authority last had it
+    // (low-passed camera node z - capsule z, units; < 0 = never sampled) and the height offset in units.
+    void FirstPersonEye(float& a_eyeHeightUnits, float& a_heightOffsetUnits);
     // Head authority (user design 14 Nov): in first person the camera is built from the capsule (data.location),
     // a low-passed game eye height and the head offset, instead of the game's animated camera node, so body
     // turns, animation bob and idle sway cannot move the view. a_tauS = eye-height smoothing time constant.
     void SetHeadAuthority(bool a_on, float a_tauS);
     bool HeadAuthority();
+    // 20 Nov: with head authority, the eye height steps at once when the player's sneak flag flips (FO4VR) instead of
+    // following the game's gradual sneak camera blend + the low-pass. [Roomscale] bSneakHeightStep; pipe "sneakstep [on|off]".
+    void        SetSneakHeightStep(bool a_on);
+    std::string SneakStepCommand(const std::string& a_arg);
     // Head authority: the first-person rig fit (PlayerCharacter::UpdateActor3DPosition D7C430 -> Get1stPersonCameraPosition,
     // caller D7C9CD) gets the raw (vanilla) translation instead of the head-authority one. The engine sets the rig root from
     // (camera - Camera bone world of the previous frame) without the previous root, so a camera that does not follow the
@@ -97,8 +104,11 @@ namespace fo4flatvr::game
     // ---- Controller aim ([Controllers] bAimWithController) -----------------------------------
     // Code patches, installed once at plugin load (before the game runs), each byte-verified first
     // (mismatch = logged and skipped):
-    //  F1  detour of Projectile::SetOriginAndDirection (rva E42EA0): player shots (not VATS, not
-    //      grenades/mines) get origin = hand P and angles from hand D, useOrigin = 1.
+    //  F1  detour of Projectile::SetOriginAndDirection (rva E42EA0): player shots (not VATS) get origin =
+    //      hand P and angles from hand D, useOrigin = 1. Grenades/mines (WEAP type 10/11) get the angles
+    //      only (game throw origin kept), while ConfigureAimThrows is on.
+    //  throw preview: calls D8265A/D82668/D828B3 in PerkUtilities::CalculateGrenadeTrajectory (D825F0)
+    //      return the hand's pitch/heading (same switch), so the perk arc matches the throw.
     //  A1  call D70D0D (PlayerCharacter::UpdatePickRef -> ViewCaster::UpdatePickRef 994B80): the
     //      activation ray (origin, dir) is replaced with (P, D).
     //  diag call 47A096 (TESObjectWEAP::Fire -> Projectile::Launch E421E0): records the player's
@@ -113,12 +123,13 @@ namespace fo4flatvr::game
     std::string InstallNoSpread(bool a_on, bool a_pellets);
     // pipe: nospread [status|on|off|pellets on|off|reset|hist] (hist = per projectile: deviation deg, pellets, zeroed)
     std::string NoSpreadCommand(const std::string& a_arg);
+    void        SetNoSpread(bool a_on, bool a_pellets);  // 20 Nov (live settings): [Weapon] bNoSpread / bNoSpreadPellets
     bool        AimEnabled();
     // Debug knob: how a camera-local vector is taken to world. 0 = local axis i is NiMatrix3 row i
     // (what the engine itself does: SetOriginAndDirection reads camera-root row 1 as forward), 1 = column i.
     void SetAimConvention(int a_conv);
     // Aim follow-ups ([Controllers] bHandLineOfFire, bSuppressCameraRecoil, bHandAutoAimOverride,
-    // bClampHandToCamera). Call before InstallAimHooks: a feature that is off at load is not patched.
+    // bClampHandToCamera). Since 20 Nov every follow-up is installed with the aim hooks and gated at runtime (live).
     //  F3  detour GetLineOfFireData (DA6640): gun-blocked lowering / cover iron-sight tests use the hand ray.
     //  F4  call D5AC41 (ModifyMovementData -> AimModel::ApplyAimAdjust): recoil no longer turns the
     //      player's view while the hand ray is live (spread / cone growth unchanged).
@@ -128,7 +139,10 @@ namespace fo4flatvr::game
     //  clamp: no patch; camera -> P segment test with CalculatePickHitFraction (DA6400) every frame,
     //      P moved to just before the hit.
     void        ConfigureAimExtras(bool a_lineOfFire, bool a_suppressRecoil, bool a_autoAimOverride, bool a_clamp);
-    // Pipe "aim lof|recoil|autoaim|clamp on|off" (runtime; only if installed at load).
+    // [Controllers] bAimThrowsWithController (default 1): grenade/mine throws follow the primary controller's pointing
+    // direction (pitch included). Runtime: pipe "aim throw on|off".
+    void        ConfigureAimThrows(bool a_on);
+    // Pipe "aim lof|recoil|autoaim|clamp|throw on|off" (runtime; only if installed at load).
     std::string SetAimFeature(const std::string& a_name, bool a_on);
     // Pipe "aim probe": next AimTick casts 24 horizontal rays from the camera (report: probe='...').
     void        RequestAimProbe();
@@ -142,6 +156,21 @@ namespace fo4flatvr::game
     // ViewCaster::UpdatePickRef uses the primary hand ray (0) or the off hand's aim ray (1, gun::OffHandAim).
     // PickRuns: how many pick updates have used that hand's ray (ControllerBindings waits for one before activating).
     void SetPickHand(int a_hand);
+    // Pointer beam (PointerBeam.h), Present thread: distance (m) along the primary hand ray to the first collision
+    // (CalculatePickHitFraction, the wall-clamp test), at most a_maxM; a_hit = something within a_maxM. False when there is
+    // no fresh hand ray, no game world or the test is unavailable.
+    bool HandRayWorldHit(float a_maxM, float& a_distM, bool& a_hit);
+    // 21 Nov (workshop agent, WorkshopHand.h): the primary hand ray in world units (origin = the wall-clamped hand point the
+    // pick and the shots use, unit direction). Any thread; false when there is no fresh, valid ray (no XR frame within 200 ms,
+    // not first person / iron sights, hand > 1 m from the camera).
+    bool HandRayWorld(float a_origin[3], float a_dir[3]);
+    // FO4VR activation preview geometry for the primary hand ray: length (m) = FO4VR's reach a_reachM (longer when pointing
+    // down, a_floorMult), clamped at the first hit; a_target = the hand-ray activation pick has a ref (then the ray runs to
+    // its hit, up to a_maxM). False without a fresh hand ray / game world.
+    bool ActivatePreview(float a_reachM, float a_floorMult, float a_maxM, float& a_lenM, bool& a_target);
+    // FO4VR's wand-laser modes: 1 = workshop mode (Workshop::QEnabled), 2 = commanding a companion
+    // (PlayerCharacter::GetActorDoingPlayerCommand), 0 = neither.
+    int BeamWorldMode();
     // Floating gun (FO4VR kickback / recoil on the wand chain): the player's AimModel recoil target (+0x68/+0x6C) and
     // spring offset (+0x70/+0x74), radians, as of the last ApplyAimAdjust (F4 hook; false if not hooked or stale);
     // the number of player projectile launches so far (TESObjectWEAP::Fire -> Projectile::Launch).

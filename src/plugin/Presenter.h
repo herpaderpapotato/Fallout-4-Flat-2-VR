@@ -29,5 +29,12 @@ namespace fo4flatvr::present
 
     // Thread-safe. Applied on the next frame.
     void RequestRecenter();
+    // 20 Nov (VR settings panel): re-read [Keys] iRecenter / iToggle / iCameraCycle / iPovToggle from Settings::Path().
+    void ReloadHotkeys();
+    // 20 Nov (live settings, ConfigStore.h): take the runtime values of a freshly read Settings (menu / panel / cinema
+    // geometry, [MenuGeometry], sWindowMenus, hotkeys, handedness, controller aim, fMaxFov, fUnitsPerMeter) into the
+    // Presenter's own copy. Present thread only (the settings dispatch at the start of the Presenter's frame). Start-up-only
+    // values (XR runtime, reference space, start mode, render size, stereo install, pose sync) are kept.
+    void ApplySettings(const Settings& a_new);
     void RequestMode(int a_mode);  // 0 cinema quad, 1 mono world view, 2 alternate-eye stereo
 }

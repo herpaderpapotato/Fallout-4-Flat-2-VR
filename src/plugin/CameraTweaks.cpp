@@ -16,6 +16,9 @@ namespace fo4flatvr::game::camtweak
     {
         std::atomic<bool> g_noAimZoom{ true }, g_fpDialogue{ true }, g_noKillCams{ true }, g_noIdleOrbit{ true };
         std::atomic<bool> g_settingsDirty{ true };
+        // 20 Nov ([Camera] bLockFirstPerson, CameraDirector.h): the first-person lock forces the dialogue / kill-cam / idle-orbit
+        // groups on, whatever their own switches say; the switches are kept and apply again when the lock is off
+        std::atomic<bool> g_forced{ false };
         std::atomic<bool> g_dataReady{ false };  // GMSTs come from the ESM: apply only after kGameDataReady
         std::mutex        g_lock;  // tweak table (main thread writes, pipe thread reports)
 
@@ -61,9 +64,9 @@ namespace fo4flatvr::game::camtweak
         bool GroupOn(Group g)
         {
             switch (g) {
-            case Group::kDialogue: return g_fpDialogue.load();
-            case Group::kKillCams: return g_noKillCams.load();
-            case Group::kIdleOrbit: return g_noIdleOrbit.load();
+            case Group::kDialogue: return g_fpDialogue.load() || g_forced.load();
+            case Group::kKillCams: return g_noKillCams.load() || g_forced.load();
+            case Group::kIdleOrbit: return g_noIdleOrbit.load() || g_forced.load();
             }
             return false;
         }
@@ -205,6 +208,15 @@ namespace fo4flatvr::game::camtweak
             a_cfg.firstPersonDialogue ? 1 : 0, a_cfg.noKillCams ? 1 : 0, a_cfg.noIdleOrbit ? 1 : 0);
     }
 
+    void SetForced(bool a_on)
+    {
+        if (g_forced.exchange(a_on) != a_on) {
+            g_settingsDirty = true;
+            REX::INFO("camera tweaks: first-person lock {} (dialogue camera off, kill cams off, idle orbit off {})", a_on ? "on" : "off",
+                a_on ? "forced" : "back to their own switches");
+        }
+    }
+
     Config Current()
     {
         return { g_noAimZoom.load(), g_fpDialogue.load(), g_noKillCams.load(), g_noIdleOrbit.load() };
@@ -276,7 +288,7 @@ namespace fo4flatvr::game::camtweak
                 REX::INFO("camera tweaks: adjustFOV restored ({})", a_worldView ? "bNoAimZoom off" : "left world view");
             }
         }
-        if (g_noIdleOrbit.load() && cam->allowAutoVanityMode) {
+        if ((g_noIdleOrbit.load() || g_forced.load()) && cam->allowAutoVanityMode) {
             cam->allowAutoVanityMode = false;  // StopDialogue/Furniture/Mount/AnimatedMode and LoadGame put it back
             if (++g_vanityClears <= 5) {
                 REX::INFO("camera tweaks: allowAutoVanityMode cleared");
@@ -314,8 +326,9 @@ namespace fo4flatvr::game::camtweak
             }
             REX::INFO("camcfg {}", a_arg);
         }
-        std::string s = std::format("noAimZoom={} fpDialogue={} noKillCams={} noIdleOrbit={} worldView={}", g_noAimZoom.load() ? 1 : 0,
-            g_fpDialogue.load() ? 1 : 0, g_noKillCams.load() ? 1 : 0, g_noIdleOrbit.load() ? 1 : 0, g_lastWorldView.load() ? 1 : 0);
+        std::string s = std::format("noAimZoom={} fpDialogue={} noKillCams={} noIdleOrbit={} forcedByLock={} worldView={}", g_noAimZoom.load() ? 1 : 0,
+            g_fpDialogue.load() ? 1 : 0, g_noKillCams.load() ? 1 : 0, g_noIdleOrbit.load() ? 1 : 0, g_forced.load() ? 1 : 0,
+            g_lastWorldView.load() ? 1 : 0);
         {
             std::scoped_lock l(g_lock);
             for (const auto& t : g_tweaks) {

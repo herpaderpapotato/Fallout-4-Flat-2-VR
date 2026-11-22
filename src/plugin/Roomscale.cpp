@@ -2,6 +2,7 @@
 
 #include "plugin/GameBridge.h"
 #include "plugin/HeadPose.h"
+#include "plugin/ConfigStore.h"
 #include "plugin/Settings.h"
 
 #include <F4SE/F4SE.h>
@@ -765,8 +766,66 @@ namespace fo4flatvr::rs
         }
     }
 
+    namespace
+    {
+        // 20 Nov (live settings, ConfigStore.h): the [Roomscale] tuning keys that changed (and fUnitsPerMeter), under the lock.
+        // Restart-only: [Camera] bOwnHeading (the first-person yaw owner: switching it re-anchors the view; head-smoothness
+        // rule, A/B through "rs cfg own"), [Roomscale] bHeadAuthority / fEyeHeightSmoothS (GameBridge, first-person camera
+        // source / eye-height filter).
+        void ReloadLive(const cfgstore::Changes& a_ch)
+        {
+            const auto path = Settings::Path();
+            auto rd = [&](const char* sec, const char* k, float d) {
+                char buf[64]{};
+                ::GetPrivateProfileStringA(sec, k, "", buf, sizeof(buf), path.c_str());
+                char*       end = nullptr;
+                const float v = std::strtof(buf, &end);
+                return end != buf ? v : d;
+            };
+            std::scoped_lock l(g_lock);
+            Cfg&        c = g_cfg;
+            const Cfg   d{};
+            std::string what;
+            auto F = [&](const char* k, float& v, float def) {
+                if (!a_ch.Has("Roomscale", k)) return;
+                v = rd("Roomscale", k, def);
+                what += std::format(" {}={}", k, v);
+            };
+            auto B = [&](const char* k, bool& v, bool def) {
+                if (!a_ch.Has("Roomscale", k)) return;
+                v = rd("Roomscale", k, def ? 1.0f : 0.0f) != 0.0f;
+                what += std::format(" {}={}", k, v ? 1 : 0);
+            };
+            B("bRoomscale", c.roomscale, d.roomscale);
+            B("bBodyFollowsHead", c.bodyFollows, d.bodyFollows);
+            B("bNoCameraSpring", c.noSpring, d.noSpring);  // the spring patch follows it every update (SetSpring)
+            F("fDeadzoneCm", c.deadzoneCm, d.deadzoneCm);
+            F("fStopCm", c.stopCm, d.stopCm);
+            F("fMaxResidualCm", c.maxResidualCm, d.maxResidualCm);
+            F("fHardMaxResidualCm", c.hardMaxCm, d.hardMaxCm);
+            F("fMaxSpeed", c.maxSpeed, d.maxSpeed);
+            F("fGain", c.gain, d.gain);
+            F("fBodyYawThresholdDeg", c.yawThresholdDeg, d.yawThresholdDeg);
+            F("fBodyYawRateDeg", c.yawRateDeg, d.yawRateDeg);
+            B("bAttributeOverDelivery", c.attributeLeftover, d.attributeLeftover);
+            F("fAttributionWindowS", c.attrWindowS, d.attrWindowS);
+            if (a_ch.Has("Roomscale", "iCameraFeedbackFix")) {
+                g_tfix = std::clamp(static_cast<int>(rd("Roomscale", "iCameraFeedbackFix", 1.0f)), 0, 2);
+                what += std::format(" iCameraFeedbackFix={}", g_tfix.load());
+            }
+            if (a_ch.Has("General", "fUnitsPerMeter")) {
+                const float u = rd("General", "fUnitsPerMeter", 70.0f);
+                c.unitsPerMeter = u > 1.0f ? u : 70.0f;
+                what += std::format(" unitsPerMeter={}", c.unitsPerMeter);
+            }
+            if (!what.empty()) REX::INFO("roomscale: settings re-read (live):{}", what);
+        }
+    }
+
     std::string Install()
     {
+        static std::once_flag s_sub;
+        std::call_once(s_sub, [] { cfgstore::Subscribe("roomscale", "Roomscale,General/fUnitsPerMeter", &ReloadLive); });
         std::scoped_lock l(g_lock);
         if (g_installed) {
             return "already installed";

@@ -3,6 +3,7 @@
 
 #include "plugin/HudLayer.h"
 #include "plugin/GameHud.h"
+#include "plugin/Settings.h"
 #include "xr/XrRuntime.h"
 
 #include <Windows.h>
@@ -13,7 +14,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <mutex>
@@ -709,6 +713,476 @@ float4 ps(float4 pos : SV_Position) : SV_Target
         }
     }
 
+
+    // ---- FO4VR HUD split (HudLayer.h SplitConfig) -------------------------------------------------------------------
+    namespace
+    {
+        enum Piece : int { kPieceHp = 0, kPieceRight = 1, kPieceCompass = 2, kPieceCount = 3 };
+        struct Rect01
+        {
+            float u0{ 0 }, v0{ 0 }, u1{ 0 }, v1{ 0 };
+            bool  valid{ false };
+        };
+        std::mutex  g_splitLock;  // g_split, g_rect01, g_head*, g_splitLine
+        SplitConfig g_split;
+        Rect01      g_rect01[kPieceCount];
+        xr::Pose    g_head{};
+        bool        g_headValid{ false };
+        float       g_aniso{ 1.0f };  // stage -> target sx / sy (game::HudSplitTick)
+
+        // present thread only
+        struct PxRect
+        {
+            int x{ 0 }, y{ 0 }, w{ 0 }, h{ 0 };
+        };
+        ComPtr<ID3D11Texture2D> g_atlas, g_zero;
+        D3D11_TEXTURE2D_DESC    g_atlasDesc{}, g_zeroDesc{};
+        float                   g_slideU = 0.0f;  // VRIK compassOffset.z (game units, 0 = shown .. -50 = hidden)
+        bool                    g_compassWant = true;
+        std::chrono::steady_clock::time_point g_lastFrame{};
+        std::atomic<std::uint64_t> g_pieceFrames{ 0 }, g_handFrames{ 0 }, g_compassFrames{ 0 }, g_atlasBuilds{ 0 }, g_compassToggles{ 0 };
+        std::string             g_splitLine{ "no frame yet" };
+
+        UINT BytesPerPixel(DXGI_FORMAT f)
+        {
+            switch (f) {
+            case DXGI_FORMAT_R16G16B16A16_FLOAT:
+            case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+            case DXGI_FORMAT_R16G16B16A16_UNORM: return 8;
+            case DXGI_FORMAT_R32G32B32A32_FLOAT:
+            case DXGI_FORMAT_R32G32B32A32_TYPELESS: return 16;
+            default: return 4;
+            }
+        }
+
+        // a_w x a_h in a_fmt, zero-filled (transparent black), default usage, SRV (the XR stage copy reads it)
+        bool MakeZeroed(ComPtr<ID3D11Texture2D>& a_tex, D3D11_TEXTURE2D_DESC& a_desc, UINT a_w, UINT a_h, DXGI_FORMAT a_fmt, const char* a_what)
+        {
+            if (a_tex && a_desc.Width == a_w && a_desc.Height == a_h && a_desc.Format == a_fmt) {
+                return true;
+            }
+            a_tex.Reset();
+            a_desc = {};
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = a_w;
+            td.Height = a_h;
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = a_fmt;
+            td.SampleDesc = { 1, 0 };
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            const UINT                bpp = BytesPerPixel(a_fmt);
+            std::vector<std::uint8_t> zeros(static_cast<std::size_t>(a_w) * a_h * bpp, 0);
+            D3D11_SUBRESOURCE_DATA    init{ zeros.data(), a_w * bpp, 0 };
+            if (!g_dev || FAILED(g_dev->CreateTexture2D(&td, &init, &a_tex))) {
+                REX::ERROR("hud split: {} texture {}x{} fmt {} creation failed", a_what, a_w, a_h, static_cast<int>(a_fmt));
+                a_tex.Reset();
+                return false;
+            }
+            a_desc = td;
+            REX::INFO("hud split: {} texture {}x{} fmt {}", a_what, a_w, a_h, static_cast<int>(a_fmt));
+            return true;
+        }
+
+        xr::Quat QMul(const xr::Quat& a, const xr::Quat& b)
+        {
+            return { a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+                a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z };
+        }
+        xr::Vec3 QRot(const xr::Quat& q, const xr::Vec3& v)
+        {
+            const xr::Quat p{ v.x, v.y, v.z, 0.0f };
+            const xr::Quat r = QMul(QMul(q, p), { -q.x, -q.y, -q.z, q.w });
+            return { r.x, r.y, r.z };
+        }
+
+        // Per hand. Mode 3 = VRIK's rule (VrikBody::setupState 18000F4C0, hideCompass 2/3): the palm normal's world-up component
+        // > 0.65, no height, no timing. OpenXR grip: +X is out of the left palm and into the right palm -> palm normal +X (left),
+        // -X (right). Mode 2 (default, the user's spec "raises hands, not high"): the grip between fCompassRaiseHighM and
+        // fCompassRaiseLowM below the eyes.
+        bool HandShows(const SplitConfig& a_c, const xr::Pose& a_head, const xr::Pose& a_grip, bool a_left)
+        {
+            if (a_c.compassShow == 3) {
+                const xr::Vec3 n = QRot(a_grip.orientation, { a_left ? 1.0f : -1.0f, 0.0f, 0.0f });
+                return n.y > a_c.palmUpDot;
+            }
+            const float below = a_head.position.y - a_grip.position.y;  // the reference space is gravity-aligned (+Y up)
+            return below <= a_c.raiseLowM && below >= a_c.raiseHighM;
+        }
+
+        // Upright head frame (FO4VR UprightHmdNode): head position, yaw only. Looking far down, the yaw comes from the head's
+        // up vector, blended in as VRIK does for its HMD direction (factor clamp(-4 f.y - 2.5, 0, 1)).
+        xr::Quat UprightYaw(const xr::Pose& a_head)
+        {
+            const xr::Vec3 f = QRot(a_head.orientation, { 0.0f, 0.0f, -1.0f });
+            const xr::Vec3 u = QRot(a_head.orientation, { 0.0f, 1.0f, 0.0f });
+            const float    t = std::clamp(-f.y * 4.0f - 2.5f, 0.0f, 1.0f);
+            const float    dx = f.x * (1.0f - t) + u.x * t, dz = f.z * (1.0f - t) + u.z * t;
+            const float    yaw = (std::abs(dx) + std::abs(dz) > 1e-5f) ? std::atan2(-dx, -dz) : 0.0f;
+            return { 0.0f, std::sin(yaw * 0.5f), 0.0f, std::cos(yaw * 0.5f) };
+        }
+
+        bool  ReadIniBool(const char* a_k, bool a_d) { return ::GetPrivateProfileIntA("HUD", a_k, a_d ? 1 : 0, Settings::Path().c_str()) != 0; }
+        int   ReadIniInt(const char* a_k, int a_d) { return static_cast<int>(::GetPrivateProfileIntA("HUD", a_k, a_d, Settings::Path().c_str())); }
+        float ReadIniFloat(const char* a_k, float a_d)
+        {
+            char buf[64]{};
+            ::GetPrivateProfileStringA("HUD", a_k, "", buf, sizeof(buf), Settings::Path().c_str());
+            if (!buf[0]) {
+                return a_d;
+            }
+            char*       end = nullptr;
+            const float v = std::strtof(buf, &end);
+            return end != buf ? v : a_d;
+        }
+
+        // ini key -> field; the start-up load and the live "hud set" share it
+        struct SplitKey
+        {
+            const char* name;
+            int         kind;  // 0 bool, 1 int, 2 float
+            std::size_t off;
+        };
+        const SplitKey kSplitKeys[] = {
+            { "bHandHud", 0, offsetof(SplitConfig, handHud) },
+            { "fHandHudWidthM", 2, offsetof(SplitConfig, handWidthM) },
+            { "fHandHudX", 2, offsetof(SplitConfig, handX) },
+            { "fHandHudY", 2, offsetof(SplitConfig, handY) },
+            { "fHandHudZ", 2, offsetof(SplitConfig, handZ) },
+            { "fHandHudPitchDeg", 2, offsetof(SplitConfig, handPitchDeg) },
+            { "bCompassChin", 0, offsetof(SplitConfig, compassSplit) },
+            { "fCompassDistanceM", 2, offsetof(SplitConfig, compassDistM) },
+            { "fCompassHeightM", 2, offsetof(SplitConfig, compassHeightM) },
+            { "fCompassWidthM", 2, offsetof(SplitConfig, compassWidthM) },
+            { "iCompassShow", 1, offsetof(SplitConfig, compassShow) },
+            { "iCompassHand", 1, offsetof(SplitConfig, compassHand) },
+            { "fCompassRaiseLowM", 2, offsetof(SplitConfig, raiseLowM) },
+            { "fCompassRaiseHighM", 2, offsetof(SplitConfig, raiseHighM) },
+            { "fCompassPalmUpDot", 2, offsetof(SplitConfig, palmUpDot) },
+            { "fCompassSlideM", 2, offsetof(SplitConfig, slideM) },
+            { "fCompassSlideRate", 2, offsetof(SplitConfig, slideRate) },
+        };
+
+        std::string SplitConfigLine(const SplitConfig& c)
+        {
+            return std::format("hand={} w={:.3f} off={:.3f},{:.3f},{:.3f} pitch={:.0f} | compass chin={} d={:.2f} h={:.2f} w={:.2f} show={} hand={} "
+                               "raise {:.2f}..{:.2f} palm>{:.2f} slide {:.2f} m rate {:.1f}",
+                c.handHud ? 1 : 0, c.handWidthM, c.handX, c.handY, c.handZ, c.handPitchDeg, c.compassSplit ? 1 : 0, c.compassDistM,
+                c.compassHeightM, c.compassWidthM, c.compassShow, c.compassHand, c.raiseHighM, c.raiseLowM, c.palmUpDot, c.slideM,
+                c.slideRate);
+        }
+    }
+
+    void ConfigureSplit(const SplitConfig& a_cfg)
+    {
+        std::scoped_lock l(g_splitLock);
+        g_split = a_cfg;
+    }
+
+    SplitConfig GetSplitConfig()
+    {
+        std::scoped_lock l(g_splitLock);
+        return g_split;
+    }
+
+    void LoadSplitConfig()
+    {
+        SplitConfig c;
+        for (const auto& k : kSplitKeys) {
+            auto* p = reinterpret_cast<std::uint8_t*>(&c) + k.off;
+            if (k.kind == 0) {
+                *reinterpret_cast<bool*>(p) = ReadIniBool(k.name, *reinterpret_cast<bool*>(p));
+            } else if (k.kind == 1) {
+                *reinterpret_cast<int*>(p) = ReadIniInt(k.name, *reinterpret_cast<int*>(p));
+            } else {
+                *reinterpret_cast<float*>(p) = ReadIniFloat(k.name, *reinterpret_cast<float*>(p));
+            }
+        }
+        c.leftHanded = ::GetPrivateProfileIntA("Controllers", "bLeftHanded", 0, Settings::Path().c_str()) != 0;
+        ConfigureSplit(c);
+        REX::INFO("hud split (FO4VR HUD placement): {} leftHanded={}", SplitConfigLine(c), c.leftHanded ? 1 : 0);
+    }
+
+    std::string SetSplitValue(const std::string& a_key, const std::string& a_value)
+    {
+        for (const auto& k : kSplitKeys) {
+            if (_stricmp(k.name, a_key.c_str()) != 0) {
+                continue;
+            }
+            float v = 0.0f;
+            if (_stricmp(a_value.c_str(), "on") == 0 || _stricmp(a_value.c_str(), "true") == 0) {
+                v = 1.0f;
+            } else if (_stricmp(a_value.c_str(), "off") == 0 || _stricmp(a_value.c_str(), "false") == 0) {
+                v = 0.0f;
+            } else {
+                char* end = nullptr;
+                v = std::strtof(a_value.c_str(), &end);
+                if (end == a_value.c_str()) {
+                    return "error: hud set " + a_key + ": not a value: '" + a_value + "'";
+                }
+            }
+            SplitConfig c = GetSplitConfig();
+            auto*       p = reinterpret_cast<std::uint8_t*>(&c) + k.off;
+            if (k.kind == 0) {
+                *reinterpret_cast<bool*>(p) = v != 0.0f;
+            } else if (k.kind == 1) {
+                *reinterpret_cast<int*>(p) = static_cast<int>(std::lround(v));
+            } else {
+                *reinterpret_cast<float*>(p) = v;
+            }
+            ConfigureSplit(c);
+            REX::INFO("hud split: {} = {} (live)", k.name, a_value);
+            return "hud split " + SplitConfigLine(c);
+        }
+        std::string keys;
+        for (const auto& k : kSplitKeys) {
+            keys += std::string(keys.empty() ? "" : " ") + k.name;
+        }
+        return "error: hud set: unknown key '" + a_key + "' (keys: " + keys + ")";
+    }
+
+    void SetPieceRect(int a_piece, float a_u0, float a_v0, float a_u1, float a_v1, bool a_valid)
+    {
+        if (a_piece < 0 || a_piece >= kPieceCount) {
+            return;
+        }
+        std::scoped_lock l(g_splitLock);
+        g_rect01[a_piece] = { a_u0, a_v0, a_u1, a_v1, a_valid && a_u1 > a_u0 && a_v1 > a_v0 };
+    }
+
+    void SetPieceAniso(float a_sxOverSy)
+    {
+        std::scoped_lock l(g_splitLock);
+        g_aniso = a_sxOverSy > 0.1f && a_sxOverSy < 10.0f ? a_sxOverSy : 1.0f;
+    }
+
+    bool SplitWanted()
+    {
+        const SplitConfig c = GetSplitConfig();
+        return g_enabled.load() && (c.handHud || c.compassSplit || c.compassShow != 0);
+    }
+
+    void UpdateFrame(xr::Runtime& a_rt, bool a_began, const xr::Pose* a_head)
+    {
+        (void)a_rt;
+        std::scoped_lock l(g_splitLock);
+        g_headValid = a_began && a_head;
+        if (g_headValid) {
+            g_head = *a_head;
+        }
+    }
+
+    namespace
+    {
+        // Cuts this frame's pieces out of the HUD copy a_hud into g_atlas (their rectangles are then cleared in a_hud, so the
+        // head-locked HUD quad no longer shows them) and queues them. Present thread, before the main HUD quad is submitted.
+        // Returns the number of piece layers queued.
+        int SubmitSplit(xr::Runtime& a_rt, ID3D11DeviceContext* a_ctx, Copy& a_hud, bool a_premul)
+        {
+            SplitConfig c;
+            Rect01      r01[kPieceCount];
+            xr::Pose    head;
+            bool        headOk;
+            float       aniso = 1.0f;
+            {
+                std::scoped_lock l(g_splitLock);
+                c = g_split;
+                for (int i = 0; i < kPieceCount; ++i) {
+                    r01[i] = g_rect01[i];
+                }
+                head = g_head;
+                headOk = g_headValid;
+                aniso = g_aniso;
+            }
+            const auto  now = std::chrono::steady_clock::now();
+            const float dt = g_lastFrame.time_since_epoch().count() ? std::clamp(std::chrono::duration<float>(now - g_lastFrame).count(), 0.0f, 0.05f)
+                                                                    : 0.0f;  // VRIK clamps its frame time to 0.05 s too
+            g_lastFrame = now;
+            const auto& ctl = a_rt.Controllers();
+
+            // compass visibility (VRIK: decided every frame, no debounce; the slide smooths it)
+            bool want = g_compassWant;
+            if (c.compassShow == 0) {
+                want = true;
+            } else if (c.compassShow == 1) {
+                want = false;
+            } else if (headOk && ctl.active) {
+                bool any = false, seen = false;
+                if (c.compassHand != 2 && ctl.leftGripPoseValid) {
+                    seen = true;
+                    any = any || HandShows(c, head, ctl.leftGripPose, true);
+                }
+                if (c.compassHand != 1 && ctl.rightGripPoseValid) {
+                    seen = true;
+                    any = any || HandShows(c, head, ctl.rightGripPose, false);
+                }
+                if (seen) {
+                    want = any;  // VRIK: hands not tracked keep the last state
+                }
+            }
+            if (want != g_compassWant) {
+                ++g_compassToggles;
+            }
+            g_compassWant = want;
+            // VRIK VrikBody::showHideControllers 18000EFB0: z += dt * 10 * (z - 1) * (hidden ? +1 : -1), clamped to [-50, 0]
+            g_slideU = std::clamp(g_slideU + dt * c.slideRate * (g_slideU - 1.0f) * (want ? -1.0f : 1.0f), -50.0f, 0.0f);
+            if (c.compassShow == 0) {
+                g_slideU = 0.0f;
+            } else if (c.compassShow == 1) {
+                g_slideU = -50.0f;
+            }
+            const bool compassVisible = g_slideU > -50.0f;
+
+            const UINT W = a_hud.desc.Width, H = a_hud.desc.Height;
+            auto       px = [&](const Rect01& r) {
+                PxRect p;
+                if (!r.valid || !W || !H) {
+                    return p;
+                }
+                const int x0 = std::clamp(static_cast<int>(std::floor(r.u0 * W)), 0, static_cast<int>(W));
+                const int y0 = std::clamp(static_cast<int>(std::floor(r.v0 * H)), 0, static_cast<int>(H));
+                const int x1 = std::clamp(static_cast<int>(std::ceil(r.u1 * W)), 0, static_cast<int>(W));
+                const int y1 = std::clamp(static_cast<int>(std::ceil(r.v1 * H)), 0, static_cast<int>(H));
+                p = { x0, y0, x1 - x0, y1 - y0 };
+                return p;
+            };
+            const PxRect hp = px(r01[kPieceHp]), rt = px(r01[kPieceRight]), cp = px(r01[kPieceCompass]);
+
+            // hand: the aim hand's aim pose (FO4VR: PrimaryUIAttachNode under PrimaryWandNode)
+            const bool  leftAim = c.leftHanded;
+            const bool  aimOk = ctl.active && (leftAim ? ctl.leftAimValid : ctl.rightAimValid);
+            const auto& aim = leftAim ? ctl.leftAim : ctl.rightAim;
+            const bool  handOn = c.handHud && aimOk && (hp.w > 0 || rt.w > 0);
+            const bool  compassMask = cp.w > 0 && (c.compassSplit || !compassVisible);
+            const bool  compassOn = c.compassSplit && cp.w > 0 && compassVisible && headOk;
+            if (!handOn && !compassMask) {
+                return 0;
+            }
+
+            // atlas layout: row 0 = [HP | right meters], bottom-aligned, 4 px apart; row 1 = compass
+            const int gap = 4;
+            const int hpW = handOn ? hp.w : 0, rtW = handOn ? rt.w : 0;
+            const int row0H = handOn ? (std::max)(hpW ? hp.h : 0, rtW ? rt.h : 0) : 0;
+            const int row0W = hpW + rtW + (hpW && rtW ? gap : 0);
+            const int dyC = row0H + (row0H && compassOn ? gap : 0);
+            const int aw = (std::max)({ row0W, compassOn ? cp.w : 0, 1 });
+            const int ah = (std::max)(dyC + (compassOn ? cp.h : 0), 1);
+            // the atlas only grows (64 px steps), so small layout changes do not reallocate it
+            if (!g_atlas || g_atlasDesc.Format != a_hud.desc.Format || g_atlasDesc.Width < static_cast<UINT>(aw) ||
+                g_atlasDesc.Height < static_cast<UINT>(ah)) {
+                const UINT nw = (std::max)(static_cast<UINT>((aw + 63) & ~63), g_atlasDesc.Format == a_hud.desc.Format ? g_atlasDesc.Width : 0u);
+                const UINT nh = (std::max)(static_cast<UINT>((ah + 63) & ~63), g_atlasDesc.Format == a_hud.desc.Format ? g_atlasDesc.Height : 0u);
+                if (!MakeZeroed(g_atlas, g_atlasDesc, nw, nh, a_hud.desc.Format, "piece atlas")) {
+                    return 0;
+                }
+                ++g_atlasBuilds;
+            }
+            const int maskW = (std::max)({ hp.w, rt.w, cp.w, 1 }), maskH = (std::max)({ hp.h, rt.h, cp.h, 1 });
+            if (!g_zero || g_zeroDesc.Format != a_hud.desc.Format || g_zeroDesc.Width < static_cast<UINT>(maskW) ||
+                g_zeroDesc.Height < static_cast<UINT>(maskH)) {
+                if (!MakeZeroed(g_zero, g_zeroDesc, static_cast<UINT>((maskW + 63) & ~63), static_cast<UINT>((maskH + 63) & ~63), a_hud.desc.Format,
+                        "mask")) {
+                    return 0;
+                }
+            }
+            // clear the used atlas area (pieces change size: no stale pixels in the gaps)
+            {
+                const UINT zw = (std::min)(g_zeroDesc.Width, g_atlasDesc.Width), zh = (std::min)(g_zeroDesc.Height, g_atlasDesc.Height);
+                for (UINT y = 0; y < static_cast<UINT>(ah); y += zh) {
+                    for (UINT x = 0; x < static_cast<UINT>(aw); x += zw) {
+                        const D3D11_BOX zb{ 0, 0, 0, (std::min)(zw, g_atlasDesc.Width - x), (std::min)(zh, g_atlasDesc.Height - y), 1 };
+                        a_ctx->CopySubresourceRegion(g_atlas.Get(), 0, x, y, 0, g_zero.Get(), 0, &zb);
+                    }
+                }
+            }
+            auto cut = [&](const PxRect& r, int a_dx, int a_dy) {
+                if (r.w <= 0 || r.h <= 0) {
+                    return;
+                }
+                const D3D11_BOX b{ static_cast<UINT>(r.x), static_cast<UINT>(r.y), 0, static_cast<UINT>(r.x + r.w), static_cast<UINT>(r.y + r.h), 1 };
+                if (a_dx >= 0) {
+                    a_ctx->CopySubresourceRegion(g_atlas.Get(), 0, static_cast<UINT>(a_dx), static_cast<UINT>(a_dy), 0, a_hud.tex.Get(), 0, &b);
+                }
+                const D3D11_BOX zb{ 0, 0, 0, static_cast<UINT>(r.w), static_cast<UINT>(r.h), 1 };
+                a_ctx->CopySubresourceRegion(a_hud.tex.Get(), 0, static_cast<UINT>(r.x), static_cast<UINT>(r.y), 0, g_zero.Get(), 0, &zb);
+            };
+            xr::Runtime::HudPiece pieces[2];
+            int                   n = 0;
+            // stage px -> target px may be anisotropic (ExactFit over a non-16:9 viewport): the quad height undoes it (stage aspect)
+            const float stretch = aniso;
+            if (handOn) {
+                cut(hp, 0, row0H - hp.h);
+                cut(rt, hpW + (hpW && rtW ? gap : 0), row0H - rt.h);
+                auto& p = pieces[n++];
+                p.x = 0, p.y = 0, p.w = row0W, p.h = row0H;
+                p.inView = false;
+                p.widthMeters = c.handWidthM;
+                p.heightMeters = c.handWidthM * static_cast<float>(row0H) / static_cast<float>((std::max)(row0W, 1)) * stretch;
+                // aim pose: -Z along the ray, +Y up, +X right; the quad shows its +Z side = back toward the user
+                const float    half = c.handPitchDeg * 0.5f * 0.0174532925f;
+                const xr::Quat tilt{ -std::sin(half), 0.0f, 0.0f, std::cos(half) };
+                const xr::Vec3 off = QRot(aim.orientation, { leftAim ? -c.handX : c.handX, c.handY, c.handZ });
+                p.pose.orientation = QMul(aim.orientation, tilt);
+                p.pose.position = { aim.position.x + off.x, aim.position.y + off.y, aim.position.z + off.z };
+                ++g_handFrames;
+            }
+            if (compassMask) {
+                cut(cp, compassOn ? 0 : -1, dyC);
+                if (compassOn) {
+                    auto& p = pieces[n++];
+                    p.x = 0, p.y = dyC, p.w = cp.w, p.h = cp.h;
+                    p.inView = false;
+                    p.widthMeters = c.compassWidthM;
+                    p.heightMeters = c.compassWidthM * static_cast<float>(cp.h) / static_cast<float>(cp.w) * stretch;
+                    // FO4VR world_HMD_status.nif compass_panel on UprightHmdNode, facing the eye; VRIK's slide moves it down
+                    const xr::Quat qy = UprightYaw(head);
+                    const float    h = c.compassHeightM, d = c.compassDistM;
+                    const float    tilt = std::atan2(h, d);
+                    const xr::Quat qx{ std::sin(tilt * 0.5f), 0.0f, 0.0f, std::cos(tilt * 0.5f) };
+                    const float    slide = g_slideU / 50.0f * c.slideM;  // 0 .. -slideM
+                    const xr::Vec3 o = QRot(qy, { 0.0f, h + slide, -d });
+                    p.pose.orientation = QMul(qy, qx);
+                    p.pose.position = { head.position.x + o.x, head.position.y + o.y, head.position.z + o.z };
+                    ++g_compassFrames;
+                }
+            }
+            if (n > 0 && a_rt.SubmitHudPieces(a_ctx, g_atlas.Get(), pieces, n, a_premul)) {
+                ++g_pieceFrames;
+            }
+            {
+                std::scoped_lock l(g_splitLock);
+                g_splitLine = std::format("this frame: hand {} compass {} | px hp {}x{}@{},{} right {}x{}@{},{} compass {}x{}@{},{} (HUD copy {}x{}) atlas {}x{}",
+                    handOn ? 1 : 0, compassOn ? "1" : compassMask ? "masked" : "0", hp.w, hp.h, hp.x, hp.y, rt.w, rt.h, rt.x, rt.y, cp.w, cp.h, cp.x, cp.y, W,
+                    H, g_atlasDesc.Width, g_atlasDesc.Height);
+            }
+            return n;
+        }
+    }
+
+    std::string SplitStatus()
+    {
+        const SplitConfig c = GetSplitConfig();
+        std::string       line;
+        Rect01            r[kPieceCount];
+        {
+            std::scoped_lock l(g_splitLock);
+            line = g_splitLine;
+            for (int i = 0; i < kPieceCount; ++i) {
+                r[i] = g_rect01[i];
+            }
+        }
+        std::string                  rects;
+        static constexpr const char* kNames[] = { "hp", "right", "compass" };
+        for (int i = 0; i < kPieceCount; ++i) {
+            rects += r[i].valid ? std::format(" {}=[{:.3f},{:.3f}..{:.3f},{:.3f}]", kNames[i], r[i].u0, r[i].v0, r[i].u1, r[i].v1)
+                                : std::format(" {}=none", kNames[i]);
+        }
+        return std::format("split {} | rects{} | pieceFrames={} handFrames={} compassFrames={} compassWant={} slide={:.1f}u toggles={} atlasBuilds={} | {}",
+            SplitConfigLine(c), rects, g_pieceFrames.load(), g_handFrames.load(), g_compassFrames.load(), g_compassWant ? 1 : 0, g_slideU,
+            g_compassToggles.load(), g_atlasBuilds.load(), line);
+    }
+
     void Configure(const Config& a_cfg)
     {
         {
@@ -804,6 +1278,11 @@ float4 ps(float4 pos : SV_Position) : SV_Target
             std::scoped_lock l(g_lock);
             d = g_cfg.distanceMeters, w = g_cfg.widthMeters, h = g_cfg.heightMeters;
         }
+        // FO4VR HUD split (meters on the aim hand, compass on the chin panel): cut out of this frame's copy before it is shown.
+        // Not in power armour (FO4VR's PA helmet HUD carries them there; the PA dash composite keeps the whole HUD).
+        if (hudFresh && !paFresh) {
+            SubmitSplit(a_rt, a_ctx, g_copy[Index(g_source.load())], g_premultiplied.load());
+        }
         // Power armour: the dash captured this frame goes under the HUD in one premultiplied texture.
         ID3D11Texture2D* shown = hudFresh ? c.tex.Get() : nullptr;
         bool             premul = g_premultiplied.load();
@@ -858,6 +1337,7 @@ float4 ps(float4 pos : SV_Position) : SV_Target
         g_pvB.fresh = g_pvW.fresh = false;
         g_layerActive = a_layerNext && g_enabled.load() && game::HudHooksInstalled();
         game::HudFrameworkTick();  // HUDFramework widget guard / layout log (no-op without HUDFramework)
+        game::HudSplitTick();      // FO4VR HUD split: clip rectangles (no-op with every piece off)
     }
 
     void ConfigurePowerArmor(bool a_hudOnLayer, bool a_hideRain)

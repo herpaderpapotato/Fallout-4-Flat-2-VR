@@ -89,6 +89,12 @@ namespace fo4flatvr::game
     // First open menu (top of the stack first) drawn by "FlatScreenModel" (flags 0x8000) other than ButtonBarMenu, or
     // "" - in the world view such a menu would otherwise be drawn screen-space into the double-wide stereo frame.
     std::string FlatOverlayMenu();
+    // 20 Nov: top mod / F4SE menu (IMenu vtable outside Fallout4.exe; or named in [Menus] sPanelMenus) drawn by FlatScreenModel
+    // (0x8000) that takes input (any-menu pointer test), not in [Menus] sNoPanelMenus, or "". The Presenter puts it on the
+    // anchored menu panel (Silhouette's picker, SAM, F4SE CustomMenu menus). Logs each menu once. [Menus] bPanelModMenus.
+    std::string ModPanelMenu();
+    void        SetModPanelMenus(int a_on);  // pipe "menupanel modmenus on|off|ini": live override (-1 = ini)
+    void        ReloadPointerSettings();     // 20 Nov (live settings): [Menus] bPointerAnyMenu / bPanelModMenus / sPanelMenus / sNoPanelMenus read again
 
     // Menus with kUsesBlurredBackground (0x400000: PauseMenu, VATSMenu) raise UI+0x1F8 [measured: 1 with PauseMenu or
     // VATSMenu open, 0 with the Pip-Boy (flag absent)], and the frame then shows a blurred copy of the scene taken when

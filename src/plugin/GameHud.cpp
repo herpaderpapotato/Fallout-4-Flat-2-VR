@@ -3,6 +3,7 @@
 #include "plugin/Dialogue.h"
 #include "plugin/PipboyLayer.h"
 #include "plugin/Settings.h"
+#include "plugin/ThreadQueues.h"
 
 #include <algorithm>
 #include <atomic>
@@ -13,12 +14,16 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <vector>
 
 #include <F4SE/F4SE.h>
 #include <RE/Fallout.h>
+#include <Scaleform/G/GFx_MovieDef.h>
 #include <Scaleform/G/GFx_Viewport.h>
 
 #include <Windows.h>
+#include <d3d11.h>
 #undef ERROR
 
 namespace fo4flatvr::game
@@ -105,13 +110,38 @@ namespace fo4flatvr::game
         std::mutex                 g_seenLock;
         std::string                g_seen;  // renderer names seen at H2 (render order of the first frame each appeared)
 
-        void NoteRenderer(const char* a_name)
+        bool RtViews(std::uint32_t a_id, void*& a_tex, void*& a_rtv);
+        bool RtViewsOrFrameBuffer(std::uint32_t a_id, void*& a_tex, void*& a_rtv);
+
+        // 22 Nov (workshop agent): the first sighting also logs the destination render target id and whether its views map
+        // (WorkshopMenu3D, the workshop build bar's item icons, draws in RenderAll pass 1 from Swap into target 0)
+        void NoteRenderer(const char* a_name, std::uint32_t a_dest)
         {
             std::scoped_lock l(g_seenLock);
             const std::string tag = std::string(" ") + a_name + " ";
             if ((" " + g_seen + " ").find(tag) == std::string::npos && g_seen.size() < 600) {
                 g_seen += (g_seen.empty() ? "" : " ") + std::string(a_name);
-                REX::INFO("hud H2: renderer '{}' seen", a_name);
+                void* tex = nullptr;
+                void* rtv = nullptr;
+                const bool ok = RtViewsOrFrameBuffer(a_dest, tex, rtv);
+                UINT w = 0, h = 0, smp = 0;
+                if (ok) {
+                    D3D11_TEXTURE2D_DESC d{};
+                    static_cast<ID3D11Texture2D*>(tex)->GetDesc(&d);
+                    w = d.Width, h = d.Height, smp = d.SampleDesc.Count;
+                }
+                std::uint32_t handle = 0xFFFFFFFF;
+                const void *swTex = nullptr, *swRtv = nullptr, *swChain = nullptr;
+                if (auto* rtm = RE::BSGraphics::RenderTargetManager::GetSingleton(); rtm && a_dest < 101) {
+                    handle = *reinterpret_cast<const std::uint32_t*>(reinterpret_cast<const std::uint8_t*>(rtm) + kRtHandleOffset + 4 * a_dest);
+                }
+                if (auto* data = RE::BSGraphics::GetRendererData()) {
+                    swTex = data->renderWindow[0].swapChainRenderTarget.texture;
+                    swRtv = data->renderWindow[0].swapChainRenderTarget.rtView;
+                    swChain = data->renderWindow[0].swapChain;
+                }
+                REX::INFO("hud H2: renderer '{}' seen (destination target 0x{:X} handle {}: views {} {}x{} samples {}; window 0 swap chain {} tex {} rtv {})",
+                    a_name, a_dest, static_cast<int>(handle), ok ? "ok" : tex ? "no RTV" : "none", w, h, smp, swChain, swTex, swRtv);
             }
         }
 
@@ -130,6 +160,47 @@ namespace fo4flatvr::game
             a_tex = data->renderTargets[handle].texture;
             a_rtv = data->renderTargets[handle].rtView;
             return a_tex && a_rtv;
+        }
+
+        // 22 Nov (workshop agent): target id 0 has no pooled handle (-1); SetCurrentRenderTarget then binds the main window's
+        // swap-chain target. WorkshopMenu3D (the workshop build bar: item icons on WorkshopMenuGlass.nif, screen-attached,
+        // RenderAll pass 1 from Swap C334DD) draws there - RtViews failed, so the icons went screen-space into the world
+        // image (bottom of the double-wide stereo frame, below the view) instead of onto the hand panel.
+        bool RtViewsOrFrameBuffer(std::uint32_t a_id, void*& a_tex, void*& a_rtv)
+        {
+            if (RtViews(a_id, a_tex, a_rtv)) {
+                return true;
+            }
+            auto* rtm = RE::BSGraphics::RenderTargetManager::GetSingleton();
+            auto* data = RE::BSGraphics::GetRendererData();
+            if (a_id != 0 || !rtm || !data) {
+                return false;
+            }
+            // measured 22 Nov (no-XR, Sanctuary workshop): id 0 -> handle 0, renderTargets[0] without views; window 0's
+            // swap-chain target has an RTV but no texture pointer -> the texture from the RTV's resource
+            const auto handle = *reinterpret_cast<const std::uint32_t*>(reinterpret_cast<const std::uint8_t*>(rtm) + kRtHandleOffset);
+            void* rtvp = handle < 101 ? static_cast<void*>(data->renderTargets[handle].rtView) : nullptr;
+            if (!rtvp) {
+                rtvp = data->renderWindow[0].swapChainRenderTarget.rtView;
+            }
+            if (!rtvp) {
+                return false;
+            }
+            ID3D11Resource* res = nullptr;
+            static_cast<ID3D11RenderTargetView*>(rtvp)->GetResource(&res);
+            if (!res) {
+                return false;
+            }
+            ID3D11Texture2D* t2d = nullptr;
+            res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&t2d));
+            res->Release();
+            if (!t2d) {
+                return false;
+            }
+            t2d->Release();  // the swap chain keeps the buffer alive; we only borrow the pointer for this draw
+            a_tex = t2d;
+            a_rtv = rtvp;
+            return true;
         }
 
         void* g_flatRtv[2]{};  // render thread: RTVs of 0x3E / 0x3F during the last FlatScreenModel draw (H1)
@@ -222,7 +293,7 @@ namespace fo4flatvr::game
                 return;
             }
             const char* name = RendererName(a_renderer);
-            NoteRenderer(name);
+            NoteRenderer(name, a_dest);
             if (_stricmp(name, "FlatScreenModel") == 0) {
                 if (dlg::SkipWorldFlat()) {  // dialogue options on their own panel
                     dlg::NoteWorldFlatSkipped();
@@ -240,11 +311,18 @@ namespace fo4flatvr::game
                 void*     tex = nullptr;
                 void*     rtv = nullptr;
                 PaDrawCtx ctx{ a_renderer, a_dest };
-                if (RtViews(a_dest, tex, rtv) && hud::CaptureMenuPreview(name, tex, rtv, [](void* p) {
+                const bool views = RtViewsOrFrameBuffer(a_dest, tex, rtv);
+                if (views && hud::CaptureMenuPreview(name, tex, rtv, [](void* p) {
                         const auto* c = static_cast<const PaDrawCtx*>(p);
                         g_origRenderMain(c->renderer, c->dest);
                     }, &ctx)) {
                     return;
+                }
+                static std::string s_missLogged;  // render thread
+                if (s_missLogged.find(std::string("|") + name + "|") == std::string::npos && s_missLogged.size() < 400) {
+                    s_missLogged += std::string("|") + name + "|";
+                    REX::WARN("hud preview: renderer '{}' NOT captured (destination target 0x{:X}, views {}): drawn into the world image", name,
+                        a_dest, views ? "ok, capture failed" : "not mapped");
                 }
             }
             if (_stricmp(name, "PowerArmorRenderer") == 0) {
@@ -397,13 +475,9 @@ namespace fo4flatvr::game
 
     std::string MenusReport()
     {
-        const auto tasks = F4SE::GetTaskInterface();
-        if (!tasks) {
-            return "error: no task interface";
-        }
         auto done = std::make_shared<std::promise<std::string>>();
         auto fut = done->get_future();
-        tasks->AddTask([done]() {
+        const bool queued = tq::RunOnMain([done]() {  // main-idle queue (ThreadQueues.h)
             std::string s;
             auto*       ui = RE::UI::GetSingleton();
             if (!ui) {
@@ -434,6 +508,9 @@ namespace fo4flatvr::game
             }
             done->set_value(std::move(s));
         });
+        if (!queued) {
+            return "error: no main-thread queue";
+        }
         if (fut.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
             return "error: main thread did not run the task within 2 s";
         }
@@ -651,16 +728,164 @@ namespace fo4flatvr::game
             return;
         }
         g_hfNext = now + std::chrono::seconds(1);
-        if (const auto tasks = F4SE::GetTaskInterface()) {
-            tasks->AddUITask([]() { HfCheck(); });
-        } else {
+        // 20 Nov (threading audit): main-idle queue = the UI's own thread at a point no menu advances or renders (ThreadQueues.h);
+        // the F4SE UI task ran on job threads too (user's log: 31408, 20804, 12108 ...) while HUDMenu rendered on the main thread
+        if (!tq::RunOnUI([]() { HfCheck(); })) {
             g_hfPending = false;
         }
     }
+
+    // ---- FO4VR HUD split: clip rectangles (HudLayer.h SplitConfig) ---------------------------------------------------
+    // Twice a second on the UI thread: each piece's screen rectangle = the union of its HUDMenu clips' stage bounds
+    // (getBounds(root1)), mapped through the movie's viewport (HUDMenu loads ExactFit: the 1280 x 720 stage over the viewport
+    // rect of the render-size buffer) to 0..1 of the HUD target. Clip lists are ini strings ([HUD] sHandHudLeftClips,
+    // sHandHudRightClips, sCompassClips; comma lists of paths under root1), so HUD replacers with other names can be
+    // listed; a piece whose clips are all missing stays on the HUD quad. The compass uses its background + marker mask, not
+    // CompassWidget_mc itself: HUDFramework parents its widget container inside CompassBar_mc (mod-edi-hudframework.md), and
+    // the widgets would widen the compass rectangle to the whole screen.
+    namespace
+    {
+        std::atomic<bool>                     g_spPending{ false };
+        std::chrono::steady_clock::time_point g_spNext{};
+        std::string                           g_spLastLog;  // UI thread
+        std::vector<std::string>              g_spClips[3];  // UI thread, read once
+        bool                                  g_spLoaded = false;
+
+        std::vector<std::string> SplitList(const std::string& a_s)
+        {
+            std::vector<std::string> out;
+            std::string              cur;
+            for (char ch : a_s + ",") {
+                if (ch == ',') {
+                    while (!cur.empty() && (cur.back() == ' ' || cur.back() == '\t')) cur.pop_back();
+                    std::size_t b = 0;
+                    while (b < cur.size() && (cur[b] == ' ' || cur[b] == '\t')) ++b;
+                    if (b < cur.size()) out.push_back(cur.substr(b));
+                    cur.clear();
+                } else {
+                    cur += ch;
+                }
+            }
+            return out;
+        }
+
+        void SpLoad()
+        {
+            static constexpr const char* kKeys[3] = { "sHandHudLeftClips", "sHandHudRightClips", "sCompassClips" };
+            static constexpr const char* kDefs[3] = {
+                "LeftMeters_mc.HPMeter_mc,LeftMeters_mc.RadsMeter_mc",
+                "RightMeters_mc.ActionPointMeter_mc,RightMeters_mc.AmmoCount_mc,RightMeters_mc.ExplosiveAmmoCount_mc,"
+                "RightMeters_mc.HUDActiveEffectsWidget_mc,RightMeters_mc.FatigueWarning_mc",
+                "BottomCenterGroup_mc.CompassWidget_mc.CompassBGHolder_mc,BottomCenterGroup_mc.CompassWidget_mc.QuestMask_mc"
+            };
+            for (int i = 0; i < 3; ++i) {
+                char buf[1024]{};
+                ::GetPrivateProfileStringA("HUD", kKeys[i], kDefs[i], buf, sizeof(buf), Settings::Path().c_str());
+                g_spClips[i] = SplitList(buf[0] ? buf : kDefs[i]);
+            }
+            g_spLoaded = true;
+        }
+
+        void SpCheck()  // F4SE UI task (main thread)
+        {
+            g_spPending = false;
+            if (!g_spLoaded) {
+                SpLoad();
+            }
+            auto*                          ui = RE::UI::GetSingleton();
+            static const RE::BSFixedString kHud("HUDMenu");
+            Scaleform::Ptr<RE::IMenu>      menu = ui ? ui->GetMenu(kHud) : nullptr;
+            if (!menu || !menu->uiMovie) {
+                return;
+            }
+            auto*                    mv = menu->uiMovie.get();
+            Scaleform::GFx::Viewport vp{};
+            mv->GetViewport(&vp);
+            auto*        def = mv->GetMovieDef();
+            const double sw = def ? def->GetWidth() : 1280.0, sh = def ? def->GetHeight() : 720.0;
+            const double bw = vp.bufferWidth > 0 ? vp.bufferWidth : vp.width, bh = vp.bufferHeight > 0 ? vp.bufferHeight : vp.height;
+            if (sw <= 0 || sh <= 0 || bw <= 0 || bh <= 0 || vp.width <= 0 || vp.height <= 0) {
+                return;
+            }
+            // stage -> viewport: ExactFit stretches; ShowAll / NoBorder scale uniformly and centre; NoScale centres 1:1
+            double     sx = vp.width / sw, sy = vp.height / sh;
+            const auto mode = mv->GetViewScaleMode();
+            if (mode == Scaleform::GFx::Movie::ScaleModeType::kShowAll) {
+                sx = sy = (std::min)(sx, sy);
+            } else if (mode == Scaleform::GFx::Movie::ScaleModeType::kNoBorder) {
+                sx = sy = (std::max)(sx, sy);
+            } else if (mode == Scaleform::GFx::Movie::ScaleModeType::kNoScale) {
+                sx = sy = 1.0;
+            }
+            const double ox = vp.left + (vp.width - sw * sx) * 0.5, oy = vp.top + (vp.height - sh * sy) * 0.5;
+            hud::SetPieceAniso(static_cast<float>(sx / sy));
+            HValue       root;
+            if (!mv->GetVariable(&root, "root1") || !root.IsObject()) {
+                return;
+            }
+            std::string log = std::format("viewport buf {}x{} rect {},{} {}x{} stage {:.0f}x{:.0f} mode {}", vp.bufferWidth, vp.bufferHeight, vp.left,
+                vp.top, vp.width, vp.height, sw, sh, static_cast<int>(mode));
+            static constexpr const char* kNames[3] = { "hand-left", "hand-right", "compass" };
+            for (int i = 0; i < 3; ++i) {
+                double x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+                int    found = 0;
+                for (const auto& path : g_spClips[i]) {
+                    HValue clip, r;
+                    if (!mv->GetVariable(&clip, ("root1." + path).c_str()) || !clip.IsObject() || !clip.Invoke("getBounds", &r, &root, 1) || !r.IsObject()) {
+                        continue;
+                    }
+                    const double x = HMem(r, "x"), y = HMem(r, "y"), w = HMem(r, "width"), h = HMem(r, "height");
+                    if (!(w > 0.5) || !(h > 0.5) || w > sw * 2 || h > sh * 2) {
+                        continue;  // empty clip (getBounds of nothing is 0 / 6710886)
+                    }
+                    x0 = (std::min)(x0, x), y0 = (std::min)(y0, y), x1 = (std::max)(x1, x + w), y1 = (std::max)(y1, y + h);
+                    ++found;
+                }
+                if (!found) {
+                    hud::SetPieceRect(i, 0, 0, 0, 0, false);
+                    log += std::format(" | {}: no clip found", kNames[i]);
+                    continue;
+                }
+                const double pad = 2.0;  // stage px of glow around the clips
+                x0 -= pad, y0 -= pad, x1 += pad, y1 += pad;
+                const double u0 = (ox + x0 * sx) / bw, v0 = (oy + y0 * sy) / bh, u1 = (ox + x1 * sx) / bw, v1 = (oy + y1 * sy) / bh;
+                hud::SetPieceRect(i, static_cast<float>(std::clamp(u0, 0.0, 1.0)), static_cast<float>(std::clamp(v0, 0.0, 1.0)),
+                    static_cast<float>(std::clamp(u1, 0.0, 1.0)), static_cast<float>(std::clamp(v1, 0.0, 1.0)), true);
+                log += std::format(" | {}: {} clip(s) stage {:.0f},{:.0f}..{:.0f},{:.0f} -> uv {:.3f},{:.3f}..{:.3f},{:.3f}", kNames[i], found, x0, y0, x1, y1,
+                    u0, v0, u1, v1);
+            }
+            if (log != g_spLastLog) {  // log on change only
+                g_spLastLog = log;
+                REX::INFO("hud split: {}", log);
+            }
+        }
+    }
+
+    void HudSplitTick()
+    {
+        if (!hud::SplitWanted()) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now < g_spNext || g_spPending.exchange(true)) {
+            return;
+        }
+        g_spNext = now + std::chrono::milliseconds(500);
+        if (!tq::RunOnUI([]() { SpCheck(); })) {  // main-idle queue (ThreadQueues.h), as HfCheck
+            g_spPending = false;
+        }
+    }
+
 
     std::string HudFrameworkStatus()
     {
         std::scoped_lock l(g_hfLock);
         return std::format("hudfw on={} checks={} fixes={} | {}", g_hfOn.load(), g_hfChecks.load(), g_hfFixes.load(), g_hfStatus);
+    }
+
+    void ReloadHudSettings()
+    {
+        g_hfOn = -1;
+        tq::RunOnUI([]() { g_spLoaded = false; });  // the clip lists are read and used on the UI (main) thread
     }
 }

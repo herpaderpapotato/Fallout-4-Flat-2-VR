@@ -13,7 +13,8 @@
 // + modifier from the MCM list, sent with SendInput while the game window has the focus: game controls, MCM hotkeys of
 // other mods, and our own F2/F3/F8), 2 recentre, 3 first/third person, 4 camera view cycle.
 // Safeguards: cancelled by the same hand's grip (holster chord), the other stick's click (FRIK's config chord), a hold over
-// fMaxHoldS, an invalid pose or leaving gameplay; fCooldownS after a gesture fires; while a gesture stick is clicked, that
+// fMaxHoldS, an invalid pose or a menu opening / a load (20 Nov, [Gestures] bAllViews=1: gestures work in every camera state
+// and view policy - CINEMA, third person, SCENE - not only the first-person world view; 0 = first-person gameplay only); fCooldownS after a gesture fires; while a gesture stick is clicked, that
 // stick's own jobs (turn / jump / sneak / move) are held at zero until it is back in the dead zone. VRIK button delay for a
 // stick click that the game also uses (the off hand's = sprint): the click reaches the game only after fButtonDelayS held
 // still (haptic tick), and then that press is no gesture.
@@ -21,7 +22,8 @@
 // Both hands up = VRIK's selfie mode with FRIK-flat's mirror body ([Selfie]): raising the chosen hand(s) fHandsUpCm above
 // the HMD for fHoldS toggles it (re-arms only below the HMD). While the hands stay up after turning it on, the body is placed
 // fDistanceM in front of the head, facing you, and rolling the steering hand's wrist turns it (fRollGain, fRollDeadzoneDeg).
-// Lowering the hands freezes it. Ends on the gesture again, any menu / Pip-Boy, or a camera state other than first person.
+// Lowering the hands freezes it. Ends on the gesture again, a load, or a camera state other than first person; pause, Pip-Boy
+// and other menus keep it ([Selfie] bKeepInMenus=1, 19 Nov; 0 = any menu ends it).
 //
 // Settings: fo4flatvr.ini [Gestures] / [Selfie] (optional), overridden by MCM's Data\MCM\Settings\fo4flatvr.ini (the file
 // the game sees through MO2's VFS: overwrite\MCM\Settings), re-read about once a second when its time stamp changes - MCM
@@ -45,10 +47,21 @@ namespace fo4flatvr::gestures
         bool                       gameplay{ false };  // bindings gameplay / quick-loot context (world view, no menu)
         int                        camState{ -1 };     // game camera state (0 = first person)
         bool                       leftHanded{ false };
+        // 20 Nov: kept for the status line only. With [Gestures] bAllViews=1 (default) gestures run in every context (menus,
+        // Pip-Boy, dialogue, VATS, workshop, every camera view; user: "Gestures shouldn't be locked out in a menu or in any
+        // scenario"); the camera actions wait while LoadingMenu / MainMenu is up. 0 = only in `gameplay`.
+        bool                       anyView{ false };
+        // 20 Nov: the primary stick's click is also a game button in this context (workshop: R stick click = RB), so it gets
+        // the VRIK button delay (held still fButtonDelayS -> the game's) like the off hand's sprint click
+        bool                       primaryClickToGame{ false };
     };
 
     // Once per XR frame, before the gameplay mapping uses the sticks.
     void Update(const Frame& a_f);
+
+    // 21 Nov (bridge v8 input claims, ControllerBindings.h SetClaims): a press of that physical hand's stick click that is
+    // down now ends without a gesture (its click was claimed by a physics-hands client while held). Before Update.
+    void AbortPress(int a_hand, const char* a_why);
 
     // physical hand 0 = left, 1 = right: that stick's deflection is held at zero (click held / latched after a gesture)
     bool StickHeld(int a_hand);

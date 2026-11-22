@@ -1,15 +1,18 @@
 #include "plugin/GameBridge.h"
 #include "plugin/CameraDirector.h"
 #include "plugin/CameraTweaks.h"
+#include "plugin/ConfigStore.h"
 #include "plugin/HeadPose.h"
 #include "plugin/FloatingGun.h"
 #include "plugin/FrikBridge.h"
+#include "plugin/ThreadQueues.h"
 #include "plugin/Roomscale.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <vector>
@@ -201,6 +204,124 @@ namespace fo4flatvr::game
         std::atomic<std::uint64_t> g_rigFitCalls{ 0 };
         constexpr std::uintptr_t kRigFitRet = 0xD7C9CD;  // return address of UpdateActor3DPosition's Get1stPersonCameraPosition call
 
+        // Sneak height step (20 Nov, user: "Can the sneak toggle adjust to match fo4vr. i.e. the same abrupt, not gradual height
+        // change"). The eye height below follows the game's animated camera node, which blends down/up over the sneak
+        // transition, and the 0.6 s low-pass slowed it further. FO4VR changes the view height in one step when the sneak flag
+        // flips (Ghidra, Fallout4VR 1.2.72 FUN_140ef7180 = the HMD-node update: HMD local z = tracked height x
+        // fComfortSneakHeight (0.7) while the sneak stance bits are set, no smoothing). Here: on the frame the sneak bits
+        // flips, the eye height jumps to the other stance's level (the learned sneak/stand ratio of the last settled levels,
+        // or kSneakRatioDefault before one is learned) and is held there while the game's camera node is still blending
+        // (until the raw node arrives near it or stops moving, at most kSneakHoldS); then the usual low-pass takes the
+        // residual. Only the eye height: ground height (stairs, slopes, FRIK smooth movement) is not part of it.
+        // [Roomscale] bSneakHeightStep=0 = the gradual change as before.
+        bool  g_sneakStep = true;
+        int   g_stance = -1;                     // 0 standing, 1 sneaking, -1 unknown
+        float g_stanceLevel[2]{ -1.0f, -1.0f };  // settled low-passed eye height per stance (units), < 0 = not learned
+        float g_sneakRatio = -1.0f;              // learned sneak / stand eye height ratio, < 0 = none
+        std::chrono::steady_clock::time_point g_stanceSince{}, g_holdUntil{}, g_holdStart{}, g_rawMovedT{};
+        float    g_rawPrev = -1.0f;
+        unsigned g_sneakSteps = 0, g_sneakHoldsEarly = 0;
+        float    g_lastStepFrom = 0.0f, g_lastStepTo = 0.0f;
+        // flat 1.11.240 first-person camera node: 120.5 u standing, 80.5 u sneaking (20 Nov, no-XR, TestProfileVR latest save) =
+        // 0.668; FO4VR comfort sneak uses 0.7 x the HMD height. Used until a ratio is learned from settled levels this session.
+        float    g_sneakRatioDefault = 0.668f;
+        constexpr float kSneakHoldS = 1.2f;
+        // Plausible sneak / stand eye-height ratios (flat 0.668, FO4VR 0.7). 20 Nov (VATS agent): the user log 23:25 learned 0.949,
+        // then 1.000, from a frozen first-person camera node (after VATS the player's animation manager kept the third-person
+        // graph active in first person - FRIK-flat PovSwitchSync - so graph 1 no longer posed the "Camera" bone and it stayed at
+        // the sneak height 80.5 u); every later step was then 80.5 -> 80.5 u. Levels / ratios outside this band are not learned.
+        constexpr float kSneakRatioMin = 0.5f, kSneakRatioMax = 0.85f;
+        // Frozen-node guard (same report: "stuck in crouch height ... right stick down to switch back to standing ... camera
+        // height stays stuck low"): stance standing for kSneakHoldS, both levels learned and apart, and the game's node still
+        // sitting on the learned sneak level -> the eye height stays at the learned standing level until the node leaves it.
+        bool     g_frozenGuard = false;
+        unsigned g_frozenGuards = 0;
+
+        // The sneak stance bits FO4VR's HMD-node update tests (VR FUN_140ef7180: (actor+0x134 >> 12 & 7) == 1); on flat
+        // 1.11.240 the same field and Actor::IsSneaking's first test (666050: (actor+0x134 & 0x3800) == 0x800). Read
+        // directly: lock-free (IsSneaking also takes the extra-list read lock) on the camera job thread.
+        bool PlayerSneaking()
+        {
+            const auto* pc = RE::PlayerCharacter::GetSingleton();
+            return pc && (*reinterpret_cast<const std::uint32_t*>(reinterpret_cast<std::uintptr_t>(pc) + 0x134) & 0x3800u) == 0x800u;
+        }
+
+        // a_eh: the game's eye height this frame; returns true while the step holds g_eyeH (no low-pass this frame)
+        bool SneakStep(float a_eh, std::chrono::steady_clock::time_point a_now)
+        {
+            using namespace std::chrono;
+            if (!g_sneakStep || g_eyeH < 0.0f) {
+                g_stance = -1;
+                g_holdUntil = {};
+                return false;
+            }
+            if (g_rawPrev < 0.0f || std::abs(a_eh - g_rawPrev) > 0.15f) g_rawMovedT = a_now;
+            g_rawPrev = a_eh;
+            const int st = PlayerSneaking() ? 1 : 0;
+            if (g_stance < 0) {
+                g_stance = st, g_stanceSince = a_now;
+            } else if (st != g_stance) {
+                const float from = g_eyeH;
+                const float r = g_sneakRatio >= kSneakRatioMin && g_sneakRatio <= kSneakRatioMax ? g_sneakRatio : g_sneakRatioDefault;
+                g_eyeH = st == 1 ? from * r : from / r;
+                g_lastStepFrom = from, g_lastStepTo = g_eyeH;
+                g_stance = st, g_stanceSince = a_now;
+                g_holdStart = a_now;
+                g_holdUntil = a_now + duration_cast<steady_clock::duration>(duration<float>(kSneakHoldS));
+                if (++g_sneakSteps <= 20) {
+                    REX::INFO("camera: sneak {} -> eye height step {:.1f} -> {:.1f} u (ratio {:.3f}{}); game camera node now {:.1f}", st ? "on" : "off", from,
+                        g_eyeH, r, g_sneakRatio > 0.0f ? " learned" : " default", a_eh);
+                }
+                return true;
+            }
+            if (a_now < g_holdUntil) {
+                // the game's node is still blending: hold, unless it has arrived near the step or stopped moving
+                const bool arrived = std::abs(a_eh - g_eyeH) < 1.5f;
+                // "stopped moving" only once it has moved since the step: a node that never left the old level is not settled
+                const bool settled = a_now - g_holdStart > milliseconds(150) && g_rawMovedT > g_holdStart && a_now - g_rawMovedT > milliseconds(150);
+                if (!arrived && !settled) return true;
+                ++g_sneakHoldsEarly;
+                g_holdUntil = {};
+            }
+            // frozen-node guard (see g_frozenGuard): standing, but the game's camera node still on the sneak level
+            const float stand = g_stanceLevel[0], sneak = g_stanceLevel[1];
+            const bool  frozen = st == 0 && stand > 0.0f && sneak > 0.0f && stand - sneak > 15.0f && std::abs(a_eh - sneak) < 2.0f &&
+                                a_now - g_stanceSince > duration_cast<steady_clock::duration>(duration<float>(kSneakHoldS));
+            if (frozen != g_frozenGuard) {
+                g_frozenGuard = frozen;
+                if (frozen) ++g_frozenGuards;
+                if (g_frozenGuards <= 20) {
+                    if (frozen) {
+                        REX::INFO("camera: standing, but the game's camera node stays at the sneak level {:.1f} u -> eye height held at the "
+                                  "learned standing level {:.1f} u (#{})", a_eh, stand, g_frozenGuards);
+                    } else {
+                        REX::INFO("camera: the game's camera node left the sneak level ({:.1f} u) - eye height follows it again ({:.1f} u, #{})",
+                            a_eh, g_eyeH, g_frozenGuards);
+                    }
+                }
+            }
+            if (frozen) {
+                g_eyeH = stand;
+                return true;  // no low-pass toward the frozen node, nothing learned from it
+            }
+            // learn the settled level of this stance (low-passed, so walking bob is averaged), and the ratio from both; a level
+            // that would give an implausible ratio against the other stance's is not taken (frozen node, see kSneakRatioMin)
+            if (a_now - g_stanceSince > milliseconds(1500)) {
+                const float other = g_stanceLevel[1 - st];
+                const float r = other > 0.0f ? (st == 1 ? g_eyeH / other : other / g_eyeH) : -1.0f;
+                if (other <= 0.0f || (r >= kSneakRatioMin && r <= kSneakRatioMax)) {
+                    g_stanceLevel[st] = g_eyeH;
+                    if (r > 0.0f) {
+                        if (g_sneakRatio < 0.0f || std::abs(r - g_sneakRatio) > 0.01f) {
+                            REX::INFO("camera: sneak eye height ratio learned {:.3f} (stand {:.1f} u, sneak {:.1f} u)", r, g_stanceLevel[0], g_stanceLevel[1]);
+                        }
+                        g_sneakRatio = r;
+                    }
+                }
+            }
+            return false;
+        }
+
         // Head authority: camera = capsule + low-passed eye height + head offset (roomscale residual), ignoring the
         // game's animated camera node (whose horizontal offset from the capsule swings with body yaw, and whose
         // height carries bob / idle sway / turn animations). The raw node is only used for the eye height.
@@ -217,6 +338,10 @@ namespace fo4flatvr::game
             g_eyeT = now;
             if (g_eyeH < 0.0f || dt > 1.0f || std::abs(eh - g_eyeH) > 80.0f) {
                 g_eyeH = eh;  // first sample, after a gap, or a teleport-sized jump
+                g_stance = -1;
+                g_holdUntil = {};
+            } else if (SneakStep(eh, now)) {
+                // sneak toggled: stepped / held (no low-pass while the game's camera node is still blending)
             } else if (g_eyeTauS > 0.0f) {
                 g_eyeH += (eh - g_eyeH) * (1.0f - std::exp(-dt / g_eyeTauS));
             } else {
@@ -394,6 +519,12 @@ namespace fo4flatvr::game
         g_heightOffsetCm = a_cm;
     }
 
+    void FirstPersonEye(float& a_eyeHeightUnits, float& a_heightOffsetUnits)
+    {
+        a_eyeHeightUnits = g_headAuthority ? g_eyeH : -1.0f;
+        a_heightOffsetUnits = g_heightOffsetCm * 0.01f * g_unitsPerMeter;
+    }
+
     void SetHeadAuthority(bool a_on, float a_tauS)
     {
         g_headAuthority = a_on;
@@ -405,6 +536,21 @@ namespace fo4flatvr::game
     bool HeadAuthority()
     {
         return g_headAuthority;
+    }
+
+    void SetSneakHeightStep(bool a_on)
+    {
+        g_sneakStep = a_on;
+        REX::INFO("camera: sneak eye height {} ([Roomscale] bSneakHeightStep)", a_on ? "steps at once on a sneak toggle (FO4VR)" : "follows the game's gradual change");
+    }
+
+    std::string SneakStepCommand(const std::string& a_arg)
+    {
+        if (a_arg == "on" || a_arg == "off") SetSneakHeightStep(a_arg == "on");
+        return std::format("sneakstep on={} headAuthority={} sneaking={} stance={} eyeH={:.1f} raw={:.1f} levels stand={:.1f} sneak={:.1f} ratio={:.3f} (default {:.3f}) "
+                           "steps={} holdsEndedEarly={} last {:.1f}->{:.1f} tau={:.2f}s frozenGuard={} frozenGuards={}",
+            g_sneakStep ? 1 : 0, g_headAuthority ? 1 : 0, PlayerSneaking() ? 1 : 0, g_stance, g_eyeH, g_rawPrev, g_stanceLevel[0], g_stanceLevel[1], g_sneakRatio,
+            g_sneakRatioDefault, g_sneakSteps, g_sneakHoldsEarly, g_lastStepFrom, g_lastStepTo, g_eyeTauS, g_frozenGuard ? 1 : 0, g_frozenGuards);
     }
 
     void SetRigFitRaw(bool a_on)
@@ -700,15 +846,11 @@ namespace fo4flatvr::game
 
     bool QueueConsoleCommand(std::string a_command)
     {
-        const auto tasks = F4SE::GetTaskInterface();
-        if (!tasks) {
-            return false;
-        }
-        tasks->AddTask([cmd = std::move(a_command)]() {
+        // main-idle queue (ThreadQueues.h): right before the engine runs its own queued console commands, same thread / point
+        return tq::RunOnMain([cmd = std::move(a_command)]() {
             REX::INFO("console: {}", cmd);
             RE::Console::ExecuteCommand(cmd.c_str());
         });
-        return true;
     }
 
     // ==== Controller aim ==========================================================================
@@ -801,6 +943,14 @@ namespace fo4flatvr::game
         PickInfo   g_pick;
         FireInfo   g_fire;
         std::atomic<bool> g_aimEnabled{ false };
+        // [Controllers] bAimThrowsWithController (default 1): grenades (WEAP type 10) and mines (11) leave along the primary
+        // controller's pointing direction, pitch included (F1 angles only; the game keeps its own throw origin and the
+        // projectile's speed / gravity arc), and the perk trajectory preview (PerkUtilities::CalculateGrenadeTrajectory
+        // D825F0) uses the same angles. 0 = the game's actor heading + look pitch (vanilla, FO4VR's code path).
+        std::atomic<bool>          g_optThrow{ true };
+        std::atomic<std::uint64_t> g_throwOverrides{ 0 }, g_throwSkips{ 0 }, g_trajOverrides{ 0 }, g_trajCalls{ 0 };
+        bool                       g_trajHooked = false;
+        float                      g_throwLastZ = 0.0f, g_throwLastX = 0.0f, g_throwGameZ = 0.0f, g_throwGameX = 0.0f;
 
         // ---- [Weapon] bNoSpread: no cone of fire for the player's shots outside VATS ----
         // TESObjectWEAP::Fire (4799B0) inits ProjectileLaunchData::coneOfFireRadiusMult (+0x8C) = 1.0 at 479BC0, calls
@@ -894,10 +1044,63 @@ namespace fo4flatvr::game
             return h.get();
         }
 
+        // ---- VATS shot origin (20 Nov, VATS agent; user: "high percentage shots will fail ... point blank will hit") --------
+        // Flat VATS aims each playback shot itself: SetOriginAndDirection (E42EA0) takes origin = Actor::GetFireNode world
+        // (+ the first-person offset global 34484E0 only while player+0xDFE bit 4, PlayerCharacter vfunc 0x470, says first
+        // person; Main::Swap writes that global = player location only in camera state 0, else 0), then, with VATS mode 1,
+        // VATS::SetProjectileLaunchData (E5C050) sets the angles from that origin to the queued part (hit: its centre of mass
+        // + lead; miss: just outside its pose bound). The first-person rig lives in player-relative space, so a playback
+        // shot from the first-person ProjectileNode (DoShow1stPerson returned early with FRIK's body shown - see FRIK-flat
+        // PovSwitchSync - or the offset global 0 in the VATS camera state) starts near the WORLD origin (user log 23:17:47:
+        // origin (-4.6,46.0,74.5), player at (-31588,12284,2000); angles = world origin -> target) and never reaches the
+        // target. Fix: such an origin (far from the player, itself small) + player.data.location, then
+        // SetProjectileLaunchData again so the angles start from the real muzzle. [Controllers] bVatsShotFix (default 1).
+        constexpr std::uintptr_t   kVatsSetLaunchData = 0xE5C050;  // VATS::SetProjectileLaunchData(VATS*, data, fireNode)
+        constexpr std::uintptr_t   kVatsPredictRet1 = 0xE5E9A6;    // VATS::PredictRangedAttackCollision -> SetOriginAndDirection
+        constexpr std::uintptr_t   kVatsPredictRet2 = 0xE609CE;    // VATSUtils::CreateAttackPredictionProjectile -> same
+        using VatsSetLaunch_t = void (*)(void*, RE::ProjectileLaunchData*, void*);
+        std::atomic<bool>          g_vatsShotFix{ true };
+        std::atomic<std::uint64_t> g_vatsShots{ 0 }, g_vatsFixed{ 0 }, g_vatsPredicts{ 0 };
+
+        void VatsShotFix(RE::ProjectileLaunchData* a_data, RE::PlayerCharacter* a_pc)
+        {
+            const auto  n = ++g_vatsShots;
+            const auto& L = a_pc->data.location;
+            const V3    o{ a_data->origin.x, a_data->origin.y, a_data->origin.z };
+            const float fromPlayer = Len(Sub(o, V3{ L.x, L.y, L.z }));
+            const bool  third = ((*reinterpret_cast<const std::uint8_t*>(reinterpret_cast<std::uintptr_t>(a_pc) + 0xDFE)) >> 4) & 1;
+            auto* const pcam = RE::PlayerCamera::GetSingleton();
+            const int   cs = pcam && pcam->currentState ? static_cast<int>(pcam->currentState->id.get()) : -1;
+            const float z0 = a_data->zAngle, x0 = a_data->xAngle;
+            // player-relative: the shot origin should be within reach of the body; a first-person node is a small vector
+            const bool relative = fromPlayer > 400.0f && Len(o) < 300.0f;
+            bool       fixed = false;
+            if (relative && g_vatsShotFix.load(std::memory_order_relaxed)) {
+                if (auto* vats = *reinterpret_cast<void**>(Base() + kVatsSingleton)) {
+                    a_data->origin = { o.x + L.x, o.y + L.y, o.z + L.z };
+                    reinterpret_cast<VatsSetLaunch_t>(Base() + kVatsSetLaunchData)(vats, a_data, nullptr);
+                    fixed = true;
+                    ++g_vatsFixed;
+                }
+            }
+            if (n <= 40 || n % 50 == 0 || fixed) {
+                REX::INFO("vats shot #{}: origin {} ({:.0f} u from the player) thirdPersonFlag {} camState {} angles z {:.4f} x {:.4f}{}", n, F3(o),
+                    fromPlayer, third ? 1 : 0, cs, z0, x0,
+                    fixed ? std::format(" -> player-relative origin fixed: {} angles z {:.4f} x {:.4f}",
+                                F3(V3{ a_data->origin.x, a_data->origin.y, a_data->origin.z }), a_data->zAngle, a_data->xAngle)
+                          : relative ? std::string(" (player-relative origin, bVatsShotFix=0: not fixed)") : std::string());
+            }
+        }
+
         // ---- F1 -------------------------------------------------------------------------------------
-        bool SodAim(RE::ProjectileLaunchData* a_data)
+        bool SodAim(RE::ProjectileLaunchData* a_data, bool a_vatsPredict)
         {
             const bool ok = g_origSOD(a_data);
+            if (ok && a_data && VatsPlayback()) {
+                if (auto* pc = RE::PlayerCharacter::GetSingleton(); pc && a_data->shooter == pc) {
+                    VatsShotFix(a_data, pc);
+                }
+            }
             if (!ok || !a_data || !g_aimEnabled.load(std::memory_order_relaxed)) {
                 return ok;
             }
@@ -907,25 +1110,51 @@ namespace fo4flatvr::game
                 ++g_fire.calls;
                 return ok;
             }
+            if (a_vatsPredict) {  // VATS hit-chance prediction projectile: the game's own aim, as flat (no hand ray, no log)
+                ++g_vatsPredicts;
+                return ok;
+            }
             const char* skip = nullptr;
             HandRay     r;
             // fromWeapon.object (+0x30) is the TESObjectWEAP; weapon type byte at +0x2CF (10 grenade, 11 mine)
             const auto* weap = *reinterpret_cast<const std::uint8_t* const*>(reinterpret_cast<const std::uint8_t*>(a_data) + 0x30);
             const std::uint8_t wtype = weap ? weap[0x2CF] : 0xFF;
+            const bool         thrown = wtype == 10 || wtype == 11;
             if (VatsPlayback()) {
                 skip = "vats";
-            } else if (wtype == 10 || wtype == 11) {
-                skip = "grenade/mine";
+            } else if (thrown && !g_optThrow.load(std::memory_order_relaxed)) {
+                skip = "grenade/mine (bAimThrowsWithController=0)";
             } else if (!GetFreshRay(r)) {
                 skip = "no fresh hand ray";
             }
             const V3 o{ a_data->origin.x, a_data->origin.y, a_data->origin.z };
             const float z0 = a_data->zAngle, x0 = a_data->xAngle;
             if (!skip) {
-                a_data->origin = { r.P.x, r.P.y, r.P.z };
                 a_data->zAngle = std::atan2(r.D.x, r.D.y);
                 a_data->xAngle = -std::asin(std::clamp(r.D.z / (std::max)(Len(r.D), 1e-6f), -1.0f, 1.0f));
-                a_data->useOrigin = true;
+                if (!thrown) {
+                    a_data->origin = { r.P.x, r.P.y, r.P.z };
+                    a_data->useOrigin = true;
+                }
+                // thrown: only the direction. The origin stays the game's throw point (grenade: Actor::GetCurrentFireLocation,
+                // as in FO4VR 14104F5EF; mine: its fire node), the arc stays the projectile's speed + gravity.
+            }
+            if (thrown) {
+                if (skip) {
+                    ++g_throwSkips;
+                } else {
+                    ++g_throwOverrides;
+                }
+                {
+                    std::scoped_lock l(g_aimLock);
+                    g_throwGameZ = z0;
+                    g_throwGameX = x0;
+                    g_throwLastZ = a_data->zAngle;
+                    g_throwLastX = a_data->xAngle;
+                }
+                REX::INFO("aim throw ({}): {} ; zAngle {:.4f} -> {:.4f} ; xAngle {:.4f} -> {:.4f} (hand hdg {:.1f} pitchUp {:.1f}); origin {}",
+                    wtype == 10 ? "grenade" : "mine", skip ? skip : "hand direction", z0, a_data->zAngle, x0, a_data->xAngle,
+                    skip ? 0.0f : HeadingDeg(r.D), skip ? 0.0f : PitchUpDeg(r.D), F3(o));
             }
             std::uint64_t n;
             {
@@ -938,7 +1167,7 @@ namespace fo4flatvr::game
                 g_fire.origX = x0;
                 if (!skip) {
                     ++g_fire.overridden;
-                    g_fire.newO = r.P;
+                    g_fire.newO = thrown ? o : r.P;
                     g_fire.newZ = a_data->zAngle;
                     g_fire.newX = a_data->xAngle;
                 }
@@ -949,7 +1178,7 @@ namespace fo4flatvr::game
                     REX::INFO("aim F1 #{}: player shot not redirected ({}); origin {} z={:.4f} x={:.4f}", n, skip, F3(o), z0, x0);
                 } else {
                     REX::INFO("aim F1 #{}: origin {} -> {} ; zAngle {:.4f} -> {:.4f} ; xAngle {:.4f} -> {:.4f} (hdg {:.1f} pitchUp {:.1f})",
-                        n, F3(o), F3(r.P), z0, a_data->zAngle, x0, a_data->xAngle, HeadingDeg(r.D), PitchUpDeg(r.D));
+                        n, F3(o), F3(thrown ? o : r.P), z0, a_data->zAngle, x0, a_data->xAngle, HeadingDeg(r.D), PitchUpDeg(r.D));
                 }
             }
             return ok;
@@ -995,8 +1224,11 @@ namespace fo4flatvr::game
 
         bool HkSetOriginAndDirection(RE::ProjectileLaunchData* a_data)
         {
-            const bool ok = SodAim(a_data);
-            if (ok && a_data) {
+            // reached by a jmp from the function's entry: the return address is the engine caller's
+            const auto ret = reinterpret_cast<std::uintptr_t>(_ReturnAddress()) - Base();
+            const bool predict = ret == kVatsPredictRet1 || ret == kVatsPredictRet2;
+            const bool ok = SodAim(a_data, predict);
+            if (ok && a_data && !predict) {
                 NoSpread(a_data);
             }
             return ok;
@@ -1283,6 +1515,60 @@ namespace fo4flatvr::game
             }
             return true;
         }
+
+        // ---- throw preview: PerkUtilities::CalculateGrenadeTrajectory (D825F0, perk "Show Grenade Trajectory") ----
+        // It builds the arc from the player's look pitch (Actor::GetLooking C834E0, called at D8265A and D828B3) and
+        // heading (vfunc 0x638 = PlayerCharacter::GetHeading D62DA0, call [rax+638] at D82668), like the grenade branch of
+        // SetOriginAndDirection. These three calls return the hand's angles while bAimThrowsWithController applies, so the
+        // preview arc is the one the grenade will fly (FO4VR 140F39D90 is the same code).
+        constexpr std::uintptr_t kGetLooking = 0xC834E0;
+        constexpr std::uintptr_t kTrajLookSite1 = 0xD8265A;
+        constexpr std::uintptr_t kTrajHeadingSite = 0xD82668;
+        constexpr std::uintptr_t kTrajLookSite2 = 0xD828B3;
+        using GetLooking_t = float (*)(RE::Actor*);
+        GetLooking_t g_origTrajLook1 = nullptr, g_origTrajLook2 = nullptr;
+
+        // hand angles in the engine convention (zAngle heading 0 = +Y wrapped to [0, 2pi) as GetHeading returns it;
+        // xAngle pitch, positive = down), or false = use the game's.
+        bool ThrowAngles(float& a_z, float& a_x)
+        {
+            HandRay r;
+            if (!g_aimEnabled.load(std::memory_order_relaxed) || !g_optThrow.load(std::memory_order_relaxed) || VatsActive() ||
+                !GetFreshRay(r)) {
+                return false;
+            }
+            a_z = std::atan2(r.D.x, r.D.y);
+            if (a_z < 0.0f) a_z += 6.2831855f;
+            a_x = -std::asin(std::clamp(r.D.z / (std::max)(Len(r.D), 1e-6f), -1.0f, 1.0f));
+            return true;
+        }
+
+        float HkTrajLook1(RE::Actor* a_actor)
+        {
+            ++g_trajCalls;
+            float z, x;
+            if (ThrowAngles(z, x)) {
+                ++g_trajOverrides;
+                return x;
+            }
+            return g_origTrajLook1(a_actor);
+        }
+
+        float HkTrajLook2(RE::Actor* a_actor)
+        {
+            float z, x;
+            return ThrowAngles(z, x) ? x : g_origTrajLook2(a_actor);
+        }
+
+        float HkTrajHeading(RE::Actor* a_actor)
+        {
+            float z, x;
+            if (ThrowAngles(z, x)) {
+                return z;
+            }
+            const auto* vtbl = *reinterpret_cast<const std::uintptr_t* const*>(a_actor);
+            return reinterpret_cast<float (*)(RE::Actor*)>(vtbl[0x638 / 8])(a_actor);
+        }
     }
 
     // F1 (also for [Weapon] bNoSpread alone): idempotent
@@ -1332,6 +1618,18 @@ namespace fo4flatvr::game
 
         // F1: Projectile::SetOriginAndDirection prologue: mov r11,rsp; push rbp; push rdi; lea rbp,[r11-0xB8]
         InstallFireDetour();
+        {  // [Controllers] bVatsShotFix (live): VATS playback shots from a player-relative first-person muzzle (VatsShotFix)
+            static auto read = []() {
+                std::string v;
+                const bool on = !cfgstore::EffectiveValue("Controllers", "bVatsShotFix", v) || std::atoi(v.c_str()) != 0;
+                if (on != g_vatsShotFix.exchange(on)) REX::INFO("aim: VATS shot origin fix {} ([Controllers] bVatsShotFix)", on ? "on" : "off");
+                return on;
+            };
+            const bool on = read();
+            cfgstore::Subscribe("vatsshot", "Controllers/bVatsShotFix", [](const cfgstore::Changes&) { read(); });
+            REX::INFO("aim: VATS shot origin fix {} ([Controllers] bVatsShotFix; F1 {}); VATS prediction calls {:X}/{:X} keep the game's aim",
+                on ? "on" : "off", g_fireHooked ? "hooked" : "NOT hooked", kVatsPredictRet1 - 5, kVatsPredictRet2 - 5);
+        }
 
         // A1: call ViewCaster::UpdatePickRef in PlayerCharacter::UpdatePickRef
         static constexpr std::uint8_t kPickCall[5] = { 0xE8, 0x6E, 0x3E, 0xC2, 0xFF };
@@ -1349,9 +1647,30 @@ namespace fo4flatvr::game
             REX::INFO("aim diag: call at rva {:X} -> hook (original {:X})", kLaunchCallSite, reinterpret_cast<std::uintptr_t>(g_origLaunch) - base);
         }
 
+        // Throw preview ([Controllers] bAimThrowsWithController): 3 calls in PerkUtilities::CalculateGrenadeTrajectory.
+        // Own trampoline (36 B) so the shared one is not stretched. All three byte-checked, or none patched.
+        {
+            static constexpr std::uint8_t kLook1[5] = { 0xE8, 0x81, 0x0E, 0xF0, 0xFF };
+            static constexpr std::uint8_t kLook2[5] = { 0xE8, 0x28, 0x0C, 0xF0, 0xFF };
+            static constexpr std::uint8_t kHeadingCall[6] = { 0xFF, 0x90, 0x38, 0x06, 0x00, 0x00 };  // call [rax+638]
+            if (CallMatches(kTrajLookSite1, kGetLooking, kLook1, "GetLooking call 1 in CalculateGrenadeTrajectory") &&
+                CallMatches(kTrajLookSite2, kGetLooking, kLook2, "GetLooking call 2 in CalculateGrenadeTrajectory") &&
+                BytesMatch(base + kTrajHeadingSite, kHeadingCall, sizeof(kHeadingCall), "GetHeading vcall in CalculateGrenadeTrajectory")) {
+                static REL::Trampoline throwTramp{ "fo4flatvr throw preview" };
+                throwTramp.create(64);
+                g_origTrajLook1 = reinterpret_cast<GetLooking_t>(throwTramp.write_call<5>(base + kTrajLookSite1, &HkTrajLook1));
+                g_origTrajLook2 = reinterpret_cast<GetLooking_t>(throwTramp.write_call<5>(base + kTrajLookSite2, &HkTrajLook2));
+                throwTramp.write_call<6>(base + kTrajHeadingSite, &HkTrajHeading);  // HkTrajHeading calls the vfunc itself
+                g_trajHooked = true;
+                REX::INFO("aim throw: trajectory preview calls {:X}/{:X}/{:X} -> hand angles", kTrajLookSite1, kTrajHeadingSite, kTrajLookSite2);
+            }
+        }
+
         // ---- follow-ups ----
         // F3: GetLineOfFireData prologue: mov [rsp+10],rsi (5 B, relocated) | push rdi | sub rsp,40 | mov rax,[rip+..]
-        if (g_optLof) {
+        // 20 Nov (live settings): F3 / F4 / A2 / clamp are installed whatever their switch says at load and pass through while
+        // it is off (each hook checks its g_opt* atomic), so [Controllers] bHandLineOfFire ... apply live
+        if (true) {  // g_optLof gates at runtime
             static constexpr std::uint8_t kLofPrologue[] = { 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x40, 0x48, 0x8B, 0x05 };
             const std::uintptr_t lof = base + kLineOfFire;
             if (BytesMatch(lof, kLofPrologue, sizeof(kLofPrologue), "GetLineOfFireData prologue")) {
@@ -1369,7 +1688,7 @@ namespace fo4flatvr::game
             }
         }
         // F4: call AimModel::ApplyAimAdjust in PlayerCharacter::ModifyMovementData
-        if (g_optRecoil) {
+        if (true) {  // g_optRecoil gates at runtime
             static constexpr std::uint8_t kAdjCall[5] = { 0xE8, 0xFA, 0xC3, 0xAD, 0xFF };
             if (CallMatches(kAimAdjustCallSite, kApplyAimAdjust, kAdjCall, "AimModel::ApplyAimAdjust")) {
                 g_origAimAdjust = reinterpret_cast<ApplyAimAdjust_t>(tramp.write_call<5>(base + kAimAdjustCallSite, &HkApplyAimAdjust));
@@ -1378,7 +1697,7 @@ namespace fo4flatvr::game
             }
         }
         // A2: GetAutoAimActor + IsCameraLookingAtTeammate calls inside ViewCaster::UpdatePickRef (needs A1)
-        if (g_optAutoAim && g_pickHooked) {
+        if (g_pickHooked) {  // g_optAutoAim gates at runtime
             static constexpr std::uint8_t kAutoAimCall[5] = { 0xE8, 0xF1, 0xD7, 0x40, 0x00 };
             if (CallMatches(kAutoAimCallSite, kGetAutoAimActor, kAutoAimCall, "PlayerCharacter::GetAutoAimActor")) {
                 g_origAutoAim = reinterpret_cast<GetAutoAimActor_t>(tramp.write_call<5>(base + kAutoAimCallSite, &HkGetAutoAimActor));
@@ -1393,7 +1712,7 @@ namespace fo4flatvr::game
                 kTeammateCallSite, g_teammateHooked ? "hooked" : "FAILED");
         }
         // clamp: no patch, a call into CalculatePickHitFraction (prologue checked: mov rax,rsp; mov [rax+8],rbx; mov [rax+10],rsi; push rbp)
-        if (g_optClamp) {
+        if (true) {  // g_optClamp gates at runtime
             static constexpr std::uint8_t kCalcPrologue[] = { 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89, 0x70, 0x10, 0x55 };
             if (BytesMatch(base + kCalcPickHitFraction, kCalcPrologue, sizeof(kCalcPrologue), "CalculatePickHitFraction prologue")) {
                 g_calcHit = reinterpret_cast<CalcHit_t>(base + kCalcPickHitFraction);
@@ -1401,9 +1720,10 @@ namespace fo4flatvr::game
             }
         }
         auto st = [](bool a_want, bool a_ok) { return !a_want ? "off" : a_ok ? "ok" : "FAILED"; };
-        summary = std::format("fire={} pick={} launch={} lof={} recoil={} autoaim={} clamp={}", g_fireHooked ? "ok" : "FAILED",
+        summary = std::format("fire={} pick={} launch={} lof={} recoil={} autoaim={} clamp={} throw={} throwPreview={}", g_fireHooked ? "ok" : "FAILED",
             g_pickHooked ? "ok" : "FAILED", g_launchHooked ? "ok" : "FAILED", st(g_optLof, g_lofHooked), st(g_optRecoil, g_recoilHooked),
-            st(g_optAutoAim.load(), g_autoAimHooked && g_teammateHooked), st(g_optClamp, g_clampOk));
+            st(g_optAutoAim.load(), g_autoAimHooked && g_teammateHooked), st(g_optClamp, g_clampOk), st(g_optThrow.load(), g_fireHooked),
+            g_trajHooked ? "ok" : "FAILED");
         g_aimEnabled = g_fireHooked || g_pickHooked;
         REX::INFO("aim hooks: {} (trampoline {}B used of {}B)", summary, tramp.allocated_size(), tramp.capacity());
         return summary;
@@ -1420,6 +1740,20 @@ namespace fo4flatvr::game
             g_fireHooked ? "ok" : "not installed");
         REX::INFO("[Weapon] no spread: {}", r);
         return r;
+    }
+
+    void SetNoSpread(bool a_on, bool a_pellets)
+    {
+        g_noSpreadPellets = a_pellets;
+        if (g_noSpread.exchange(a_on) == a_on) {
+            return;
+        }
+        REX::INFO("[Weapon] no spread {} (live; pellets {})", a_on ? "on" : "off", a_pellets ? 1 : 0);
+        if (a_on && !g_fireHooked) {
+            // F1 was not installed at load (controller aim and bNoSpread both off): patch it on the main thread at the
+            // main-idle point (no job thread inside TESObjectWEAP::Fire then)
+            tq::RunOnMain([]() { InstallFireDetour(); });
+        }
     }
 
     std::string NoSpreadCommand(const std::string& a_arg)
@@ -1472,14 +1806,21 @@ namespace fo4flatvr::game
         g_optClamp = a_clamp;
     }
 
+    void ConfigureAimThrows(bool a_on)
+    {
+        g_optThrow = a_on;
+    }
+
     std::string SetAimFeature(const std::string& a_name, bool a_on)
     {
         std::atomic<bool>* f = a_name == "lof" ? &g_optLof : a_name == "recoil" ? &g_optRecoil :
-                               a_name == "autoaim" ? &g_optAutoAim : a_name == "clamp" ? &g_optClamp : nullptr;
+                               a_name == "autoaim" ? &g_optAutoAim : a_name == "clamp" ? &g_optClamp :
+                               a_name == "throw" ? &g_optThrow : a_name == "vatsshot" ? &g_vatsShotFix : nullptr;
         const bool installed = a_name == "lof" ? g_lofHooked : a_name == "recoil" ? g_recoilHooked :
-                               a_name == "autoaim" ? (g_autoAimHooked || g_teammateHooked) : a_name == "clamp" ? g_clampOk : false;
+                               a_name == "autoaim" ? (g_autoAimHooked || g_teammateHooked) : a_name == "clamp" ? g_clampOk :
+                               a_name == "throw" || a_name == "vatsshot" ? g_fireHooked : false;
         if (!f) {
-            return "error: aim lof|recoil|autoaim|clamp on|off";
+            return "error: aim lof|recoil|autoaim|clamp|throw|vatsshot on|off";
         }
         *f = a_on;
         return std::format("aim {} {}{}", a_name, a_on ? "on" : "off", installed ? "" : " (not installed at load: no effect)");
@@ -1615,6 +1956,103 @@ namespace fo4flatvr::game
         g_pickHandReq = a_hand == 1 ? 1 : 0;
     }
 
+    bool HandRayWorld(float a_origin[3], float a_dir[3])
+    {
+        HandRay r;
+        if (!GetFreshRay(r)) {
+            return false;
+        }
+        a_origin[0] = r.P.x, a_origin[1] = r.P.y, a_origin[2] = r.P.z;
+        a_dir[0] = r.D.x, a_dir[1] = r.D.y, a_dir[2] = r.D.z;
+        return true;
+    }
+
+    // Pointer beam (PointerBeam.h): first collision along the primary hand ray (the same P/D the pick and the shots use).
+    bool HandRayWorldHit(float a_maxM, float& a_distM, bool& a_hit)
+    {
+        HandRay r;
+        if (!g_calcHit || !(a_maxM > 0.0f) || !GetFreshRay(r) || !InGameWorld()) {
+            return false;
+        }
+        const float  maxU = a_maxM * g_unitsPerMeter;
+        RE::NiPoint3 from{ r.P.x, r.P.y, r.P.z };
+        RE::NiPoint3 vec{ r.D.x * maxU, r.D.y * maxU, r.D.z * maxU };
+        const float  f = g_calcHit(from, vec, false);
+        a_hit = f >= 0.0f && f < 1.0f;
+        a_distM = (a_hit ? f : 1.0f) * a_maxM;
+        return true;
+    }
+
+    // FO4VR activation preview (bShowWandActivationPreview; VR 140EF0F30 per hand, 140F18DC0 reach): reach =
+    // fPrimaryWandMaxGrabDistance (96 u), longer when pointing down: max(reach, (hand z - feet z + reach) * 1.5 * down^2)
+    // (fDownwardGrabFloorDistanceMultiplier:VRWand 1.5); target = that hand's ViewCaster activate pick ref -> raycast to the
+    // hit (here up to a_maxM, the flat pick reaches further than 96 u), else raycast clamped to the reach.
+    bool ActivatePreview(float a_reachM, float a_floorMult, float a_maxM, float& a_lenM, bool& a_target)
+    {
+        HandRay r;
+        auto*   player = RE::PlayerCharacter::GetSingleton();
+        if (!g_calcHit || !player || !(a_reachM > 0.0f) || !GetFreshRay(r) || !InGameWorld()) {
+            return false;
+        }
+        a_target = false;
+        {
+            std::scoped_lock l(g_aimLock);
+            a_target = g_pick.redirected && g_pick.handle != 0 && g_pickHandReq.load() == 0;
+        }
+        if (a_target) {
+            std::uint32_t h;
+            {
+                std::scoped_lock l(g_aimLock);
+                h = g_pick.handle;
+            }
+            const auto ref = LookupRef(h);
+            a_target = ref && !ref->IsDisabled() && !ref->IsDeleted();
+        }
+        float       reach = a_reachM;
+        const float down = -r.D.z / (std::max)(Len(r.D), 1e-6f);
+        if (down >= 0.0f) {
+            const float handH = (r.P.z - player->data.location.z) / g_unitsPerMeter;
+            reach = (std::max)(reach, (handH + a_reachM) * a_floorMult * down * down);
+        }
+        const float  lim = a_target ? (std::max)(a_maxM, reach) : reach;
+        const float  limU = lim * g_unitsPerMeter;
+        RE::NiPoint3 from{ r.P.x, r.P.y, r.P.z };
+        RE::NiPoint3 vec{ r.D.x * limU, r.D.y * limU, r.D.z * limU };
+        const float  f = g_calcHit(from, vec, false);
+        a_lenM = (f >= 0.0f && f < 1.0f ? f : 1.0f) * lim;
+        if (a_target && !(f >= 0.0f && f < 1.0f)) {
+            a_lenM = reach;  // picked but not hit by this test (e.g. a non-collision activator): end at the reach
+        }
+        return true;
+    }
+
+    // FO4VR shows its wand laser (PrimaryWandLaserPointer) while Workshop::QEnabled or PlayerCharacter::GetActorDoingPlayerCommand.
+    // 1.11.240: Workshop::QEnabled 37E430 = movzx eax, byte [30F6EDD]; ret. GetActorDoingPlayerCommand D73010 reads the handle at
+    // PlayerCharacter+0xB1C.
+    int BeamWorldMode()
+    {
+        static const std::uint8_t* s_workshop = [] {
+            const auto* p = reinterpret_cast<const std::uint8_t*>(Base() + 0x37E430);
+            if (p[0] != 0x0F || p[1] != 0xB6 || p[2] != 0x05 || p[7] != 0xC3) {
+                REX::WARN("beam: Workshop::QEnabled (37E430) bytes differ; workshop beam off");
+                return static_cast<const std::uint8_t*>(nullptr);
+            }
+            std::int32_t rel;
+            std::memcpy(&rel, p + 3, sizeof(rel));
+            return p + 7 + rel;
+        }();
+        if (s_workshop && *s_workshop) {
+            return 1;
+        }
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) {
+            return 0;
+        }
+        std::uint32_t handle;
+        std::memcpy(&handle, reinterpret_cast<const std::uint8_t*>(player) + 0xB1C, sizeof(handle));
+        return handle && LookupRef(handle) ? 2 : 0;
+    }
+
     std::uint64_t PickRuns(int a_hand)
     {
         return g_pickRuns[a_hand == 1 ? 1 : 0].load();
@@ -1657,7 +2095,7 @@ namespace fo4flatvr::game
     void RequestEquip(std::uint32_t a_formID, int a_mode)
     {
         g_equipMode = a_mode;
-        g_equipRequest = a_formID;
+        g_equipRequest = a_formID;  // AimTick (a main tick at the main-idle point since 20 Nov: ActorEquipManager off the job threads)
     }
 
     void AimTick()
@@ -1852,6 +2290,14 @@ namespace fo4flatvr::game
             s += std::format(" opts=lof:{}{},recoil:{}{},autoaim:{}{},clamp:{}{}", g_optLof.load() ? 1 : 0, g_lofHooked ? "" : "!",
                 g_optRecoil.load() ? 1 : 0, g_recoilHooked ? "" : "!", g_optAutoAim.load() ? 1 : 0, g_autoAimHooked ? "" : "!",
                 g_optClamp.load() ? 1 : 0, g_clampOk ? "" : "!");
+            {
+                std::scoped_lock l(g_aimLock);
+                s += std::format(" throw={} throwOverrides={} throwSkips={} throwGameHdg={:.1f} throwGamePitchDown={:.1f} throwHdg={:.1f} throwPitchDown={:.1f} trajHooked={} trajCalls={} trajOverrides={}",
+                    g_optThrow.load() ? 1 : 0, g_throwOverrides.load(), g_throwSkips.load(), g_throwGameZ * r2d, g_throwGameX * r2d,
+                    g_throwLastZ * r2d, g_throwLastX * r2d, g_trajHooked ? 1 : 0, g_trajCalls.load(), g_trajOverrides.load());
+                s += std::format(" vatsShotFix={} vatsShots={} vatsFixed={} vatsPredictions={}", g_vatsShotFix.load() ? 1 : 0, g_vatsShots.load(),
+                    g_vatsFixed.load(), g_vatsPredicts.load());
+            }
             const V3 lofEnd{ x.lofO.x + x.lofV.x, x.lofO.y + x.lofV.y, x.lofO.z + x.lofV.z };
             s += std::format(" lofCalls={} lofOverrides={} lofLen={:.1f} lofEngineO={} lofEngineHdg={:.1f} lofEnginePitch={:.1f} lofO={} lofEnd={} lofVecLen={:.1f} lofHdg={:.1f} lofPitch={:.1f}",
                 x.lofCalls, x.lofOverrides, x.lofLen, F3(x.lofEngineO), HeadingDeg(x.lofEngineV), PitchUpDeg(x.lofEngineV), F3(x.lofO),

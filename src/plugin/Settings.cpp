@@ -1,18 +1,50 @@
 #include "plugin/Settings.h"
+#include "plugin/ConfigStore.h"
 
 #include <Windows.h>  // NOMINMAX / WIN32_LEAN_AND_MEAN come from xrcore's public defines
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 
 namespace fo4flatvr
 {
     namespace
     {
+        // 20 Nov (live settings): Load() reads from the merged values in memory (cfgstore::MergedValues, the same text the merged
+        // file holds) with GetPrivateProfile*'s rules, instead of ~170 profile-API calls (about 0.13 ms each = 20 ms per Load on
+        // the Present thread at every live change). Rules measured on the Windows profile API: a present but empty key gives ""
+        // as a string and the default as an int; a fully quoted value loses its quotes; ints take a sign and 0x hex and stop at
+        // the first non-digit (a non-number = 0).
+        thread_local const std::map<std::string, std::string>* t_snap = nullptr;
+
+        std::string Lower(std::string s)
+        {
+            for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return s;
+        }
+
+        const std::string* Snap(const char* a_section, const char* a_key)
+        {
+            if (!t_snap) return nullptr;
+            const auto it = t_snap->find(Lower(a_section) + "\n" + Lower(a_key));
+            return it == t_snap->end() ? nullptr : &it->second;
+        }
+
+        std::string Unquote(const std::string& v)
+        {
+            return v.size() >= 2 && v.front() == '"' && v.back() == '"' ? v.substr(1, v.size() - 2) : v;
+        }
+
         std::string ReadString(const std::string& a_path, const char* a_section, const char* a_key, const char* a_default)
         {
+            if (t_snap) {
+                const auto* v = Snap(a_section, a_key);
+                return v ? Unquote(*v) : std::string(a_default ? a_default : "");
+            }
             char buf[1024]{};
             ::GetPrivateProfileStringA(a_section, a_key, a_default, buf, sizeof(buf), a_path.c_str());
             return buf;
@@ -31,13 +63,31 @@ namespace fo4flatvr
 
         int ReadInt(const std::string& a_path, const char* a_section, const char* a_key, int a_default)
         {
+            if (t_snap) {
+                const auto* v = Snap(a_section, a_key);
+                if (!v || v->empty()) return a_default;
+                const std::string t = Unquote(*v);
+                const char*       c = t.c_str();
+                bool              neg = false;
+                if (*c == '+' || *c == '-') neg = *c++ == '-';
+                const bool hex = c[0] == '0' && (c[1] == 'x' || c[1] == 'X');
+                const long n = std::strtol(hex ? c + 2 : c, nullptr, hex ? 16 : 10);
+                return static_cast<int>(neg ? -n : n);
+            }
             return static_cast<int>(::GetPrivateProfileIntA(a_section, a_key, a_default, a_path.c_str()));
         }
     }
 
     std::string Settings::Path()
     {
-        // Relative to the game's working directory (the install root), like F4SE's own paths.
+        // 20 Nov (ConfigStore.h): the merged settings file (fo4flatvr.ini < MCM's Data\MCM\Settings\fo4flatvr.ini < unsaved
+        // VR-panel previews), Data/F4SE/Plugins/fo4flatvr.effective.ini; the user's fo4flatvr.ini if it could not be written.
+        return cfgstore::EffectivePath();
+    }
+
+    std::string Settings::UserPath()
+    {
+        // Relative to the game's working directory (the install root), like F4SE's own paths. Never written by the plugin.
         return std::filesystem::absolute("Data/F4SE/Plugins/fo4flatvr.ini").string();
     }
 
@@ -45,6 +95,12 @@ namespace fo4flatvr
     {
         Settings   s;
         const auto p = Path();
+        const auto snap = cfgstore::MergedValues();  // 20 Nov: in-memory reads (Snap above)
+        struct SnapScope
+        {
+            explicit SnapScope(const std::map<std::string, std::string>* a_m) { t_snap = a_m; }
+            ~SnapScope() { t_snap = nullptr; }
+        } scope(&snap);
         s.enabled = ReadInt(p, "General", "bEnabled", 1) != 0;
         s.headTracking = ReadInt(p, "General", "bHeadTracking", 1) != 0;
         s.positionTracking = ReadInt(p, "General", "bPositionTracking", 1) != 0;
@@ -57,8 +113,11 @@ namespace fo4flatvr
         s.heightOffsetCm = ReadFloat(p, "General", "fHeightOffsetCm", 0.0f);
         s.headAuthority = ReadFloat(p, "Roomscale", "bHeadAuthority", 1.0f) != 0.0f;
         s.eyeHeightTauS = ReadFloat(p, "Roomscale", "fEyeHeightSmoothS", s.eyeHeightTauS);
+        s.sneakHeightStep = ReadInt(p, "Roomscale", "bSneakHeightStep", 1) != 0;
         s.poseSync = ReadInt(p, "General", "bPoseSync", 1) != 0;
         s.poseSyncTimeoutMs = ReadFloat(p, "General", "fPoseSyncTimeoutMs", s.poseSyncTimeoutMs);
+        s.gpuQueueLimit = ReadInt(p, "General", "bGpuQueueLimit", 1) != 0;
+        s.gpuQueueFrames = (std::clamp)(ReadInt(p, "General", "iGpuQueueFrames", s.gpuQueueFrames), 0, 2);
         s.poseTrace = ReadInt(p, "Debug", "bPoseTrace", 0) != 0;
         s.poseTraceFrames = ReadInt(p, "Debug", "iPoseTraceFrames", s.poseTraceFrames);
         s.poseTraceFiles = ReadInt(p, "Debug", "iPoseTraceFiles", s.poseTraceFiles);
@@ -69,6 +128,7 @@ namespace fo4flatvr
         s.unitsPerMeter = ReadFloat(p, "General", "fUnitsPerMeter", s.unitsPerMeter);
         s.xrRuntimeJson = ReadString(p, "OpenXR", "sRuntimeJson", "");
         s.preferStageSpace = ReadInt(p, "OpenXR", "bPreferStageSpace", 0) != 0;
+        s.recentreOnPoseJump = ReadInt(p, "OpenXR", "bRecentreOnPoseJump", 1) != 0;
         s.quadWidthMeters = ReadFloat(p, "Cinema", "fWidthMeters", s.quadWidthMeters);
         s.quadDistanceMeters = ReadFloat(p, "Cinema", "fDistanceMeters", s.quadDistanceMeters);
         s.quadHeightMeters = ReadFloat(p, "Cinema", "fHeightMeters", s.quadHeightMeters);
@@ -84,6 +144,7 @@ namespace fo4flatvr
         s.suppressCameraRecoil = ReadInt(p, "Controllers", "bSuppressCameraRecoil", s.suppressCameraRecoil ? 1 : 0) != 0;
         s.handAutoAimOverride = ReadInt(p, "Controllers", "bHandAutoAimOverride", s.handAutoAimOverride ? 1 : 0) != 0;
         s.clampHandToCamera = ReadInt(p, "Controllers", "bClampHandToCamera", s.clampHandToCamera ? 1 : 0) != 0;
+        s.aimThrowsWithController = ReadInt(p, "Controllers", "bAimThrowsWithController", s.aimThrowsWithController ? 1 : 0) != 0;
         s.separateHud = ReadInt(p, "HUD", "bSeparateHud", s.separateHud ? 1 : 0) != 0;
         s.hudDistanceMeters = ReadFloat(p, "HUD", "fDistanceMeters", s.hudDistanceMeters);
         s.hudWidthMeters = ReadFloat(p, "HUD", "fWidthMeters", s.hudWidthMeters);
@@ -128,6 +189,8 @@ namespace fo4flatvr
         s.menuWorkshopHandUpMeters = ReadFloat(p, "Menus", "fWorkshopHandUpMeters", s.menuWorkshopHandUpMeters);
         s.menuWorkshopHandBackMeters = ReadFloat(p, "Menus", "fWorkshopHandBackMeters", s.menuWorkshopHandBackMeters);
         s.menuWorkshopHandPitchDeg = ReadFloat(p, "Menus", "fWorkshopHandPitchDeg", s.menuWorkshopHandPitchDeg);
+        s.menuWorkshopHandCrop = ReadInt(p, "Menus", "bWorkshopHandCrop", s.menuWorkshopHandCrop ? 1 : 0) != 0;
+        s.menuWorkshopCropTop = ReadFloat(p, "Menus", "fWorkshopCropTop", s.menuWorkshopCropTop);
         s.menuVatsLabelScale = ReadFloat(p, "Menus", "fVatsLabelScale", s.menuVatsLabelScale);
         s.menuVatsNoVignette = ReadInt(p, "Menus", "bVatsNoVignette", s.menuVatsNoVignette ? 1 : 0) != 0;
         s.pipboyFloating = ReadInt(p, "Pipboy", "bFloating", s.pipboyFloating ? 1 : 0) != 0;
@@ -145,8 +208,16 @@ namespace fo4flatvr
         s.menuWindowMenus = ReadString(p, "Menus", "sWindowMenus", "");
         {
             // [MenuGeometry] <MenuName>=width,distance,height
-            std::string buf(32768, '\0');
-            const DWORD n = ::GetPrivateProfileSectionA("MenuGeometry", buf.data(), static_cast<DWORD>(buf.size()), p.c_str());
+            // the section as GetPrivateProfileSectionA gives it ("key=value" strings, each 0-terminated), from the snapshot
+            std::string buf;
+            for (const auto& [k, v] : snap) {
+                if (k.rfind("menugeometry\n", 0) == 0) {
+                    buf += k.substr(13) + "=" + v;
+                    buf += '\0';
+                }
+            }
+            buf += '\0';
+            const DWORD n = static_cast<DWORD>(buf.size() - 1);
             for (std::size_t i = 0; i < n && buf[i];) {
                 const std::string line(buf.c_str() + i);
                 i += line.size() + 1;
@@ -182,6 +253,7 @@ namespace fo4flatvr
             rb("bSplitDraws", s.stereoSplit);
             rb("bSaoPerEye", s.stereoSaoPerEye);
             rb("bTaaPerEye", s.stereoTaaPerEye);
+            rb("bHiddenAreaMask", s.stereoHiddenAreaMask);
             rb("bCutTaa", s.stereoCutTaa);
             rb("bCutMotionBlur", s.stereoCutMotionBlur);
             rb("bCutDof", s.stereoCutDof);

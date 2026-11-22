@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include <d3d11.h>
 
@@ -118,6 +119,11 @@ namespace xr
         // (FO4VR workshop menu on the secondary wand); nullptr = back to the anchored placement. Pointer hit tests
         // (CinemaQuadPose) follow it.
         void SetCinemaQuadOverride(const Pose* a_poseInRef, float a_widthMeters);
+        // 21 Nov (workshop agent): show only a sub-rectangle of the cinema quad's image (uv 0..1, origin top-left: u0, v0, u1,
+        // v1); the quad keeps its width and takes the sub-rectangle's aspect. nullptr = the whole image. CinemaQuadCrop reports
+        // the active crop (pointer hits map quad uv -> image uv with it).
+        void SetCinemaQuadCrop(const float* a_uv4);
+        bool CinemaQuadCrop(float a_uv4[4]) const;
 
         // Backdrop: in this frame, if no new projection image is submitted (SubmitMono / SubmitEye), show the last one
         // again with the pose/FOV it was rendered with (world-locked, the runtime reprojects it): mono = the mono
@@ -176,6 +182,24 @@ namespace xr
         bool SubmitHud(ID3D11DeviceContext* a_ctx, ID3D11Texture2D* a_src, const Pose& a_poseInView, float a_widthMeters,
             bool a_premultiplied = true);
 
+        // HUD pieces (20 Nov, HUD agent; FO4VR's split HUD: wand HUD, chin compass): one "piece atlas" image (own swapchain,
+        // alpha kept, same copy rules as SubmitHud) shown as up to kMaxHudPieces quad layers, each a sub-rectangle of the
+        // atlas (pixels) with its own pose - in VIEW space (inView, head-locked) or in the REFERENCE space (a hand, an upright
+        // head frame). Width a_pieces[i].widthMeters, height from the rectangle's aspect. Layered right after the HUD quad.
+        // Once per frame with all pieces, between BeginFrame and EndFrame; false = nothing queued.
+        static constexpr int kMaxHudPieces = 4;
+        struct HudPiece
+        {
+            std::int32_t x{ 0 }, y{ 0 }, w{ 0 }, h{ 0 };
+            Pose         pose{};
+            bool         inView{ false };
+            float        widthMeters{ 0.1f };
+            float        heightMeters{ 0.0f };  // 0 = from the rectangle's aspect
+        };
+        bool SubmitHudPieces(ID3D11DeviceContext* a_ctx, ID3D11Texture2D* a_atlas, const HudPiece* a_pieces, int a_count,
+            bool a_premultiplied = true);
+        [[nodiscard]] std::uint64_t HudPieceLayersSubmitted() const noexcept;  // diagnostics: piece layers sent to xrEndFrame
+
         // World-locked quads: a_src (same copy/gamma/state rules as SubmitQuad, own swapchain per slot sized to
         // a_src) on a quad layer at a_poseInRef in the REFERENCE space (FrameInfo::head's space; the caller re-poses
         // it every frame, e.g. from a controller grip pose). Width a_widthMeters, height from a_src's aspect.
@@ -183,7 +207,9 @@ namespace xr
         // a_slot 0..kMaxWorldQuads-1, one layer each: 0 = wrist Pip-Boy screen, 1 = dialogue option panel.
         // Layer order at EndFrame: projection, vignette, HUD, world quads (slot order), cinema quad, fade.
         // Between BeginFrame and EndFrame; returns false if nothing was queued.
-        static constexpr int kMaxWorldQuads = 4;
+        // 20 Nov: slot kTopWorldQuad (4, the VR settings panel) is layered after the cinema quad instead (below the beams).
+        static constexpr int kMaxWorldQuads = 5;
+        static constexpr int kTopWorldQuad = 4;
         bool SubmitWorldQuad(ID3D11DeviceContext* a_ctx, ID3D11Texture2D* a_src, const Pose& a_poseInRef, float a_widthMeters,
             bool a_alphaBlend = false, bool a_premultiplied = true, int a_slot = 0);
         [[nodiscard]] std::uint64_t WorldQuadsSubmitted(int a_slot) const noexcept;  // diagnostics: xrEndFrame calls with that slot's layer
@@ -204,6 +230,25 @@ namespace xr
         [[nodiscard]] std::uint64_t VignetteLayersSubmitted() const noexcept;  // diagnostics: frames with a vignette layer
         [[nodiscard]] std::uint64_t VignetteUploads() const noexcept;          // diagnostics: image regenerations
         [[nodiscard]] std::uint32_t LastLayerCount() const noexcept;           // layers in the last xrEndFrame
+
+        // Pointer beams (laser pointer; plugin/PointerBeam.h decides when and where). Slot 0..kMaxBeams-1 (one per hand):
+        // a ribbon quad from a_from to a_to (REFERENCE space), a_widthMeters wide, turned about its own axis to face
+        // a_viewer (the head), coloured a_rgba (sRGB, straight alpha; soft edges). a_dotSizeMeters > 0 adds an end dot
+        // at a_to facing a_viewer (white with a dark rim, green while a_pressed). Compositor layers, so both eyes see it
+        // at its true 3D place (stereo-correct) and it draws over the panels/menus it ends on. All beams of a frame share
+        // one colour image (the last a_rgba wins). Layer order at EndFrame: ..., cinema quad, beams, end dots, fade.
+        // Between BeginFrame and EndFrame; returns false if nothing was queued.
+        // a_style kBeamPreview: FO4VR's activation preview (bShowWandActivationPreview) instead - the ribbon is a cone
+        // (full width at a_from, a point at a_to; alpha rising from 0 at a_from to a_rgba[3] at a_to: world_targetIndicator_ray.nif)
+        // and the end marker an additive glow disc a_dotSizeMeters across in a_rgba's colour: a_pressed = "target" (bright
+        // core + halo, activateArc_Target.nif) else a faint even disc (activateArc_noTarget.nif). Own images (the laser's stay).
+        static constexpr int kMaxBeams = 2;
+        // a_dotAt: the end dot / marker there instead of at a_to. A ribbon with a_rgba[3] <= 0 is not drawn (its dot still is).
+        static constexpr int kBeamLaser = 0, kBeamPreview = 1;
+        bool SubmitBeam(ID3D11DeviceContext* a_ctx, int a_slot, const Vec3& a_from, const Vec3& a_to, const Vec3& a_viewer, float a_widthMeters,
+            const float a_rgba[4], float a_dotSizeMeters, bool a_pressed, int a_style = kBeamLaser, const Vec3* a_dotAt = nullptr);
+        [[nodiscard]] std::uint64_t BeamLayersSubmitted() const noexcept;  // diagnostics: beam layers (all slots) sent to xrEndFrame
+        [[nodiscard]] std::uint64_t BeamUploads() const noexcept;          // diagnostics: beam/dot image (re)generations
 
         // Symmetric FOV containing eye a_eye's (asymmetric) FOV from the last located views, with the
         // narrower axis widened so tan(h) / tan(v) == a_aspect (width / height) when a_aspect > 0.
@@ -239,7 +284,16 @@ namespace xr
         [[nodiscard]] bool         running() const noexcept;  // session begun and not stopping
         [[nodiscard]] const std::string& lastError() const noexcept;
         [[nodiscard]] std::string  runtimeName() const;      // XrInstanceProperties::runtimeName + version
+        [[nodiscard]] std::string  apiLayers() const;        // 20 Nov: API layers the loader offers (implicit ones load) + ReShade modules seen
         [[nodiscard]] std::int64_t swapchainFormat() const noexcept;  // quad, else mono, else eye swapchain DXGI_FORMAT; 0 before the first submit
+
+        // 22 Nov (hidden-area agent): XR_KHR_visibility_mask. Enabled at instance creation when the runtime offers it; the
+        // hidden-triangle mesh of both eyes is fetched once the session runs and again on XrEventDataVisibilityMaskChangedKHR
+        // (PollEvents). Vertices are view-space tangents (x right, y up, on the z = -1 plane), three indices per triangle.
+        // VisibilityMaskSerial() changes whenever a new mesh is stored (0 = none yet); poll it and re-read.
+        [[nodiscard]] bool          VisibilityMaskSupported() const noexcept;
+        [[nodiscard]] std::uint64_t VisibilityMaskSerial() const noexcept;
+        bool                        VisibilityMask(int a_eye, std::vector<float>& a_xy, std::vector<std::uint32_t>& a_indices) const;
 
     private:
         struct Impl;

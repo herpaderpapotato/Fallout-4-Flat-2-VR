@@ -10,6 +10,7 @@ struct ID3D11DeviceContext;
 namespace xr
 {
     class Runtime;
+    struct Pose;
 }
 
 namespace fo4flatvr::hud
@@ -27,6 +28,50 @@ namespace fo4flatvr::hud
 
     void Configure(const Config& a_cfg);
     const Config& GetConfig();
+
+    // ---- FO4VR HUD split (20 Nov; analysis/vr-hud.md section 9) ------------------------------------------------
+    // FO4VR splits HUDMenu into world-space menus (Fallout4VR.exe 1.2.72 SendHUDMessage::ShowHUD 140AFBEB0, BuildVRNodes
+    // 140EF4AE0): HP / rads / AP / ammo / explosives / effects / fatigue on the primary wand (WSPrimaryWandHUD,
+    // world_primaryWand.nif on PrimaryUIAttachNode), the compass low under the chin (WSHMDHUDStatus, world_HMD_status.nif on
+    // UprightHmdNode), notifications / subtitles / quest / XP on UprightHmdLagNode (WSHMDHUDInfo). Here: the clips' screen
+    // rectangles (Scaleform bounds, game::HudSplitTick) are cut out of the HUD copy into a piece atlas and shown on their own
+    // quads (xr::Runtime::SubmitHudPieces): the meters on the aim hand, the compass on the chin panel. The compass shows per
+    // [HUD] iCompassShow (default: while a hand is raised, not high; VRIK's palm-up rule as option 3) and slides like VRIK's.
+    // Every key is live: pipe "hud set <key> <value>" (config panel / MCM), "hud split" = status.
+    struct SplitConfig
+    {
+        bool  handHud{ true };              // [HUD] bHandHud: meters on the aim hand (FO4VR WSPrimaryWandHUD)
+        float handWidthM{ 0.13f };          // [HUD] fHandHudWidthM
+        float handX{ -0.09f };              // [HUD] fHandHudX/Y/Z (m) in the aim pose (X right, mirrored for the left hand;
+        float handY{ -0.02f };              //   Y up; Z back toward you). FO4VR: fPrimaryWandHUDX:VRUI -6 u (8.6 cm) inward
+        float handZ{ 0.0f };
+        float handPitchDeg{ 0.0f };         // [HUD] fHandHudPitchDeg: tilt about the panel's X (+ = top toward you)
+        bool  compassSplit{ true };         // [HUD] bCompassChin: compass on FO4VR's chin panel (UprightHmdNode)
+        float compassDistM{ 0.32f };        // [HUD] fCompassDistanceM: ahead of the eyes (FO4VR world_HMD_status.nif: 0.22-0.42)
+        float compassHeightM{ -0.55f };     // [HUD] fCompassHeightM: below the eyes (FO4VR: 0.47-0.64 below)
+        float compassWidthM{ 0.55f };       // [HUD] fCompassWidthM (FO4VR panel 0.6 m, curved)
+        int   compassShow{ 2 };             // [HUD] iCompassShow: 0 always, 1 never, 2 hand raised (not high), 3 palm up (VRIK)
+        int   compassHand{ 0 };             // [HUD] iCompassHand: 0 either, 1 left, 2 right
+        float raiseLowM{ 0.45f };           // [HUD] fCompassRaiseLowM: hand at most this far below the eyes ...
+        float raiseHighM{ 0.05f };          // [HUD] fCompassRaiseHighM: ... and at least this far below ("not high")
+        float palmUpDot{ 0.65f };           // [HUD] fCompassPalmUpDot: VRIK's palm-up threshold (cos 49 deg)
+        float slideM{ 0.714f };             // [HUD] fCompassSlideM: VRIK hides by sliding 50 u (0.71 m) down
+        float slideRate{ 10.0f };           // [HUD] fCompassSlideRate: VRIK's rate (dz = dt * 10 * (z - 1), ~0.39 s)
+        bool  leftHanded{ false };          // [Controllers] bLeftHanded: the aim hand (hand HUD) is the left one
+    };
+    void ConfigureSplit(const SplitConfig& a_cfg);
+    SplitConfig GetSplitConfig();
+    void LoadSplitConfig();  // reads the [HUD] split keys from the settings file (start-up)
+    // Pipe "hud set <key> <value>" (ini key name, case-insensitive): live change. Returns the status line or an error.
+    std::string SetSplitValue(const std::string& a_key, const std::string& a_value);
+    std::string SplitStatus();
+    // Game side (UI thread): a piece's rectangle in the HUD target (0..1 of the buffer). a_piece: 0 = hand left part
+    // (HP), 1 = hand right part (AP / ammo), 2 = compass. a_valid false = the clips were not found (piece stays on the HUD).
+    void SetPieceRect(int a_piece, float a_u0, float a_v0, float a_u1, float a_v1, bool a_valid);
+    void SetPieceAniso(float a_sxOverSy);  // stage -> HUD target scale x / y (1 = square pixels; the quads undo it)
+    bool SplitWanted();  // any piece enabled (game side polls the clip bounds only then)
+    // Presenter, after BeginFrame: this frame's head (reference space; null = none) for the compass frame and the gesture.
+    void UpdateFrame(xr::Runtime& a_rt, bool a_began, const xr::Pose* a_head);
 
     // Runtime switch (pipe "hud on|off"); only effective when the game hooks are installed.
     void SetEnabled(bool a_on);

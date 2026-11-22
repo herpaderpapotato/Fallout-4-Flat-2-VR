@@ -1,4 +1,4 @@
-# Launch Fallout 4 through Mod Organizer 2 (F4SE executable, profile TestProfile) so the VFS supplies the fo4flatvr and
+# Launch Fallout 4 through Mod Organizer 2 (F4SE executable, profile TestProfileVR) so the VFS supplies the fo4flatvr and
 # FRIK-flat mods, unless the game is already running, and wait for the plugin's XR session.
 # Since 15 Nov 21:16 the plugins are MO2 mods only; the base Data folder must not contain them (refused below).
 # The OpenXR runtime is whatever fo4flatvr.ini [OpenXR] sRuntimeJson says (empty = the system's active runtime).
@@ -14,7 +14,7 @@ if ($running) {
 $game = 'C:\Program Files (x86)\Steam\steamapps\common\Fallout 4'
 $mo2 = 'C:\Modding\MO2\ModOrganizer.exe'
 $inst = "$env:LOCALAPPDATA\ModOrganizer\Fallout 4"
-$modlist = "$inst\profiles\TestProfile\modlist.txt"
+$modlist = "$inst\profiles\TestProfileVR\modlist.txt"
 $log = "$env:USERPROFILE\Documents\My Games\Fallout4\F4SE\fo4flatvr.log"
 
 # old deploy path: a base copy would load twice / shadow the MO2 mod
@@ -26,7 +26,7 @@ if ($dup) {
 # the mod list is the user's: only read it
 $lines = Get-Content $modlist -ErrorAction SilentlyContinue
 if (-not ($lines -contains '+fo4flatvr')) {
-    Write-Output "REFUSING: MO2 mod fo4flatvr is not enabled in profile TestProfile ($modlist). Enable it in MO2."
+    Write-Output "REFUSING: MO2 mod fo4flatvr is not enabled in profile TestProfileVR ($modlist). Enable it in MO2."
     exit 1
 }
 if (-not ($lines -contains '+FRIK-flat')) { Write-Output "note: FRIK-flat is disabled in MO2 (no FRIK smooth movement / body)." }
@@ -36,7 +36,7 @@ if (Test-Path "$inst\overwrite\F4SE\Plugins\fo4flatvr.ini") {
 
 $start = Get-Date
 try {
-    Start-Process -FilePath $mo2 -ArgumentList @('-i', '"Fallout 4"', '-p', 'TestProfile', 'run', '-e', 'F4SE') -WorkingDirectory (Split-Path $mo2) -ErrorAction Stop
+    Start-Process -FilePath $mo2 -ArgumentList @('-i', '"Fallout 4"', '-p', 'TestProfileVR', 'run', '-e', 'F4SE') -WorkingDirectory (Split-Path $mo2) -ErrorAction Stop
 } catch {
     Write-Output "launch failed: $($_.Exception.Message)"
     exit 1

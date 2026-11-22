@@ -1,4 +1,9 @@
 #include "plugin/CameraDirector.h"
+#include "plugin/ThreadQueues.h"
+
+#include "plugin/CameraTweaks.h"
+#include "plugin/ConfigStore.h"
+#include "plugin/GameMenuPointer.h"
 
 #include "plugin/GameBridge.h"
 #include "plugin/Gestures.h"
@@ -11,6 +16,8 @@
 #include <F4SE/F4SE.h>
 #include <RE/Fallout.h>
 
+#include "plugin/HeadHideCore.h"
+
 #include <Windows.h>
 #undef ERROR
 
@@ -22,6 +29,7 @@
 #include <cstring>
 #include <format>
 #include <mutex>
+#include <vector>
 
 namespace fo4flatvr::camdir
 {
@@ -141,6 +149,12 @@ namespace fo4flatvr::camdir
             return std::atan2(fx, fy);
         }
 
+        // 20 Nov late ([Camera] bOrbitStatesScene): the game's orbit cameras (idle orbit 1, third person 8, mount 10, bleedout 11,
+        // dialogue camera 12; BleedoutCameraState derives from ThirdPersonState). TRACK there writes Rz(owned heading) x head
+        // into the orbit camera's root at the orbit position (user ini sPolicyBleedout=TRACK, 20 Nov 22:45 headset: "bleedout
+        // status camera causing movement based on head orientation"); SCENE takes the orbit camera's own yaw as the base.
+        bool OrbitState(int a_st) { return a_st == 1 || a_st == 8 || a_st == 10 || a_st == 11 || a_st == 12; }
+
         struct Cfg
         {
             bool   enabled{ true };
@@ -186,6 +200,26 @@ namespace fo4flatvr::camdir
             bool   freeAafThird{ true };      // bFreeCamAAFThirdPerson: AAF's own Force3rdPerson passes bBlockThirdPerson (player AAF-busy)
             bool   freeMoveView{ true };      // bFreeCamMoveWithView: free-camera stick flying follows the head-tracked view
             bool   freeHeadDelta{ true };     // bFreeCamHeadDelta: head offset counted from the scene entry / last snap (POV at the head)
+            // 20 Nov (CameraDirector.h): the two camera-lock comparison modes, HUD notifications, same controls in every view
+            bool   lockFp{ false };           // bLockFirstPerson
+            bool   bodyCam{ false };          // bBodyCamera
+            bool   hudNotify{ true };         // bCameraHudNotify
+            bool   sameInput{ true };         // bSameInputAllViews
+            // 20 Nov late (user: "AAF fails defeat scenes when third person is blocked"; "bleedout status camera causing movement
+            // based on head orientation"; "AAF with PoV camera ... drifts back to a point left"; "locked out of pip boy"):
+            bool   lockScenes{ true };        // bLockAllowScenes: under bLockFirstPerson, AAF / defeat scenes keep their cameras
+            float  defeatWindowS{ 30.0f };    // fDefeatWindowS: a script's third person this long after a bleedout is the defeat flow
+            bool   orbitScene{ true };        // bOrbitStatesScene: TRACK on an orbit camera (idle orbit, third person, mount,
+                                             // bleedout, dialogue camera) is shown as SCENE
+            bool   freeOwnStick{ true };      // bFreeCamOwnStickYaw: the stick's turn in the free camera is our own offset
+            bool   aftercare{ true };         // bSceneAftercare: Pip-Boy refusals diagnosed; scene leftovers released
+            // 21 Nov (user: "camera stays on the body" stays where the player's body was in a scene, not at the animated
+            // location; "none of the POV AAF cameras actually follow an actor's head position")
+            bool   bodyFollow{ true };        // bBodyCameraFollowsAnimation: the body camera rides the animated Head bone when
+                                             // the body is animated away from the capsule (scenes, furniture, paired anims)
+            float  bodyEyeFwd{ 8.0f };        // fBodyCameraEyeForward: eye in front of the Head bone along the face (units)
+            bool   bodyYieldPov{ true };      // bBodyCameraYieldsToPov: free camera at ANOTHER actor's head (AAF POV) = SCENE
+            bool   freeStatePos{ true };      // bFreeCamStatePosition: the free camera's own translation (after AAF's write)
         };
 
         struct Fade
@@ -270,13 +304,65 @@ namespace fo4flatvr::camdir
             Clock::time_point thirdCtrlSince{}, fpQuietSince{};
             std::uint64_t     thirdReturns{ 0 };
             std::string       lastReturn{ "-" };
+            // first-person lock backstop / body camera (20 Nov)
+            Clock::time_point lockForceAt{};
+            std::uint64_t     lockForces{ 0 };
+            std::string       lockLast{ "-" };
+            bool              body{ false };        // this tick: the body camera applied
+            V3                bodyBase, prevBody;   // eye base on the body (before the head offset)
+            bool              havePrevBody{ false };
+            float             bodyEyeH{ 0.0f };
+            std::uint64_t     bodyTicks{ 0 };
+            // body camera follows the animation (bBodyCameraFollowsAnimation, 21 Nov)
+            float             bodyFollowW{ 0.0f };     // 0 = capsule eye, 1 = animated eye (blended over kBodyBlendS)
+            bool              bodyFollowWant{ false };
+            bool              bodyAnimOk{ false };     // the Head bone was read this tick
+            bool              bodySceneNow{ false };   // scene / furniture / bleedout signal (10 Hz)
+            float             bodyDisp{ 0.0f };        // animated eye - capsule eye (units)
+            V3                bodyAnimEye{};
+            Clock::time_point bodyFollowAt{}, bodySceneAt{};
+            std::uint64_t     bodyFollowSnaps{ 0 }, bodyFollowBlends{ 0 }, bodyAnimMiss{ 0 };
+            // bBodyCameraYieldsToPov: the free camera sits at another actor's head (AAF POV on an NPC; PollHeadHide, 10 Hz)
+            bool              bodyYield{ false };
+            bool              lastScene{ false };      // last tick showed SCENE (body <-> SCENE switch in one state)
+            std::string       bodyYieldWho{ "-" };
+            std::uint64_t     bodyYields{ 0 };
+            std::uint64_t     freeStateReads{ 0 };     // bFreeCamStatePosition: ticks that used the state's translation
+            bool              preYawOk{ false };   // the game camera's own yaw (before our write), for GameCameraYaw
+            float             preYaw{ 0.0f };
+            // free camera: the stick's turn kept as our own yaw on top of the game's (AAF's POV auto mode re-aims the free
+            // camera at the actor's gaze 1.2 s after the last look input, so a turn written into the camera drifted back)
+            float             stickYaw{ 0.0f };
+            std::uint64_t     stickTurnUpdates{ 0 };
+            // AAF / defeat scenes under the camera locks
+            Clock::time_point sceneFlowSeen{};      // last tick a scene / defeat signal held
+            Clock::time_point flowCheckAt{};        // last SceneFlow evaluation (10 Hz)
+            bool              sceneFlowNow{ false };
+            std::uint64_t     scenePasses{ 0 }, lockForceSkips{ 0 };
+            std::string       lastScenePass{ "-" };
         };
+        // HUD notifications (PollNotify; main thread)
+        struct Notify
+        {
+            int           state{ -100 };
+            std::string   mode;
+            std::uint64_t shown{ 0 }, refusedShown{ 0 };
+            std::string   last{ "-" };
+        };
+        Notify             g_n;
+        std::string        g_refused;            // a refused camera request to announce (g_lock)
+        Clock::time_point  g_refusedAt{};        // last announced refusal (throttle)
+        std::string        g_refusedLastText;
         std::atomic<std::uint64_t> g_freeTicks{ 0 };
         std::atomic<bool>          g_thirdArmReq{ false };  // HkCamFn<Force3rdPerson>: a script third person (arms the return)
 
         std::mutex g_lock;
         Cfg        g_cfg;
         Dir        g_d;
+        // 20 Nov (live settings): the free-camera thunk is patched whatever bFreeCamScene says at load; this is the switch
+        // (read without the lock by the thunk hook). FreeOn(): the scene view is on and the thunk patched (g_lock held).
+        std::atomic<bool> g_freeSceneLive{ false };
+        bool FreeOn() { return g_d.freeHooked && g_cfg.freeScene; }
         Fade       g_f;
 
         using Update_t = void (*)(RE::TESCamera*);
@@ -322,9 +408,22 @@ namespace fo4flatvr::camdir
         constexpr std::uintptr_t kPushHudCallSite = 0x1027DA2;     // StartFurnitureMode -> SendHUDMessage::PushHUDMode
         constexpr std::uintptr_t kPaKwCallSite = 0x44CBB3;         // TESFurniture::Activate -> PowerArmor::GetFurnitureKeyword
 
-        enum GateId { kGFurniture, kGAnimated, kGSet3rd, kGForce3rd, kGStartVats, kGForceVats, kGStopVats, kGPipboyStop, kGVatsState, kGates };
+        // 20 Nov, first-person lock (read in Ghidra 1.11.240): PlayerCamera::ToggleFreeCameraMode(cam, bool) 1027920 (enters
+        // with PushState(3) unless the current state is the free camera +0xF8, else pops it), StartBleedoutMode(cam) 1028580
+        // (SetState(+0x138) and the old state onto tempReturnStates; StopBleedoutMode 1028600 only removes +0x138 from that
+        // stack when it is not current: harmless without a start), StartMountMode(cam, mount handle*) 10282E0 (PushState(10);
+        // StopMountMode 1028370 searches the stack for +0x130 first: harmless without a start). The dialogue camera is not
+        // detoured: StartDialogueMode also updates the followers' packages; bDialogueCameraEnable=0 stops TryDialogueCamera
+        // before it (camtweak, forced on by the lock).
+        constexpr std::uintptr_t kToggleFreeCam = 0x1027920;
+        constexpr std::uintptr_t kStartBleedout = 0x1028580;
+        constexpr std::uintptr_t kStartMount = 0x10282E0;
+
+        enum GateId { kGFurniture, kGAnimated, kGSet3rd, kGForce3rd, kGStartVats, kGForceVats, kGStopVats, kGPipboyStop, kGVatsState,
+            kGFreeCam, kGBleedout, kGMount, kGates };
         const char* const kGateNames[kGates] = { "StartFurnitureMode", "StartAnimatedMode", "Set3rdPerson", "Force3rdPerson",
-            "StartVATSMode", "ForceVATSMode", "StopVATSMode", "StopPipboyMode->TESCamera::Update", "VATS ChangeState(2)" };
+            "StartVATSMode", "ForceVATSMode", "StopVATSMode", "StopPipboyMode->TESCamera::Update", "VATS ChangeState(2)",
+            "ToggleFreeCameraMode", "StartBleedoutMode", "StartMountMode" };
         struct GateStat
         {
             bool          patched{ false };
@@ -592,8 +691,9 @@ namespace fo4flatvr::camdir
                 std::scoped_lock l(g_lock);
                 ++g_gs[kGFurniture].calls;
                 if (pa) ++g_paFurniture;
-                gate = pa ? g_cfg.gatePowerArmor : g_cfg.gateFurniture;
+                gate = (pa ? g_cfg.gatePowerArmor : g_cfg.gateFurniture) || g_cfg.lockFp;
                 if (gate) ++g_gs[kGFurniture].blocked;
+                if (gate && g_cfg.lockFp) g_refused = pa ? "power armour camera refused" : "furniture camera refused";
                 g_lastGate = std::format("StartFurnitureMode {:08X} pa={} {}", a_ref ? a_ref->GetFormID() : 0, pa ? 1 : 0,
                     gate ? "gated" : "passed");
             }
@@ -727,8 +827,9 @@ namespace fo4flatvr::camdir
             {
                 std::scoped_lock l(g_lock);
                 ++g_gs[kGAnimated].calls;
-                gate = g_cfg.gateAnimated;
+                gate = g_cfg.gateAnimated || g_cfg.lockFp;
                 if (gate) ++g_gs[kGAnimated].blocked;
+                if (gate && g_cfg.lockFp) g_refused = "animated camera refused";
                 g_lastGate = std::format("StartAnimatedMode '{}' {}", a_node ? a_node : "", gate ? "gated" : "passed");
             }
             REX::INFO("camdir gate: StartAnimatedMode node '{}' {} -> {}", a_node ? a_node : "", a_b, gate ? "skipped" : "original");
@@ -801,9 +902,60 @@ namespace fo4flatvr::camdir
                     return true;  // AI-driven player (scripted walk / scene)
                 }
             }
-            auto* dh = RE::TESDataHandler::GetSingleton();
-            auto* kw = dh ? dh->LookupForm<RE::BGSKeyword>(0x00915A, "AAF.esm") : nullptr;
+            // the keyword is looked up once (LookupForm walks the plugin list; this runs every camera tick now)
+            static std::atomic<RE::BGSKeyword*> s_kw{ nullptr };
+            static std::atomic<int>             s_tries{ 0 };
+            RE::BGSKeyword* kw = s_kw.load(std::memory_order_relaxed);
+            if (!kw && s_tries.load(std::memory_order_relaxed) < 5) {
+                ++s_tries;
+                auto* dh = RE::TESDataHandler::GetSingleton();
+                kw = dh ? dh->LookupForm<RE::BGSKeyword>(0x00915A, "AAF.esm") : nullptr;
+                s_kw = kw;
+            }
             return kw && player->HasKeywordHelper(kw, nullptr);
+        }
+
+        // ---- AAF / defeat scenes under the camera locks (20 Nov late, user: "AAF fails defeat scenes when third person is
+        // blocked") ----
+        // Defeat mods (AAF Violate FPV_OnHit Surrender: InputEnableLayer.DisablePlayerControls, wait while IsBleedingOut,
+        // then "If Game.GetCameraState() == 0: Game.ForceThirdPerson()", then the AAF scene) ask for third person AFTER the
+        // player's bleedout and BEFORE AAF's walk makes the player AI-driven: neither AAF signal holds yet. So a bleedout
+        // (the player's life state essential-down / bleedout, or a StartBleedoutMode) opens a defeat window of
+        // fDefeatWindowS in which a script's third person passes the blocks. User log 20 Nov 22:09 / 22:44: StartBleedoutMode
+        // and Force3rdPerson refused by bLockFirstPerson -> the scene never started.
+        std::atomic<std::int64_t> g_bleedoutSeenMs{ 0 };  // steady clock ms of the last bleedout signal (0 = never)
+        std::int64_t NowMs() { return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count(); }
+        bool PlayerBleedingOut()
+        {
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            if (!player) return false;
+            const auto ls = static_cast<const RE::ActorState*>(player)->lifeState;  // 7 essential down, 8 bleedout
+            return ls == 7 || ls == 8;
+        }
+        void NoteBleedout() { g_bleedoutSeenMs = NowMs(); }
+        // a scene / defeat flow holds (g_lock held or not: no director state read)
+        bool SceneFlow(float a_defeatWindowS, const char** a_why = nullptr)
+        {
+            const char* why = nullptr;
+            if (PlayerBleedingOut()) {
+                NoteBleedout();
+                why = "bleedout";
+            } else if (PlayerAafBusy()) {
+                why = "AI-driven / AAF-busy";
+            } else {
+                const auto seen = g_bleedoutSeenMs.load();
+                if (seen && a_defeatWindowS > 0.0f && NowMs() - seen < static_cast<std::int64_t>(a_defeatWindowS * 1000.0f)) {
+                    why = "defeat window after a bleedout";
+                }
+            }
+            if (a_why) *a_why = why ? why : "-";
+            return why != nullptr;
+        }
+        // a block (bBlockThirdPerson / bLockFirstPerson) lets this camera request through for an AAF / defeat scene (g_lock held)
+        bool ScenePassLocked(const char** a_why)
+        {
+            const bool on = g_cfg.lockFp ? g_cfg.lockScenes : g_cfg.freeAafThird;
+            return on && (g_cfg.lockFp || FreeOn()) && SceneFlow(g_cfg.defeatWindowS, a_why);
         }
 
         template <int G>
@@ -815,7 +967,7 @@ namespace fo4flatvr::camdir
                 std::scoped_lock l(g_lock);
                 ++g_gs[G].calls;
                 if constexpr (G == kGSet3rd || G == kGForce3rd) {
-                    gate = g_cfg.blockThirdPerson;
+                    gate = g_cfg.blockThirdPerson || g_cfg.lockFp;
                     orig = G == kGSet3rd ? g_origSet3rd : g_origForce3rd;
                     if constexpr (G == kGForce3rd) {
                         // AAF locks the player with Game.ForceThirdPerson() then the fly cam (AAF_MainQuestScript DoLockActor,
@@ -823,12 +975,19 @@ namespace fo4flatvr::camdir
                         // until our late Show1stPerson(false) on the free-camera entry - after AAF's first PlayIdle - and the
                         // player's later idles did not take (user, headset 15 Nov 17:16-17:23; aaf_visibility.log shown3rd=0 at the
                         // first idle). Let AAF's own call through, as in the flat game: state 8 fades (fThirdPersonGraceMs), then 3.
-                        if (gate && g_cfg.freeAafThird && g_d.freeHooked && PlayerAafBusy()) {
+                        // 20 Nov late: the defeat flow too (bleedout / defeat window, see SceneFlow), and under bLockFirstPerson
+                        // with bLockAllowScenes (the scene's views are SCENE / the body camera; the lock's backstop waits).
+                        const char* why = "-";
+                        if (gate && ScenePassLocked(&why)) {
                             gate = false;
                             ++g_d.aafThirdPassed;
-                            REX::INFO("camdir gate: Force3rdPerson with the player AI-driven / AAF-busy (scene lock) -> passed (bFreeCamAAFThirdPerson)");
+                            ++g_d.scenePasses;
+                            g_d.lastScenePass = std::format("Force3rdPerson ({})", why);
+                            REX::INFO("camdir gate: Force3rdPerson during an AAF / defeat scene ({}) -> passed ({})", why,
+                                g_cfg.lockFp ? "bLockAllowScenes" : "bFreeCamAAFThirdPerson");
                         }
                     }
+                    if (gate && g_cfg.lockFp) g_refused = "third person refused";
                 } else if constexpr (G == kGStartVats || G == kGForceVats) {
                     gate = g_cfg.gateVats;
                     orig = G == kGStartVats ? g_origStartVats : g_origForceVats;
@@ -855,6 +1014,176 @@ namespace fo4flatvr::camdir
                     g_d.thirdArmed = false;
                 }
             }
+        }
+
+        // 20 Nov, first-person lock: the free camera (entering only), bleedout and mount cameras
+        using ToggleFree_t = void (*)(RE::PlayerCamera*, bool);
+        using StartMount_t = void (*)(RE::PlayerCamera*, void*);
+        ToggleFree_t g_origToggleFree = nullptr;
+        CamFn_t      g_origStartBleed = nullptr;
+        StartMount_t g_origStartMount = nullptr;
+
+        void HkToggleFreeCam(RE::PlayerCamera* a_cam, bool a_b)
+        {
+            auto*       c = reinterpret_cast<std::uint8_t*>(a_cam);
+            void* const cur = *reinterpret_cast<void**>(c + 0x28);
+            void* const freeSt = *reinterpret_cast<void**>(c + 0xF8);  // cameraStates[3]
+            const bool  entering = !cur || cur != freeSt;
+            bool        gate;
+            {
+                std::scoped_lock l(g_lock);
+                ++g_gs[kGFreeCam].calls;
+                gate = entering && g_cfg.lockFp;
+                const char* why = "-";
+                if (gate && ScenePassLocked(&why)) {  // AAF's fly cam during its scene (bLockAllowScenes)
+                    gate = false;
+                    ++g_d.scenePasses;
+                    g_d.lastScenePass = std::format("ToggleFreeCameraMode ({})", why);
+                    REX::INFO("camdir gate: free camera during an AAF / defeat scene ({}) -> passed (bLockAllowScenes)", why);
+                }
+                if (gate) {
+                    ++g_gs[kGFreeCam].blocked;
+                    g_refused = "free camera refused";
+                }
+                g_lastGate = std::format("ToggleFreeCameraMode {} {}", entering ? "enter" : "leave", gate ? "gated" : "passed");
+            }
+            REX::INFO("camdir gate: ToggleFreeCameraMode ({}) -> {}", entering ? "enter" : "leave", gate ? "skipped (first-person lock)" : "original");
+            if (!gate) {
+                g_origToggleFree(a_cam, a_b);
+            }
+        }
+
+        void HkStartBleedout(RE::PlayerCamera* a_cam)
+        {
+            bool gate;
+            {
+                std::scoped_lock l(g_lock);
+                ++g_gs[kGBleedout].calls;
+                NoteBleedout();  // opens the defeat window (SceneFlow)
+                // the bleedout camera is the first step of a defeat flow: under bLockFirstPerson it passes with bLockAllowScenes
+                // (shown SCENE / on the body; the lock's backstop waits while the flow lasts)
+                gate = g_cfg.lockFp && !g_cfg.lockScenes;
+                if (g_cfg.lockFp && !gate) {
+                    ++g_d.scenePasses;
+                    g_d.lastScenePass = "StartBleedoutMode (defeat flow)";
+                }
+                if (gate) {
+                    ++g_gs[kGBleedout].blocked;
+                    g_refused = "bleedout camera refused";
+                }
+                g_lastGate = std::format("StartBleedoutMode {}", gate ? "gated" : "passed");
+            }
+            REX::INFO("camdir gate: StartBleedoutMode -> {}", gate ? "skipped (first-person lock)" : "original");
+            if (!gate) {
+                g_origStartBleed(a_cam);
+            }
+        }
+
+        void HkStartMount(RE::PlayerCamera* a_cam, void* a_mount)
+        {
+            bool gate;
+            {
+                std::scoped_lock l(g_lock);
+                ++g_gs[kGMount].calls;
+                gate = g_cfg.lockFp;
+                if (gate) {
+                    ++g_gs[kGMount].blocked;
+                    g_refused = "mount camera refused";
+                }
+                g_lastGate = std::format("StartMountMode {}", gate ? "gated" : "passed");
+            }
+            REX::INFO("camdir gate: StartMountMode -> {}", gate ? "skipped (first-person lock)" : "original");
+            if (!gate) {
+                g_origStartMount(a_cam, a_mount);
+            }
+        }
+
+        // body camera applies to this state (g_lock held): every state but first person / iron sights (already on the body)
+        // and VATS (the VATS window keeps the flat VATS experience)
+        // 21 Nov: except the free camera while it sits at another actor's head (AAF POV on an NPC, bBodyCameraYieldsToPov):
+        // that is AAF's chosen view, shown as SCENE (AAF's POV point + head motion)
+        bool BodyAppliesLocked(int a_st)
+        {
+            return g_d.installed && g_cfg.enabled && g_cfg.bodyCam && a_st >= 0 && a_st < kStates && a_st != 0 && a_st != 4 && a_st != 2 &&
+                   !(a_st == kStateFree && g_cfg.bodyYieldPov && g_d.bodyYield);
+        }
+
+        // ---- animated Head bone (21 Nov) ----
+        // The actor's animated "Head" bone, world: the flattened bone tree's own entry (the body skeleton bone). A by-name
+        // search can land on the facebones rig's static duplicate 'HEAD' after a 3D rebuild (AAF CameraCaller.cpp
+        // FindHeadWorld: the camera froze at the root while the animation continued); it stays as the fallback.
+        RE::BSFlattenedBoneTree* BoneTreeOf(RE::NiAVObject* a_root)
+        {
+            if (!a_root) return nullptr;
+            if (auto* t = netimmerse_cast<RE::BSFlattenedBoneTree*>(a_root)) return t;
+            if (auto* n = a_root->IsNode()) {
+                for (auto& ch : n->children) {
+                    if (auto* t = ch ? netimmerse_cast<RE::BSFlattenedBoneTree*>(ch.get()) : nullptr) return t;
+                }
+            }
+            return nullptr;
+        }
+
+        const RE::NiTransform* HeadBoneWorld(RE::NiAVObject* a_root)
+        {
+            if (!a_root) return nullptr;
+            static const RE::BSFixedString kHead("Head");
+            if (auto* tree = BoneTreeOf(a_root); tree && tree->bone && tree->boneCount > 0) {
+                const auto it = tree->boneMap.find(kHead);
+                if (it != tree->boneMap.end() && it->second >= 0 && it->second < tree->boneCount) {
+                    return &tree->bone[it->second].world;
+                }
+            }
+            if (auto* node = a_root->GetObjectByName(kHead)) return &node->world;
+            return nullptr;
+        }
+
+        // The player's third-person Head bone, cached per 3D root (camera tick, g_lock held). Read in the director tick: that
+        // runs inside PlayerCamera::UpdateCamera (call 1026035) / the free-camera thunk, i.e. in Main::OnIdle_UpdatePlayer
+        // AFTER PlayerCharacter::UpdateAnimation (C35018: graph -> bone locals) and PlayerCharacter::UpdateScenegraph
+        // (C35076: NiAVObject::Update of the third-person 3D, root offset included) on the same job thread: this frame's
+        // final pose, no lag, no race. (Update3rdPSceneGraph C3512F after the camera re-runs the same pose; FRIK-flat's
+        // frame at C351F3 leaves the body to the engine outside first person / iron sights.)
+        struct BodyHeadCache
+        {
+            RE::NiPointer<RE::NiAVObject> root, tree;
+            int                           idx{ -1 };
+            const char*                   name{ nullptr };  // the pooled name at idx (a rebuilt tree changes it)
+        };
+        BodyHeadCache g_bh;
+
+        bool PlayerHeadWorld(RE::PlayerCharacter* a_player, RE::NiTransform& a_out)
+        {
+            auto* root = a_player ? static_cast<RE::TESObjectREFR*>(a_player)->Get3D(false) : nullptr;  // third-person 3D
+            if (!root) {
+                g_bh = {};
+                return false;
+            }
+            auto* tree = static_cast<RE::BSFlattenedBoneTree*>(g_bh.tree.get());
+            const bool valid = g_bh.root.get() == root && tree && g_bh.idx >= 0 && g_bh.idx < tree->boneCount && tree->bone &&
+                               tree->bone[g_bh.idx].name.c_str() == g_bh.name;
+            if (!valid) {
+                g_bh = {};
+                g_bh.root.reset(root);
+                if (auto* t = BoneTreeOf(root); t && t->bone && t->boneCount > 0) {
+                    static const RE::BSFixedString kHead("Head");
+                    const auto it = t->boneMap.find(kHead);
+                    if (it != t->boneMap.end() && it->second >= 0 && it->second < t->boneCount) {
+                        g_bh.tree.reset(t);
+                        g_bh.idx = it->second;
+                        g_bh.name = t->bone[it->second].name.c_str();
+                        tree = t;
+                    }
+                }
+                if (g_bh.idx < 0) {  // no flattened tree: by name (uncached)
+                    const auto* w = HeadBoneWorld(root);
+                    if (!w) return false;
+                    a_out = *w;
+                    return true;
+                }
+            }
+            a_out = tree->bone[g_bh.idx].world;
+            return true;
         }
 
         // fade clock (g_lock held)
@@ -912,12 +1241,44 @@ namespace fo4flatvr::camdir
             const int st = cam->currentState ? static_cast<int>(cam->currentState->id.get()) : -1;
             Policy pol = !g_cfg.enabled ? (st == 0 ? Policy::kTrack : Policy::kCinema)
                                         : (st >= 0 && st < kStates ? g_cfg.table[st] : Policy::kCinema);
-            const bool freeScene = g_cfg.enabled && d.freeHooked;  // bFreeCamScene and the thunk patched
-            auto       sceneOf = [&](int a_st) { return g_cfg.enabled && a_st >= 0 && a_st < kStates && d.sceneSt[a_st]; };
+            const bool freeScene = g_cfg.enabled && FreeOn();  // bFreeCamScene and the thunk patched
+            // bBodyCamera: this state is shown from the first-person eye on the body (TRACK), whatever its policy
+            const bool body = BodyAppliesLocked(st);
+            if (body) pol = Policy::kTrack;
+            d.body = body;
+            auto       sceneOf = [&](int a_st) {
+                return g_cfg.enabled && a_st >= 0 && a_st < kStates && d.sceneSt[a_st] && !BodyAppliesLocked(a_st);
+            };
             // SCENE (the AAF free-camera method for every game camera without its own handling): this state is head-tracked
             // from the game camera's position and yaw
             const bool scene = sceneOf(st);
             const bool changed = st != d.state;
+            // AAF / defeat scene in progress (bLockAllowScenes: the lock's backstop waits; SceneFlow). The camera state itself
+            // counts while the lock let it through: the free camera / bleedout with a scene pass seen.
+            // 10 Hz (keyword test on the player), every tick on a state change; first person without the lock skips it
+            if (st == 11) NoteBleedout();
+            if ((g_cfg.lockFp || st != 0) && (changed || !d.flowCheckAt.time_since_epoch().count() || Ms(d.flowCheckAt, now) >= 100.0)) {
+                d.flowCheckAt = now;
+                d.sceneFlowNow = SceneFlow(g_cfg.defeatWindowS);
+            } else if (!g_cfg.lockFp && st == 0) {
+                d.sceneFlowNow = false;
+            }
+            if (d.sceneFlowNow) d.sceneFlowSeen = now;
+            // free camera stick yaw: a scene-lifetime offset, dropped when the view leaves the SCENE states (first person ...)
+            if (changed && !scene && d.stickYaw != 0.0f) {
+                REX::INFO("camdir: free-camera stick yaw {:.1f} deg dropped (state {} {})", d.stickYaw * kR2D, st, StateName(st));
+                d.stickYaw = 0.0f;
+            }
+            // 21 Nov: the body camera <-> SCENE within one state (bBodyCameraYieldsToPov, a live bBodyCamera toggle) is a scene
+            // entry too (head-motion base reset: the view sits at the game camera's point, e.g. AAF's POV head)
+            if (!changed && scene && !d.lastScene) {
+                d.freeEntry = true;
+                d.sceneKeepHead = false;
+                d.havePrevGy = false;
+                d.glideFrames = 0;
+                ++d.sceneEntries;
+            }
+            d.lastScene = scene;
             if (changed) {
                 ++d.transitions;
                 d.prevState = d.state;
@@ -932,7 +1293,7 @@ namespace fo4flatvr::camdir
                     d.glideFrames = 0;
                     ++d.sceneEntries;
                 }
-                if (scene && st == kStateFree) {
+                if (scene && st == kStateFree && (!g_cfg.lockFp || (g_cfg.lockScenes && d.sceneFlowNow))) {
                     // AAF with third person gated (bBlockThirdPerson) goes 0 -> 3 directly: the player keeps the first-person
                     // body, so the scene's animation would not be seen. Show the third-person body (Show1stPerson queues
                     // through the TaskQueueInterface; FirstPersonState::Begin 1020430 calls Show1stPerson(true) when the
@@ -989,21 +1350,58 @@ namespace fo4flatvr::camdir
                     d.lastReturn = std::format("after {:.0f} ms in third person (from {})", Ms(d.stateSince, now), StateName(d.prevState));
                     REX::INFO("camdir: script third person, player controls-driven again for {:.1f} s -> PlayerCamera::Force1stPerson "
                               "(bThirdPersonReturn; {})", g_cfg.thirdReturnS, d.lastReturn);
-                    if (const auto tasks = F4SE::GetTaskInterface()) {
-                        tasks->AddTask([]() {
-                            auto* pc = RE::PlayerCamera::GetSingleton();
-                            if (pc && pc->currentState && static_cast<int>(pc->currentState->id.get()) == kStateThird && g_force1st) {
-                                g_force1st(pc);
-                            }
-                        });
-                    }
+                    // main-idle queue (ThreadQueues.h): this runs inside TESCamera::Update (a job thread while the game runs)
+                    tq::RunOnMain([]() {
+                        auto* pc = RE::PlayerCamera::GetSingleton();
+                        if (pc && pc->currentState && static_cast<int>(pc->currentState->id.get()) == kStateThird && g_force1st) {
+                            g_force1st(pc);
+                        }
+                    });
                 }
+            }
+
+            // ---- first-person lock backstop (bLockFirstPerson): a non-first-person state no gate caught (a save loaded in
+            // third person, a mod's own PushState, a state the lock was switched on in) -> Force1stPerson; VATS excepted
+            // 20 Nov late (bLockAllowScenes): not while an AAF / defeat scene runs, nor for 2 s after its last signal (AAF's unlock
+            // goes 3 -> 8 -> 0 itself; Violate's surrender asks for third person seconds before AAF's walk). User log 22:44:06: the
+            // backstop pulled the camera out of a running AAF scene.
+            const bool sceneHold = g_cfg.lockScenes && d.sceneFlowSeen.time_since_epoch().count() && Ms(d.sceneFlowSeen, now) < 2000.0;
+            if (g_cfg.lockFp && sceneHold && g_force1st && st >= 0 && st != 0 && st != 2 && st != 4 && changed) {
+                ++d.lockForceSkips;
+                REX::INFO("camdir: first-person lock: camera state {} {} kept for the AAF / defeat scene (bLockAllowScenes)", st, StateName(st));
+            }
+            if (g_cfg.lockFp && !sceneHold && g_force1st && st >= 0 && st != 0 && st != 2 && st != 4 &&
+                (changed || Ms(d.lockForceAt, now) >= 500.0)) {
+                d.lockForceAt = now;
+                ++d.lockForces;
+                d.lockLast = std::format("{} ({}) after {:.0f} ms", st, StateName(st), Ms(d.stateSince, now));
+                if (d.lockForces <= 50) {
+                    REX::INFO("camdir: first-person lock: camera state {} {} (no gate caught it) -> PlayerCamera::Force1stPerson", st, StateName(st));
+                }
+                g_refused = std::format("{} forced back to first person", StateName(st));
+                tq::RunOnMain([st]() {  // main-idle queue (ThreadQueues.h), not from inside the camera update
+                    auto* pc = RE::PlayerCamera::GetSingleton();
+                    if (pc && pc->currentState && static_cast<int>(pc->currentState->id.get()) == st && g_force1st) {
+                        g_force1st(pc);
+                    }
+                });
             }
 
             auto* root = cam->cameraRoot.get();
             float* R = root ? reinterpret_cast<float*>(&root->local.rotate) : nullptr;
             auto*  T = root ? &root->local.translate : nullptr;
             if (T) d.tg = { T->x, T->y, T->z };
+            // 21 Nov, bFreeCamStatePosition: in the free camera, the state's own translation. FreeCameraState::Update (10223D0)
+            // writes the camera root from it and returns; AAF's hook on that vfunc (CameraCaller.cpp UpdateThunk: POV head
+            // anchor, glides) writes the state AFTER the original, so the root carries AAF's previous-frame position and the
+            // POV trailed the animated head by a frame. The state holds this frame's (same value when nothing hooks it).
+            if (T && st == kStateFree && g_cfg.freeStatePos && cam->currentState) {
+                const auto& p = static_cast<const RE::FreeCameraState*>(cam->currentState.get())->translation;
+                if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z)) {
+                    d.tg = { p.x, p.y, p.z };
+                    ++d.freeStateReads;
+                }
+            }
 
             // ---- effective policy (FADE_SNAP state machine) ----
             auto startEpisode = [&](const char* a_why) {
@@ -1029,6 +1427,83 @@ namespace fo4flatvr::camdir
             if (d.havePrevTg && T) {
                 const float dx = d.tg.x - d.prevTg.x, dy = d.tg.y - d.prevTg.y, dz = d.tg.z - d.prevTg.z;
                 jump = std::sqrt(dx * dx + dy * dy + dz * dz);
+            }
+            // body camera: the eye base on the body (capsule + first-person eye height); jumps measured there, not on the
+            // game camera (its orbit cuts are never shown)
+            if (body) {
+                float eyeH = -1.0f, hoff = 0.0f;
+                game::FirstPersonEye(eyeH, hoff);
+                auto* player = RE::PlayerCharacter::GetSingleton();
+                const bool sneaking = player && (*reinterpret_cast<const std::uint32_t*>(reinterpret_cast<std::uintptr_t>(player) + 0x134) & 0x3800u) == 0x800u;
+                if (!(eyeH > 10.0f)) eyeH = sneaking ? 80.5f : 120.5f;  // never sampled: flat 1.11.240's first-person camera node
+                d.bodyEyeH = eyeH;
+                if (player) {
+                    const auto& loc = player->data.location;
+                    V3 eye{ loc.x, loc.y, loc.z + eyeH };  // capsule eye (the plain path)
+                    // 21 Nov, bBodyCameraFollowsAnimation: when the body is animated away from the capsule (AAF and other
+                    // scenes, furniture, paired animations, bleedout), the eye rides the animated Head bone (+ fBodyCameraEyeForward
+                    // along the face). Follow while a scene / furniture / bleedout signal holds, or while the animated eye is
+                    // > kEnter from the capsule eye (left below kExit): walking / idle head bob stays on the capsule. Changes
+                    // blend over kBlendS; a change bigger than kSnap is a cut (the jump blink, fJumpFadeUnits, as any cut).
+                    constexpr float kEnter = 24.0f, kExit = 12.0f, kSnap = 40.0f, kBlendS = 0.3f;
+                    d.bodyAnimOk = false;
+                    if (g_cfg.bodyFollow) {
+                        if (!d.bodySceneAt.time_since_epoch().count() || Ms(d.bodySceneAt, now) >= 100.0 || changed) {
+                            d.bodySceneAt = now;
+                            d.bodySceneNow = PlayerBleedingOut() || PlayerAafBusy() ||
+                                             static_cast<int>(static_cast<RE::ActorState*>(player)->DoGetSitSleepState()) != 0;
+                        }
+                        RE::NiTransform hw;
+                        if (PlayerHeadWorld(player, hw)) {
+                            const auto& r = hw.rotate.entry[1];  // head-local +Y (the face) in world: stored row 1 (AAF POV_LFACE)
+                            const float fw = g_cfg.bodyEyeFwd;
+                            d.bodyAnimEye = { hw.translate.x + r.x * fw, hw.translate.y + r.y * fw, hw.translate.z + r.z * fw };
+                            const float ex = d.bodyAnimEye.x - eye.x, ey = d.bodyAnimEye.y - eye.y, ez = d.bodyAnimEye.z - eye.z;
+                            d.bodyDisp = std::sqrt(ex * ex + ey * ey + ez * ez);
+                            d.bodyAnimOk = std::isfinite(d.bodyDisp);
+                        } else {
+                            ++d.bodyAnimMiss;
+                        }
+                    }
+                    const bool want = d.bodyAnimOk && (d.bodySceneNow || d.bodyDisp > kEnter || (d.bodyFollowWant && d.bodyDisp > kExit));
+                    const float target = want ? 1.0f : 0.0f;
+                    const double fdt = d.bodyFollowAt.time_since_epoch().count() ? Ms(d.bodyFollowAt, now) / 1000.0 : 0.0;
+                    d.bodyFollowAt = now;
+                    if (want != d.bodyFollowWant) {
+                        REX::INFO("camdir: body camera {} the animated head (state {} {}; animated eye {:.1f} u from the capsule eye{})",
+                            want ? "follows" : "back from", st, StateName(st), d.bodyDisp, d.bodySceneNow ? ", scene / furniture signal" : "");
+                    }
+                    if (!d.havePrevBody || !d.bodyAnimOk || d.bodyDisp > kSnap) {
+                        if (d.bodyFollowW != target && d.havePrevBody && d.bodyAnimOk) ++d.bodyFollowSnaps;
+                        d.bodyFollowW = target;  // entry into the body view, a lost bone or a big change: no glide
+                    } else if (d.bodyFollowW != target) {
+                        if (want != d.bodyFollowWant) ++d.bodyFollowBlends;
+                        const float step = static_cast<float>(std::min(fdt, 0.1) / kBlendS);
+                        d.bodyFollowW = target > d.bodyFollowW ? std::min(1.0f, d.bodyFollowW + step) : std::max(0.0f, d.bodyFollowW - step);
+                    }
+                    d.bodyFollowWant = want;
+                    if (d.bodyFollowW > 0.0f && d.bodyAnimOk) {
+                        const float w = d.bodyFollowW * d.bodyFollowW * (3.0f - 2.0f * d.bodyFollowW);  // smoothstep
+                        eye.x += (d.bodyAnimEye.x - eye.x) * w;
+                        eye.y += (d.bodyAnimEye.y - eye.y) * w;
+                        eye.z += (d.bodyAnimEye.z - eye.z) * w;
+                    }
+                    d.bodyBase = { eye.x, eye.y, eye.z + hoff };
+                }
+                ++d.bodyTicks;
+                jump = 0.0f;
+                if (d.havePrevBody) {
+                    const float dx = d.bodyBase.x - d.prevBody.x, dy = d.bodyBase.y - d.prevBody.y, dz = d.bodyBase.z - d.prevBody.z;
+                    jump = std::sqrt(dx * dx + dy * dy + dz * dz);
+                }
+                d.prevBody = d.bodyBase;
+                d.havePrevBody = true;
+            } else {
+                d.havePrevBody = false;
+                d.bodyFollowWant = false;
+                d.bodyFollowW = 0.0f;
+                d.bodyFollowAt = {};
+                if (g_bh.root) g_bh = {};  // no reference kept on the player's 3D outside the body view
             }
             if (T) {
                 d.prevTg = d.tg;
@@ -1227,6 +1702,8 @@ namespace fo4flatvr::camdir
                 return;
             }
             NiYawPitch(R, d.gameYaw, d.gamePitch);
+            d.preYaw = SceneYaw(R);  // the frame the game moves the player in (its own camera), before our write
+            d.preYawOk = true;
             head::Mat3 h{};
             d.haveHead = head::Tracking() && head::Get(h);
             d.haveOwn = rs::OwnedYaw(d.ownYaw);
@@ -1234,11 +1711,17 @@ namespace fo4flatvr::camdir
                 d.heading = player->data.angle.z;
             }
             float yaw = d.haveOwn ? d.ownYaw : d.gameYaw;
+            if (body && !d.haveOwn) {
+                yaw = d.heading;  // the body's heading (an orbit camera's yaw / pitch never reach the body view)
+            }
             if (scene) {
                 // SCENE view (free camera, third person, animated, ...): the base yaw is the game camera's (AAF aims its shots
                 // there; the player's stick turns it), the game camera's pitch is dropped (the head gives pitch). On entry without a fade it continues the
                 // previous view's yaw (offset), after any snap the offset is 0. Frozen while a fade holds the old pose.
                 const float sy = SceneYaw(R);
+                // free camera: + the stick's own turn (bFreeCamOwnStickYaw; HkFreeCamMove keeps it out of the camera, where
+                // AAF's POV auto mode would glide it back to the actor's gaze). Kept over cuts / snaps for the whole scene.
+                const float stick = st == kStateFree && g_cfg.freeOwnStick ? d.stickYaw : 0.0f;
                 if (d.freeEntry) {
                     d.freeEntry = false;
                     if (!d.sceneKeepHead) {
@@ -1246,8 +1729,8 @@ namespace fo4flatvr::camdir
                         d.haveFreeOffBase = head::GetOffset(o);  // head motion counts from here (the game camera = the view)
                         d.freeOffBase = o;
                     }
-                    d.freeYawOffset = d.lastBaseValid ? Wrap(d.lastBaseYaw - sy) : 0.0f;
-                    d.sceneYaw = d.lastBaseValid ? d.lastBaseYaw : sy;
+                    d.freeYawOffset = d.lastBaseValid ? Wrap(d.lastBaseYaw - sy - stick) : 0.0f;
+                    d.sceneYaw = d.lastBaseValid ? d.lastBaseYaw : Wrap(sy + stick);
                     // a blink that started this tick (entry jump) anchored on the full head offset (first person's); the hold now
                     // adds only the motion since this new base, so move the anchor by the base: no jump while fading out
                     if (!d.sceneKeepHead && f.active && g_cfg.freeHeadDelta && d.haveFreeOffBase) {
@@ -1261,7 +1744,7 @@ namespace fo4flatvr::camdir
                         d.sceneYaw * kR2D, d.freeYawOffset * kR2D, d.sceneKeepHead ? ", head base kept" : "");
                 }
                 if (eff == Policy::kTrack) {
-                    d.sceneYaw = Wrap(sy + d.freeYawOffset);
+                    d.sceneYaw = Wrap(sy + d.freeYawOffset + stick);
                 }
                 yaw = d.sceneYaw;
             }
@@ -1281,7 +1764,7 @@ namespace fo4flatvr::camdir
             if (eff != Policy::kCinema && d.haveHead && !(eff == Policy::kTrack && st == 0)) {
                 // rotation: Rz(ownYaw) x head (game rotation x head if the heading is not owned); free-camera scene: Rz(sceneYaw)
                 float bw, bx, by, bz;
-                if (scene) {
+                if (scene || body) {
                     bw = std::cos(-yaw * 0.5f); bx = 0.0f; by = 0.0f; bz = std::sin(-yaw * 0.5f);
                 } else if (d.haveOwn) {
                     bw = std::cos(-d.ownYaw * 0.5f); bx = 0.0f; by = 0.0f; bz = std::sin(-d.ownYaw * 0.5f);
@@ -1306,6 +1789,20 @@ namespace fo4flatvr::camdir
                     T->x = d.tg.x + rawOff.x;
                     T->y = d.tg.y + rawOff.y;
                     T->z = d.tg.z + rawOff.z;
+                } else if (eff == Policy::kTrack && body) {
+                    // body camera: the first-person eye on the body + head offset (roomscale residual), as head authority
+                    // builds the first-person camera (GameBridge HkFpGetPos); the game camera's translation is ignored
+                    head::Vec3 o;
+                    V3         add{};
+                    if (head::GetOffset(o)) {
+                        rs::AdjustHeadOffset(o, yaw);
+                        const float u = g_cfg.unitsPerMeter, c = std::cos(yaw), s = std::sin(yaw);
+                        add = { (o.x * c + o.y * s) * u, (-o.x * s + o.y * c) * u, o.z * u };
+                    }
+                    d.add = add;
+                    T->x = d.bodyBase.x + add.x;
+                    T->y = d.bodyBase.y + add.y;
+                    T->z = d.bodyBase.z + add.z;
                 } else if (eff == Policy::kTrack) {
                     // game translation + head offset (roomscale residual, as in first person)
                     head::Vec3 o;
@@ -1375,6 +1872,10 @@ namespace fo4flatvr::camdir
         // load-game path D682F0) pass the PlayerCamera. Same pose sync and post-tick as the UpdateCamera call site.
         void HkUpdateFreeCam(RE::TESCamera* a_cam)
         {
+            if (!g_freeSceneLive.load(std::memory_order_relaxed)) {
+                g_orig(a_cam);  // bFreeCamScene=0 (live switch): as if the thunk were not patched (no pose wait, no director tick)
+                return;
+            }
             head::WaitForPublish(5);
             g_orig(a_cam);  // TESCamera::Update 827C80 (the active state's Update: FreeCameraState, with AAF's own hook inside)
             auto* pc = RE::PlayerCamera::GetSingleton();
@@ -1405,7 +1906,7 @@ namespace fo4flatvr::camdir
             float vy = 0.0f, vp = 0.0f;
             {
                 std::scoped_lock l(g_lock);
-                if (g_cfg.enabled && g_cfg.freeMoveView && g_d.freeHooked && g_d.moveViewOk) {
+                if (g_cfg.enabled && g_cfg.freeMoveView && FreeOn() && g_d.moveViewOk) {
                     use = true;
                     vy = g_d.moveViewYaw;
                     vp = g_d.moveViewPitch;
@@ -1423,7 +1924,22 @@ namespace fo4flatvr::camdir
             g_origFreeMove(a_fs);
             const float dPitch = Wrap(a_fs->rotation.x - tPitch), dYaw = Wrap(a_fs->rotation.y - tYaw);  // the stick's turn
             a_fs->rotation.x = WrapPos(sPitch + dPitch);
-            a_fs->rotation.y = WrapPos(sYaw + dYaw);
+            // 20 Nov late (user: "AAF with PoV camera will rotate the direction of the camera at times. I use the stick to turn the
+            // central facing direction right, and then it drifts back to a point left"): AAF's POV (CameraCaller ApplyPovFrame,
+            // pov_control_mode=auto) treats any change of the free camera's rotation as a mouse takeover and, pov_takeover_cooldown
+            // (1.2 s) later, glides the camera back to the actor's gaze (POV_RESUME_TAU 0.25 s); a takeover is also clamped to
+            // pov_yaw_limit (75 deg) around the gaze. So the turn is kept as our own yaw on top of the camera's instead
+            // (Tick: sceneYaw = free-camera yaw + continuity offset + stickYaw); AAF keeps aiming the camera at the gaze.
+            bool own = false;
+            {
+                std::scoped_lock l(g_lock);
+                own = g_cfg.freeOwnStick;
+                if (own && dYaw != 0.0f) {
+                    g_d.stickYaw = Wrap(g_d.stickYaw + dYaw);
+                    ++g_d.stickTurnUpdates;
+                }
+            }
+            a_fs->rotation.y = own ? sYaw : WrapPos(sYaw + dYaw);
         }
 
         // camera step 2: StopPipboyMode runs TESCamera::Update itself (1027250 -> call @10273A6), outside UpdateCamera;
@@ -1529,6 +2045,32 @@ namespace fo4flatvr::camdir
             }
             note(kGSet3rd, c.blockThirdPerson, g_origSet3rd != nullptr);
             note(kGForce3rd, c.blockThirdPerson, g_origForce3rd != nullptr);
+            {
+                // 20 Nov, first-person lock: always installed (pass straight through while the lock is off), so
+                // "camdir lock on" works at runtime. Prologues read in Ghidra 1.11.240; relocated bytes are whole push / sub /
+                // mov [rsp+n] instructions (no RIP-relative operands).
+                // mov [rsp+8],rbx; push rdi; sub rsp,40; mov rbx,rcx; movzx edi,dl (reloc 5)
+                static constexpr std::uint8_t kFreePro[] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x40, 0x48, 0x8B, 0xD9, 0x0F, 0xB6, 0xFA };
+                // push rbx; sub rsp,20; mov rax,[rcx+28]; lea rdx,[rcx+28] (reloc 6)
+                static constexpr std::uint8_t kBleedPro[] = { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x41, 0x28, 0x48, 0x8D, 0x51, 0x28 };
+                // mov [rsp+18],rsi; push rdi; sub rsp,20; mov rax,[rcx+28]; mov rsi,rdx (reloc 5)
+                static constexpr std::uint8_t kMountPro[] = { 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x41, 0x28, 0x48, 0x8B, 0xF2 };
+                if (!g_origToggleFree) {
+                    g_origToggleFree = reinterpret_cast<ToggleFree_t>(Detour(kToggleFreeCam, kFreePro, sizeof(kFreePro), 5,
+                        reinterpret_cast<void*>(&HkToggleFreeCam), "ToggleFreeCameraMode prologue"));
+                }
+                if (!g_origStartBleed) {
+                    g_origStartBleed = reinterpret_cast<CamFn_t>(Detour(kStartBleedout, kBleedPro, sizeof(kBleedPro), 6,
+                        reinterpret_cast<void*>(&HkStartBleedout), "StartBleedoutMode prologue"));
+                }
+                if (!g_origStartMount) {
+                    g_origStartMount = reinterpret_cast<StartMount_t>(Detour(kStartMount, kMountPro, sizeof(kMountPro), 5,
+                        reinterpret_cast<void*>(&HkStartMount), "StartMountMode prologue"));
+                }
+                note(kGFreeCam, true, g_origToggleFree != nullptr);
+                note(kGBleedout, true, g_origStartBleed != nullptr);
+                note(kGMount, true, g_origStartMount != nullptr);
+            }
             if (!g_stopInteract) {
                 static constexpr std::uint8_t kStopIntPro[] = { 0x48, 0x8B, 0xC4, 0x44, 0x88, 0x48, 0x20, 0x88, 0x50, 0x10, 0x55, 0x56, 0x41, 0x54 };
                 if (BytesAt(kStopInteractingQuick, kStopIntPro, sizeof(kStopIntPro), "Actor::StopInteractingQuick prologue")) {
@@ -1558,7 +2100,7 @@ namespace fo4flatvr::camdir
                     g_force1st = reinterpret_cast<Force1st_t>(Base() + kForce1st);
                 }
             }
-            if (g_workbenchPause && !g_origWbCtor) {
+            if (!g_origWbCtor) {  // 20 Nov: installed always, g_workbenchPause gates it at runtime (live [Menus] bWorkbenchPause)
                 // mov [rsp+8],rbx; mov [rsp+18],rbp; mov [rsp+20],rsi; push rdi; sub rsp,20 (20 bytes, no RIP-relative)
                 static constexpr std::uint8_t kWbCtorPro[] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x18, 0x48, 0x89, 0x74,
                     0x24, 0x20, 0x57, 0x48, 0x83, 0xEC, 0x20 };
@@ -1652,8 +2194,20 @@ namespace fo4flatvr::camdir
         }
     }
 
+    void ReloadLive(const cfgstore::Changes& a_ch);  // 20 Nov (live settings), below
+    namespace
+    {
+        void InstallAftercare();  // below (scene aftercare: Pip-Boy refusals)
+        const char* AftercareNote();
+    }
+
     std::string Install()
     {
+        static std::once_flag s_sub;
+        std::call_once(s_sub, [] {
+            cfgstore::Subscribe("camdir", "Camera,Menus/bCraftingLiveWorld,Menus/bWorkbenchPause,General/fUnitsPerMeter,General/fHeightOffsetCm",
+                &ReloadLive);
+        });
         std::scoped_lock l(g_lock);
         if (g_d.installed) {
             return "already installed";
@@ -1728,6 +2282,19 @@ namespace fo4flatvr::camdir
         c.freeHeadDelta = rdb("bFreeCamHeadDelta", true);
         c.thirdReturn = rdb("bThirdPersonReturn", true);
         c.thirdReturnS = rdf("Camera", "fThirdPersonReturnS", c.thirdReturnS);
+        c.lockFp = rdb("bLockFirstPerson", false);
+        c.bodyCam = rdb("bBodyCamera", false);
+        c.hudNotify = rdb("bCameraHudNotify", true);
+        c.sameInput = rdb("bSameInputAllViews", true);
+        c.lockScenes = rdb("bLockAllowScenes", true);
+        c.defeatWindowS = rdf("Camera", "fDefeatWindowS", c.defeatWindowS);
+        c.orbitScene = rdb("bOrbitStatesScene", true);
+        c.freeOwnStick = rdb("bFreeCamOwnStickYaw", true);
+        c.aftercare = rdb("bSceneAftercare", true);
+        c.bodyFollow = rdb("bBodyCameraFollowsAnimation", true);
+        c.bodyEyeFwd = rdf("Camera", "fBodyCameraEyeForward", c.bodyEyeFwd);
+        c.bodyYieldPov = rdb("bBodyCameraYieldsToPov", true);
+        c.freeStatePos = rdb("bFreeCamStatePosition", true);
         for (int i = 0; i < kStates; ++i) {
             c.table[i] = kDefaultTable[i];
             char buf[32]{};
@@ -1743,6 +2310,7 @@ namespace fo4flatvr::camdir
         if (!c.enabled) {
             c.gateFurniture = c.gatePowerArmor = c.gateAnimated = c.blockThirdPerson = c.gateVats = c.pipboyStopTick = c.headingSnap = false;
             c.vatsKeepCamera = false;
+            c.lockFp = c.bodyCam = false;
             g_d.installNote = "off (bCameraDirector=0)";
             REX::INFO("camdir: off (bCameraDirector=0): no patch; presenter keeps first person = world view, rest = cinema");
             return g_d.installNote;
@@ -1768,11 +2336,12 @@ namespace fo4flatvr::camdir
         g_d.installed = true;
         g_d.installNote = "installed";
         const auto gates = InstallGates();
+        InstallAftercare();  // always (gated at runtime by bSceneAftercare)
         // free-camera scene view (bFreeCamScene): redirect the free camera's TESCamera::Update thunk to the same post-tick and
         // make state 3 a TRACK world view (overrides sPolicyFree, as bCraftingLiveWorld overrides the gates). Byte check:
         // the thunk is exactly E9 rel32 landing on TESCamera::Update (prologue checked above); any mismatch = not patched,
         // state 3 keeps sPolicyFree.
-        if (c.freeScene) {
+        {  // 20 Nov (live settings): patched whatever bFreeCamScene says; g_freeSceneLive / FreeOn() switch it at runtime
             const bool thunkOk = std::memcmp(reinterpret_cast<const void*>(base + kFreeCamThunk), kFreeCamThunkBytes, 5) == 0;
             std::int32_t trel = 0;
             std::memcpy(&trel, reinterpret_cast<const void*>(base + kFreeCamThunk + 1), 4);
@@ -1789,7 +2358,7 @@ namespace fo4flatvr::camdir
                 g_d.freeHooked = true;
                 g_d.freeNote = "installed";
                 // stick flying along the view: FreeCameraState::Update's call to UpdateMovement (bytes + target + callee prologue)
-                if (c.freeMoveView) {
+                if (true) {  // 20 Nov: installed always; g_cfg.freeMoveView gates HkFreeCamMove at runtime
                     constexpr std::uintptr_t kMoveCall = 0x1022435, kMove = 0x1022B60;
                     static constexpr std::uint8_t kMoveCallBytes[5] = { 0xE8, 0x26, 0x07, 0x00, 0x00 };
                     static constexpr std::uint8_t kMovePro[] = { 0x48, 0x8B, 0xC4 };
@@ -1806,18 +2375,26 @@ namespace fo4flatvr::camdir
                             kMoveCall, ok, tramp.free_size());
                     }
                 }
-                if (c.table[kStateFree] != Policy::kScene) {
-                    REX::INFO("camdir: bFreeCamScene=1: state Free policy {} -> SCENE (free-camera scene view)", PolicyName(c.table[kStateFree]));
+                if (c.freeScene) {
+                    if (c.table[kStateFree] != Policy::kScene) {
+                        REX::INFO("camdir: bFreeCamScene=1: state Free policy {} -> SCENE (free-camera scene view)", PolicyName(c.table[kStateFree]));
+                    }
+                    c.table[kStateFree] = Policy::kScene;
+                } else {
+                    g_d.freeNote = "installed, off (bFreeCamScene=0; live switch)";
                 }
-                c.table[kStateFree] = Policy::kScene;
             }
-        } else {
-            g_d.freeNote = "off (bFreeCamScene=0)";
         }
+        g_freeSceneLive = c.freeScene && g_d.freeHooked;
         // SCENE states: TRACK + the scene flag. The free camera can only be SCENE with its thunk patched (no director tick in
         // state 3 otherwise: a world locked to the face), else it falls back to CINEMA.
         for (int i = 0; i < kStates; ++i) {
             g_d.sceneSt[i] = false;
+            if (c.orbitScene && OrbitState(i) && c.table[i] == Policy::kTrack) {
+                REX::INFO("camdir: sPolicy{}=TRACK on an orbit camera -> SCENE ([Camera] bOrbitStatesScene; TRACK head-rotates the "
+                          "game's orbit camera, so the view and the movement followed the head)", kStateNames[i]);
+                c.table[i] = Policy::kScene;
+            }
             if (c.table[i] == Policy::kScene && (i == 0 || i == 4)) {
                 // first person / iron sights are the FirstPersonState path (head authority, roomscale, FRIK); SCENE there would
                 // drop the head-tracked first-person camera and switch the controls to the flat-screen mapping
@@ -1826,7 +2403,7 @@ namespace fo4flatvr::camdir
                 continue;
             }
             if (c.table[i] == Policy::kScene) {
-                if (i == kStateFree && !g_d.freeHooked) {
+                if (i == kStateFree && !FreeOn()) {
                     c.table[i] = Policy::kCinema;
                     REX::WARN("camdir: sPolicyFree=SCENE needs the free-camera thunk ({}): CINEMA", g_d.freeNote);
                     continue;
@@ -1835,6 +2412,19 @@ namespace fo4flatvr::camdir
                 c.table[i] = Policy::kTrack;
             }
         }
+        game::camtweak::SetForced(c.lockFp);
+        REX::INFO("camdir: first-person lock {} ([Camera] bLockFirstPerson), body camera {} (bBodyCamera), HUD notifications {} "
+                  "(bCameraHudNotify), same controls in every view {} (bSameInputAllViews)",
+            c.lockFp ? "ON" : "off", c.bodyCam ? "ON" : "off", c.hudNotify ? "on" : "off", c.sameInput ? "on" : "off");
+        REX::INFO("camdir: body camera follows the animated Head bone {} (bBodyCameraFollowsAnimation; eye {} u along the face, "
+                  "fBodyCameraEyeForward), yields to AAF's POV on another actor {} (bBodyCameraYieldsToPov); free camera position "
+                  "from the state (after AAF's write) {} (bFreeCamStatePosition)",
+            c.bodyFollow ? "on" : "off", c.bodyEyeFwd, c.bodyYieldPov ? "on" : "off", c.freeStatePos ? "on" : "off");
+        REX::INFO("camdir: AAF / defeat scenes pass the camera locks {} (bLockAllowScenes; defeat window {} s after a bleedout), orbit "
+                  "cameras TRACK -> SCENE {} (bOrbitStatesScene), free-camera stick yaw kept as our own {} (bFreeCamOwnStickYaw), "
+                  "scene aftercare {} (bSceneAftercare: {})",
+            c.lockScenes ? "on" : "off", c.defeatWindowS, c.orbitScene ? "on" : "off", c.freeOwnStick ? "on" : "off",
+            c.aftercare ? "on" : "off", AftercareNote());
         const auto s = std::format("call {:X} -> TESCamera::Update {:X} hooked (bytes ok); fade {} ms, timeout {} s; table {}; step-2 gates:{}; "
                                    "free-camera scene view (thunk {:X}): {} (body {}, yaw cut {} deg, glide {} units/s hold {} s, "
                                    "third-person grace {} ms); third-person return {} after {} s (Force1stPerson {}); bench input release {}",
@@ -1847,17 +2437,365 @@ namespace fo4flatvr::camdir
 
     namespace
     {
+        // ---- Scene aftercare: Pip-Boy refusals (20 Nov late, user: "After AAF animation I was locked out of pip boy and unable to
+        // reactivate it"; [Camera] bSceneAftercare) ----
+        // The user's 22:01-23:00 session: Pip-Boy opened 30+ times until 22:39:58, never again after the first AAF scene (22:41);
+        // no "pipboy: open" line, so the game's PipboyHandler refused before PipboyManager::PlayPipboyOpenAnim (our O1 hook).
+        // Its refusals (1.11.240 Ghidra, ButtonEvent handler 1077010 = PipboyHandler vtable slot 25B1F38):
+        //   - PlayerCharacter::GetUnderAIControl (D6A3D0: player+0xDFE bit 0 / bit 1, +0xDFD bit 7) -> silent, the press never
+        //     arms. Bit 1 is PlayerCharacter::SetAIControlledPackage (D6F180) = Papyrus Game.SetPlayerAIDriven (1129... jmp D6F180):
+        //     AAF sets it for its walk and clears it last in its unlock (after its fly-cam loop); a scene that never reaches that
+        //     line leaves the Pip-Boy refused while the player walks again (movement controller back to controls-driven).
+        //   - user event kMainFour (0x100) disabled by an input layer (InputEnableLayer.DisablePlayerControls abMenu ->
+        //     EnableUserEvent(id, 0x100); defeat mods: AAF Violate FPV_OnHit Surrender / AnimationEnd, Harassment) -> HUD
+        //     "can't use the Pip-Boy"; a layer orphaned by a broken scene keeps it.
+        //   - graph variable bBlockPipboy, dead / dying, power-armour state, commanding a companion.
+        //   - PipboyManager +0x1C6 (opening) already set: PlayPipboyOpenAnim returns at once (the original and our O1 alike).
+        // At a refused Pip-Boy press the blocker is logged (+ HUD); leftovers of a scene that is over (no AAF / defeat signal for
+        // 5 s, camera first person) are released before the handler runs, so that same press opens the Pip-Boy:
+        //   AI control bit 1 with the movement controller controls-driven -> SetAIControlledPackage(false) (what
+        //   Game.SetPlayerAIDriven(false) runs); kMainFour layers that started disabling during a scene -> EnableUserEvent(id,
+        //   0x100, true, 3) (Papyrus EnableMenu's call); the opening flag stuck for 1 s with no Pip-Boy menu -> cleared.
+        constexpr std::uintptr_t kPipboyHandlerSlot = 0x25B1F38;  // PipboyHandler vtable: OnButtonEvent
+        constexpr std::uintptr_t kPipboyHandlerFn = 0x1077010;
+        constexpr std::uintptr_t kIsValidPipboyEvent = 0x1077560;  // PipboyHandler::IsValidPipboyOpenEvent(handler, BSFixedString*)
+        constexpr std::uintptr_t kUserEventEnabled = 0x1668C20;    // BSInputEnableManager::IsUserEventEnabled(mgr, flags)
+        constexpr std::uintptr_t kEnableUserEvent = 0x166A620;     // BSInputEnableManager::EnableUserEvent(mgr, id, flags, on, sender)
+        constexpr std::uintptr_t kPipboyMgrPtr = 0x31F0888;        // PipboyManager*
+        constexpr std::size_t    kPbOpening = 0x1C6, kPbClosing = 0x1C7;
+        constexpr std::uint32_t  kMainFour = 0x100;
+        static constexpr std::uint8_t kEnableUserEventPro[] = { 0x4C, 0x8B, 0xDC, 0x49, 0x89, 0x5B, 0x08, 0x45, 0x88, 0x4B, 0x20 };
+        static constexpr std::uint8_t kPbHandlerPro[] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20 };
+
+        using PbHandle_t = void (*)(void*, void*, void*);
+        PbHandle_t g_origPbHandle = nullptr;
+
+        struct LayerRec
+        {
+            bool disabled{ false }, sceneBorn{ false };
+        };
+        struct Aftercare
+        {
+            bool                  installed{ false };
+            const char*           note{ "not installed" };
+            std::vector<LayerRec> layers;
+            Clock::time_point     lastPoll{}, flowSeen{}, lastHud{}, openingSeen{};
+            bool                  haveFlow{ false }, openingStuck{ false };
+            std::uint64_t         presses{ 0 }, refusals{ 0 }, aiReleases{ 0 }, layerReleases{ 0 }, openingClears{ 0 }, sceneLayers{ 0 };
+            std::string           lastWhy{ "-" }, lastFix{ "-" };
+        };
+        Aftercare  g_ac;      // main thread (PipboyHandler events, main tick); readout under g_acLock
+        std::mutex g_acLock;
+        std::atomic<std::uint64_t> g_pbEvents{ 0 };     // ButtonEvents the PipboyHandler received (any button it is offered)
+        std::atomic<void*>         g_pbHandler{ nullptr };
+        // pad B (our bindings' Pip-Boy button in gameplay) pressed and released with no PipboyHandler event: the press never
+        // reached the handler (its inputEventHandlingEnabled off, or an input context on the ControlMap stack that maps B to
+        // something else, e.g. a free-camera TFC context left pushed). Main tick, every frame.
+        struct PadWatch
+        {
+            bool              down{ false }, pending{ false };
+            std::uint64_t     ev0{ 0 };
+            Clock::time_point up{};
+            std::uint64_t     unreached{ 0 };
+            std::string       last{ "-" };
+        };
+        PadWatch g_pw;
+
+        std::uint8_t* PipboyMgr() { return *reinterpret_cast<std::uint8_t**>(Base() + kPipboyMgrPtr); }
+        bool UserEventEnabled(std::uint32_t a_flags)
+        {
+            auto* mgr = RE::BSInputEnableManager::GetSingleton();
+            using En_t = bool (*)(void*, std::uint32_t);
+            return !mgr || reinterpret_cast<En_t>(Base() + kUserEventEnabled)(mgr, a_flags);
+        }
+        int CameraStateNow()
+        {
+            auto* pc = RE::PlayerCamera::GetSingleton();
+            return pc && pc->currentState ? static_cast<int>(pc->currentState->id.get()) : -1;
+        }
+        std::string LayerName(RE::BSInputEnableManager* a_mgr, std::uint32_t a_i)
+        {
+            if (a_i < a_mgr->debugNames.size()) {
+                const char* s = a_mgr->debugNames[a_i].c_str();
+                if (s && *s) return s;
+            }
+            return "?";
+        }
+
+        // the scene is over: no AAF / defeat signal for 5 s, first person, not sitting (main thread; g_acLock held)
+        bool SceneOverLocked(Clock::time_point a_now, float a_defeatWindowS)
+        {
+            if (SceneFlow(a_defeatWindowS)) {
+                g_ac.flowSeen = a_now;
+                g_ac.haveFlow = true;
+                return false;
+            }
+            const int cs = CameraStateNow();
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            const int sit = player ? static_cast<int>(static_cast<RE::ActorState*>(player)->DoGetSitSleepState()) : -1;
+            return (cs == 0 || cs == 4) && sit == 0 && (!g_ac.haveFlow || Ms(g_ac.flowSeen, a_now) >= 5000.0);
+        }
+
+        // the Pip-Boy blockers now, in the handler's order (a_press: the press, where AI control stops the handler; else the
+        // armed release). Releases a scene's leftovers when a_fix. Returns "" when nothing blocks. Main thread, g_acLock held.
+        std::string PipboyBlockers(bool a_press, bool a_fix, float a_defeatWindowS, std::string& a_fixed)
+        {
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            if (!player) return {};
+            const auto  now = Clock::now();
+            auto*       pb = reinterpret_cast<std::uint8_t*>(player);
+            const auto  dfe = pb[0xDFE], dfd = pb[0xDFD];
+            const auto* mc = player->movementController.get();
+            const bool  ctrlDriven = mc && *(reinterpret_cast<const std::uint8_t*>(mc) + 0x1A1) == 1;
+            const bool  over = SceneOverLocked(now, a_defeatWindowS);
+            std::string why;
+            if ((dfe & 3) || (dfd & 0x80)) {
+                why = std::format("AI control (player+DFE={:02X} DFD={:02X}: {}; movement {})", dfe, dfd,
+                    (dfe & 2) ? "Game.SetPlayerAIDriven / AI package" : "AI move-to", ctrlDriven ? "controls-driven" : "AI-driven");
+                if (a_fix && over && (dfe & 2) && !(dfe & 1) && !(dfd & 0x80) && ctrlDriven && g_setAiCtrlPkg) {
+                    g_setAiCtrlPkg(player, false);  // PlayerCharacter::SetAIControlledPackage(false) = Game.SetPlayerAIDriven(false)
+                    ++g_ac.aiReleases;
+                    a_fixed = "the player's AI control (Game.SetPlayerAIDriven) left over from a scene";
+                    return {};
+                }
+                return why;
+            }
+            if (a_press) return {};
+            if (!UserEventEnabled(kMainFour)) {
+                auto*       mgr = RE::BSInputEnableManager::GetSingleton();
+                std::string list;
+                std::vector<std::uint32_t> fix;
+                if (mgr) {
+                    const std::uint32_t n = mgr->layers.size();
+                    for (std::uint32_t i = 0; i < n; ++i) {
+                        const auto mask = *reinterpret_cast<const std::uint32_t*>(&mgr->layers[i]);
+                        if (mask & kMainFour) continue;
+                        const bool born = i < g_ac.layers.size() && g_ac.layers[i].sceneBorn;
+                        list += std::format("{}{} '{}'{}", list.empty() ? "" : ", ", i, LayerName(mgr, i), born ? " (scene)" : "");
+                        if (born) fix.push_back(i);
+                    }
+                }
+                why = std::format("Pip-Boy input disabled by input layer(s) {}", list.empty() ? "-" : list);
+                if (a_fix && over && mgr && !fix.empty()) {
+                    using Enable_t = void (*)(void*, std::uint32_t, std::uint32_t, bool, std::uint32_t);
+                    for (const auto i : fix) {
+                        reinterpret_cast<Enable_t>(Base() + kEnableUserEvent)(mgr, i, kMainFour, true, 3);
+                        if (i < g_ac.layers.size()) g_ac.layers[i].sceneBorn = false;
+                        ++g_ac.layerReleases;
+                    }
+                    if (UserEventEnabled(kMainFour)) {
+                        a_fixed = std::format("{} scene input layer(s) that kept the Pip-Boy disabled", fix.size());
+                        why.clear();
+                    }
+                }
+                if (!why.empty()) return why;
+            }
+            const auto ls = static_cast<const RE::ActorState*>(player)->lifeState;
+            if (ls == 1 || ls == 2 || ls == 4 || ls == 5) return std::format("player life state {} (dead / dying)", ls);
+            bool block = false;
+            static const RE::BSFixedString kBlock("bBlockPipboy");
+            if (static_cast<RE::IAnimationGraphManagerHolder*>(player)->GetGraphVariableImplBool(kBlock, block) && block) {
+                return "the behaviour graph's bBlockPipboy is set (an idle / furniture animation state)";
+            }
+            if (auto* m = PipboyMgr(); m && m[kPbOpening] && !m[kPbClosing] && !game::MenuOpen("PipboyMenu")) {
+                if (!a_fix) {
+                    // readout
+                } else if (!g_ac.openingStuck) {
+                    g_ac.openingStuck = true;
+                    g_ac.openingSeen = now;
+                } else if (a_fix && Ms(g_ac.openingSeen, now) >= 1000.0) {
+                    m[kPbOpening] = 0;  // PlayPipboyOpenAnim returns at once while it is set
+                    g_ac.openingStuck = false;
+                    ++g_ac.openingClears;
+                    a_fixed = "the Pip-Boy manager's stuck 'opening' flag";
+                    return {};
+                }
+                return "PipboyManager 'opening' is set with no Pip-Boy menu (an open that never finished)";
+            }
+            if (a_fix) g_ac.openingStuck = false;
+            return {};
+        }
+
+        void HkPipboyHandle(void* a_h, void* a_ev, void* a_data)
+        {
+            bool  on = false;
+            float window = 30.0f;
+            {
+                std::scoped_lock l(g_lock);
+                on = g_cfg.aftercare;
+                window = g_cfg.defeatWindowS;
+            }
+            auto* e = static_cast<std::uint8_t*>(a_ev);
+            auto* h = static_cast<std::uint8_t*>(a_h);
+            using Valid_t = bool (*)(void*, const void*);
+            g_pbEvents.fetch_add(1, std::memory_order_relaxed);
+            g_pbHandler = a_h;
+            if (on && e && h && reinterpret_cast<Valid_t>(Base() + kIsValidPipboyEvent)(a_h, e + 0x28)) {
+                const float value = *reinterpret_cast<const float*>(e + 0x38), held = *reinterpret_cast<const float*>(e + 0x3C);
+                const bool  press = value != 0.0f && held == 0.0f;
+                const bool  armedRelease = value == 0.0f && held > 0.0f && h[0x11] && !h[0x10];
+                if (press || armedRelease) {
+                    std::string fixed, why;
+                    {
+                        std::scoped_lock l(g_acLock);
+                        if (press) ++g_ac.presses;
+                        why = PipboyBlockers(press, true, window, fixed);
+                        if (!fixed.empty()) g_ac.lastFix = fixed;
+                        if (!why.empty()) {
+                            ++g_ac.refusals;
+                            g_ac.lastWhy = why;
+                        }
+                    }
+                    const auto now = Clock::now();
+                    if (!fixed.empty()) {
+                        REX::INFO("camdir aftercare: Pip-Boy {}: released {} (bSceneAftercare)", press ? "press" : "release", fixed);
+                        game::HudMessage("Pip-Boy: released " + fixed);
+                    }
+                    if (!why.empty()) {
+                        REX::INFO("camdir aftercare: Pip-Boy {} refused by the game: {}", press ? "press" : "release", why);
+                        std::scoped_lock l(g_acLock);
+                        if (!g_ac.lastHud.time_since_epoch().count() || Ms(g_ac.lastHud, now) >= 3000.0) {
+                            g_ac.lastHud = now;
+                            game::HudMessage("Pip-Boy blocked: " + why);
+                        }
+                    }
+                }
+            }
+            g_origPbHandle(a_h, a_ev, a_data);
+        }
+
+        // 4 Hz, main thread: which input layers start disabling the Pip-Boy (kMainFour) while an AAF / defeat scene runs
+        void PollAftercare()
+        {
+            float window = 30.0f;
+            bool  on = false;
+            int   st = -1;
+            {
+                std::scoped_lock l(g_lock);
+                on = g_cfg.aftercare && g_ac.installed;
+                window = g_cfg.defeatWindowS;
+                st = g_d.state;
+            }
+            if (!on) return;
+            const auto now = Clock::now();
+            std::scoped_lock l(g_acLock);
+            {
+                auto*      ui = RE::UI::GetSingleton();
+                const auto ps = pad::Last();
+                const bool gameplay = ui && ui->menuMode == 0 && (st == 0 || st == 4);
+                if (ps.active && ps.b && !g_pw.down) {
+                    g_pw.down = true;
+                    g_pw.pending = false;
+                    g_pw.ev0 = g_pbEvents.load();
+                } else if (g_pw.down && !(ps.active && ps.b)) {
+                    g_pw.down = false;
+                    g_pw.pending = gameplay;
+                    g_pw.up = now;
+                }
+                if (g_pw.pending && Ms(g_pw.up, now) >= 400.0) {
+                    g_pw.pending = false;
+                    if (g_pbEvents.load() == g_pw.ev0 && gameplay && !game::MenuOpen("PipboyMenu")) {
+                        std::string ctx;
+                        if (auto* cm = RE::ControlMap::GetSingleton()) {
+                            for (std::uint32_t i = 0; i < cm->contextPriorityStack.size(); ++i) {
+                                ctx += std::format("{}{}", i ? "," : "", static_cast<int>(*reinterpret_cast<const std::int32_t*>(&cm->contextPriorityStack[i])));
+                            }
+                        }
+                        auto* hb = static_cast<const std::uint8_t*>(g_pbHandler.load());
+                        g_pw.last = std::format("pad B (Pip-Boy) never reached the game's Pip-Boy handler: handler enabled={} input "
+                                                "contexts (bottom..top, 0 gameplay, 10 TFC free camera)=[{}]",
+                            hb ? (hb[0x8] ? "1" : "0") : "?", ctx);
+                        ++g_pw.unreached;
+                        REX::INFO("camdir aftercare: {}", g_pw.last);
+                        if (!g_ac.lastHud.time_since_epoch().count() || Ms(g_ac.lastHud, now) >= 3000.0) {
+                            g_ac.lastHud = now;
+                            game::HudMessage("Pip-Boy blocked: the button did not reach the game's Pip-Boy handler (see log)");
+                        }
+                    }
+                }
+            }
+            if (g_ac.lastPoll.time_since_epoch().count() && Ms(g_ac.lastPoll, now) < 250.0) return;
+            g_ac.lastPoll = now;
+            if (SceneFlow(window) || st == kStateFree) {
+                g_ac.flowSeen = now;
+                g_ac.haveFlow = true;
+            }
+            const bool recent = g_ac.haveFlow && Ms(g_ac.flowSeen, now) < 5000.0;
+            auto* mgr = RE::BSInputEnableManager::GetSingleton();
+            if (!mgr) return;
+            const std::uint32_t n = mgr->layers.size();
+            if (g_ac.layers.size() < n) g_ac.layers.resize(n);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                const bool dis = !(*reinterpret_cast<const std::uint32_t*>(&mgr->layers[i]) & kMainFour);
+                auto&      r = g_ac.layers[i];
+                if (dis && !r.disabled) {
+                    r.sceneBorn = recent;
+                    if (recent) {
+                        ++g_ac.sceneLayers;
+                        REX::INFO("camdir aftercare: input layer {} '{}' disables the Pip-Boy during an AAF / defeat scene", i, LayerName(mgr, i));
+                    }
+                }
+                if (!dis) r.sceneBorn = false;
+                r.disabled = dis;
+            }
+        }
+
+        void InstallAftercare()
+        {
+            if (g_ac.installed) return;
+            const auto base = Base();
+            auto** slot = reinterpret_cast<void**>(base + kPipboyHandlerSlot);
+            if (*slot != reinterpret_cast<void*>(base + kPipboyHandlerFn) ||
+                std::memcmp(reinterpret_cast<const void*>(base + kPipboyHandlerFn), kPbHandlerPro, sizeof(kPbHandlerPro)) != 0 ||
+                std::memcmp(reinterpret_cast<const void*>(base + kEnableUserEvent), kEnableUserEventPro, sizeof(kEnableUserEventPro)) != 0) {
+                g_ac.note = "byte check FAILED";
+                REX::ERROR("camdir aftercare: PipboyHandler slot {:X} / handler {:X} / EnableUserEvent {:X} not as expected: not installed",
+                    kPipboyHandlerSlot, kPipboyHandlerFn, kEnableUserEvent);
+                return;
+            }
+            DWORD old = 0;
+            if (!::VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) {
+                g_ac.note = "VirtualProtect failed";
+                REX::ERROR("camdir aftercare: VirtualProtect {:X} failed ({})", kPipboyHandlerSlot, ::GetLastError());
+                return;
+            }
+            g_origPbHandle = reinterpret_cast<PbHandle_t>(*slot);
+            *slot = reinterpret_cast<void*>(&HkPipboyHandle);
+            ::VirtualProtect(slot, sizeof(void*), old, &old);
+            g_ac.installed = true;
+            g_ac.note = "installed";
+            REX::INFO("camdir aftercare: PipboyHandler button handler hooked (vtable slot {:X}); Pip-Boy refusals are diagnosed and scene "
+                      "leftovers released ([Camera] bSceneAftercare)", kPipboyHandlerSlot);
+        }
+
+        const char* AftercareNote() { return g_ac.note; }
+
+        // pipe "camdir aftercare": main thread (graph variable / layer reads), no fix. Caller holds no lock.
+        std::string AftercareStatus(float a_window)
+        {
+            std::scoped_lock l(g_acLock);
+            std::string      fixed;
+            const std::string why = PipboyBlockers(false, false, a_window, fixed);
+            return std::format("aftercare={} presses={} refusals={} aiReleases={} layerReleases={} openingClears={} sceneLayers={} "
+                               "lastWhy='{}' lastFix='{}' now='{}' pipboyEnabled={} handlerEvents={} unreached={} lastUnreached='{}'",
+                g_ac.note, g_ac.presses, g_ac.refusals, g_ac.aiReleases, g_ac.layerReleases, g_ac.openingClears, g_ac.sceneLayers,
+                g_ac.lastWhy, g_ac.lastFix, why.empty() ? "nothing blocks" : why, UserEventEnabled(kMainFour) ? 1 : 0, g_pbEvents.load(),
+                g_pw.unreached, g_pw.last);
+        }
+    }
+
+    namespace
+    {
         // ---- POV head hide (PollHeadHide) ----
         struct HeadHide
         {
             bool                                   cfgRead{ false };
             bool                                   on{ true };
             float                                  radius{ 40.0f };
-            std::vector<std::string>               tokens;
             RE::NiPointer<RE::Actor>               actor;          // whose head is hidden now
             RE::NiPointer<RE::Actor>               cand;           // in the radius on the last find, not hidden yet (dwell)
             int                                    candFinds{ 0 };
-            std::vector<RE::NiPointer<RE::NiAVObject>> culled;     // nodes this hid (flag bit 0 was clear before)
+            headhide::Set                          culled;         // nodes this hid (HeadHideCore.h, shared with FRIK-flat C39)
             Clock::time_point                      lastFind{}, lastScan{};
             float                                  lastDist{ -1.0f };
             std::uint64_t                          hides{ 0 }, restores{ 0 }, noFace{ 0 };
@@ -1866,21 +2804,12 @@ namespace fo4flatvr::camdir
         };
         HeadHide g_hh;
 
-        // the actor's FaceGen head (face, hair, eyes, brows, teeth, beard: every head part) is this one node under its
-        // third-person 3D; culling it hides the whole head at once
-        constexpr const char* kFaceNode = "BSFaceGenNiNodeSkinned";
+        // the actor's FaceGen head node, head-slot armour and head gear: HeadHideCore.h (one implementation with FRIK-flat C39)
+        using headhide::kFaceNode;
         // AAF POV: the free camera (TFC) at the head bone. FirstPerson / IronSights (FRIK's own head, selfie), ThirdPerson
         // and every other orbit/scene state never hide a head (17 Nov, user: "ours is breaking the face")
         constexpr float kLeaveFactor = 1.5f;  // hysteresis: a hidden head is shown again beyond radius x this
         constexpr int   kDwellFinds = 2;      // 10 Hz finds in the radius before a head is hidden (~0.1-0.2 s)
-
-        // FRIK's Mesh_Hide\face.ini list (FRIK-flat\FRIK_Config), the geometry names FRIK hides for the player's head
-        constexpr const char* kHeadTokens[] = { "bandage", "beard", "cap", "cowl", "crown", "eyepiece", "eyes", "fedora", "glasses",
-            "goggles", "hair", "head", "helm", "helmet", "hood", "mask", "mouth", "neckgore", "optics prototype", "shades", "visor",
-            "wighairtop" };
-        // head biped slots FRIK hides (CullGeometryHandler::restoreEquipment): hair top/long, FaceGen head, headband, eyes, beard,
-        // mouth, neck, scalp
-        constexpr int kHeadSlots[] = { 0, 1, 2, 16, 17, 18, 19, 20, 22 };
 
         void HeadHideConfig()
         {
@@ -1895,24 +2824,8 @@ namespace fo4flatvr::camdir
             char* end = nullptr;
             const float r = std::strtof(buf, &end);
             if (end != buf && r > 1.0f) g_hh.radius = r;
-            for (const char* t : kHeadTokens) g_hh.tokens.emplace_back(t);
             REX::INFO("camdir: POV head hide {} (radius {} units: the free camera's scene view within that of an actor's Head bone; never first person / selfie / third person)",
                 g_hh.on ? "on" : "off (bPovHeadHide=0)", g_hh.radius);
-        }
-
-        bool HeadName(const char* a_name)
-        {
-            if (!a_name || !*a_name) {
-                return false;
-            }
-            std::string n = a_name;
-            std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            for (const auto& t : g_hh.tokens) {
-                if (n.find(t) != std::string::npos) {
-                    return true;
-                }
-            }
-            return false;
         }
 
         RE::NiAVObject* ActorRoot(RE::Actor* a)
@@ -1921,69 +2834,18 @@ namespace fo4flatvr::camdir
             return a == RE::PlayerCharacter::GetSingleton() ? static_cast<RE::TESObjectREFR*>(a)->Get3D(false) : a->Get3D();
         }
 
-        void CullNode(RE::NiAVObject* o)
-        {
-            if (!o || (o->flags.flags & 1)) {
-                return;  // already culled (by the game, FRIK or another mod): never ours to show again
-            }
-            o->flags.flags |= 1;
-            g_hh.culled.emplace_back(o);
-        }
-
-        void CollectHead(RE::NiAVObject* o, int a_depth)
-        {
-            if (!o || a_depth > 40) {
-                return;
-            }
-            if (o->IsGeometry()) {
-                if (HeadName(o->name.c_str())) CullNode(o);
-                return;
-            }
-            if (auto* n = o->IsNode()) {
-                for (auto& c : n->children) {
-                    if (c) CollectHead(c.get(), a_depth + 1);
-                }
-            }
-        }
-
-        // Whole head or nothing (17 Nov): the FaceGen node (all head parts), the armour in FRIK's head slots, and head gear by
-        // FRIK's face-list names inside the actor's other armour pieces. Before, the face list was matched against every
-        // geometry of the actor: a head part whose name has none of the words (mod hair, brows, ...) stayed while the face
-        // went, and body geometry with a matching word went too. Returns false (nothing culled) without a FaceGen node.
+        // Whole head or nothing (17 Nov): see HeadHideCore.h. Returns false (nothing culled) without a FaceGen node.
         bool HeadHideScan(RE::Actor* a)
         {
-            auto* root = ActorRoot(a);
-            auto* face = root ? root->GetObjectByName(RE::BSFixedString(kFaceNode)) : nullptr;
-            if (!face) {
-                return false;
-            }
-            CullNode(face);
-            if (auto* biped = a->biped.get()) {
-                for (int slot = 0; slot < 32; ++slot) {
-                    const auto& b = biped->object[slot];
-                    if (!b.parent.object || !b.partClone || b.parent.object->GetFormType() != RE::ENUM_FORM_ID::kARMO) {
-                        continue;
-                    }
-                    if (std::find(std::begin(kHeadSlots), std::end(kHeadSlots), slot) != std::end(kHeadSlots)) {
-                        CullNode(b.partClone.get());  // head slot: the whole piece
-                    } else {
-                        CollectHead(b.partClone.get(), 0);  // other slots: only its head-gear geometry (hat on slot 54/55, hood)
-                    }
-                }
-            }
-            return true;
+            return g_hh.culled.Scan(a, ActorRoot(a));
         }
 
         void HeadHideRestore(const char* a_why)
         {
-            if (!g_hh.actor && g_hh.culled.empty()) {
+            if (!g_hh.actor && g_hh.culled.Empty()) {
                 return;
             }
-            for (auto& o : g_hh.culled) {
-                if (o) o->flags.flags &= ~static_cast<std::uint64_t>(1);
-            }
-            const auto n = g_hh.culled.size();
-            g_hh.culled.clear();
+            const auto n = g_hh.culled.Restore();
             ++g_hh.restores;
             REX::INFO("camdir: POV head hide: {:08X} head shown again ({} nodes; {})", g_hh.actor ? g_hh.actor->GetFormID() : 0, n, a_why);
             g_hh.actor.reset();
@@ -1996,10 +2858,9 @@ namespace fo4flatvr::camdir
             const auto& l = a->data.location;
             const float lx = l.x - a_cam.x, ly = l.y - a_cam.y, lz = l.z - a_cam.z;
             if (lx * lx + ly * ly + lz * lz > 400.0f * 400.0f) return -1.0f;  // the Head bone is within ~150 u of the actor's origin
-            auto* root = ActorRoot(a);
-            auto* head = root ? root->GetObjectByName(RE::BSFixedString("Head")) : nullptr;
-            if (!head) return -1.0f;
-            const auto& h = head->world.translate;
+            const auto* hw = HeadBoneWorld(ActorRoot(a));  // 21 Nov: the bone tree's Head first (not the facebones 'HEAD')
+            if (!hw) return -1.0f;
+            const auto& h = hw->translate;
             const float dx = h.x - a_cam.x, dy = h.y - a_cam.y, dz = h.z - a_cam.z;
             return std::sqrt(dx * dx + dy * dy + dz * dz);
         }
@@ -2026,10 +2887,70 @@ namespace fo4flatvr::camdir
             }
             return best;
         }
+
+        // bBodyCameraYieldsToPov (21 Nov; user: "Tested with bBodyCamera=1 ... none of the POV AAF cameras actually follow an
+        // actors head position"): bBodyCamera replaced every free-camera view, AAF's POV included. Rule now: in the free camera
+        // the body camera is the player's own animated head (AAF's shots and the POV on the player alike); when AAF's camera
+        // sits at ANOTHER actor's head (POV on an NPC: within fPovHeadRadius of that actor's Head bone for kDwellFinds finds,
+        // released beyond radius x kLeaveFactor or when the player's head is the nearer one) the view is AAF's (SCENE: AAF's
+        // POV point + head motion). Main tick, 10 Hz.
+        struct BodyYieldScan
+        {
+            Clock::time_point        last{};
+            RE::NiPointer<RE::Actor> cand;
+            int                      finds{ 0 };
+        };
+        BodyYieldScan g_by;
+
+        void PollBodyYield(int a_st, const V3& a_cam)
+        {
+            bool on, yielding;
+            {
+                std::scoped_lock l(g_lock);
+                on = g_d.installed && g_cfg.enabled && g_cfg.bodyCam && g_cfg.bodyYieldPov && a_st == kStateFree;
+                yielding = g_d.bodyYield;
+            }
+            auto set = [&](bool a_yield, const std::string& a_who) {
+                std::scoped_lock l(g_lock);
+                if (g_d.bodyYield == a_yield) return;
+                g_d.bodyYield = a_yield;
+                if (a_yield) {
+                    ++g_d.bodyYields;
+                    g_d.bodyYieldWho = a_who;
+                }
+                REX::INFO("camdir: body camera {} ({})", a_yield ? "yields to AAF's POV on another actor's head" : "back on the player's head",
+                    a_who);
+            };
+            if (!on) {
+                g_by.cand.reset();
+                g_by.finds = 0;
+                if (yielding) set(false, "not the body camera in the free camera");
+                return;
+            }
+            const auto now = Clock::now();
+            if (Ms(g_by.last, now) < 100.0) return;
+            g_by.last = now;
+            float d = -1.0f;
+            auto  a = FindPovActor(a_cam, g_hh.radius * (yielding ? kLeaveFactor : 1.0f), d);
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            const bool other = a && a.get() != player;
+            if (!other) {
+                g_by.cand.reset();
+                g_by.finds = 0;
+                if (yielding) set(false, a ? "camera at the player's head" : "camera left the actor's head");
+                return;
+            }
+            g_by.finds = a.get() == g_by.cand.get() ? g_by.finds + 1 : 1;
+            g_by.cand = a;
+            if (!yielding && g_by.finds >= kDwellFinds) {
+                set(true, std::format("{:08X} head at {:.1f} u", a->GetFormID(), d));
+            }
+        }
     }
 
     void PollHeadHide()
     {
+        PollAftercare();  // 20 Nov late: scene aftercare's input-layer watch (4 Hz; this main tick is camdir's)
         HeadHideConfig();
         bool active = false;
         V3   cam{};
@@ -2042,9 +2963,28 @@ namespace fo4flatvr::camdir
             active = g_hh.on && g_d.installed && g_cfg.enabled && st == kStateFree && g_d.sceneSt[st];
             cam = g_d.tg;  // the game camera's position (AAF's POV point), before the head offset
         }
-        const char* why = !g_hh.on ? "off (bPovHeadHide=0)" : !active ? "not the free-camera scene view" : nullptr;
+        PollBodyYield(st, cam);
+        bool bodyHead = false;  // bBodyCamera: the camera is at the player's own eye while the third-person body is shown
+        {
+            std::scoped_lock l(g_lock);
+            bodyHead = g_hh.on && BodyAppliesLocked(st);
+        }
+        const char* why = !g_hh.on ? "off (bPovHeadHide=0)" : !active && !bodyHead ? "not the free-camera scene view" : nullptr;
         if (!why && gestures::SelfieState().active) {
             why = "selfie";
+        }
+        if (!why && bodyHead) {
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            if (player && g_hh.actor.get() != player) {
+                if (g_hh.actor) HeadHideRestore("body camera: the player's own head");
+                g_hh.actor.reset(player);
+                g_hh.cand.reset();
+                g_hh.candFinds = 0;
+                g_hh.lastScan = {};
+                ++g_hh.hides;
+                g_hh.last = std::format("player (body camera, state {})", StateName(st));
+            }
+            g_hh.why = "-";
         }
         if (why) {
             g_hh.why = why;
@@ -2054,7 +2994,7 @@ namespace fo4flatvr::camdir
             return;
         }
         const auto now = Clock::now();
-        if (Ms(g_hh.lastFind, now) >= 100.0) {  // 10 Hz: the POV point moves with the head bone, actors do not swap often
+        if (!bodyHead && Ms(g_hh.lastFind, now) >= 100.0) {  // 10 Hz: the POV point moves with the head bone, actors do not swap often
             g_hh.lastFind = now;
             // a hidden head stays hidden out to radius x kLeaveFactor (no hide/show flicker at the edge); a head is hidden only
             // after kDwellFinds finds in a row inside the radius (a camera passing a head does not hide it)
@@ -2096,7 +3036,7 @@ namespace fo4flatvr::camdir
         if (Ms(g_hh.lastScan, now) >= 500.0) {  // equipment / head parts can change during a scene (undress, re-equip)
             const bool first = g_hh.lastScan.time_since_epoch().count() == 0;
             g_hh.lastScan = now;
-            const auto before = g_hh.culled.size();
+            const auto before = g_hh.culled.Size();
             const bool face = HeadHideScan(g_hh.actor.get());
             if (!face) {
                 g_hh.why = "no FaceGen head node (nothing hidden)";
@@ -2105,16 +3045,14 @@ namespace fo4flatvr::camdir
             if (first) {
                 if (face) {
                     REX::INFO("camdir: POV head hide: view at the head of {} -> {} head nodes culled (FaceGen head + head gear)", g_hh.last,
-                        g_hh.culled.size() - before);
+                        g_hh.culled.Size() - before);
                 } else {
                     REX::INFO("camdir: POV head hide: view at the head of {} but it has no {} node: nothing hidden (whole head or nothing)",
                         g_hh.last, kFaceNode);
                 }
             }
         }
-        for (auto& o : g_hh.culled) {  // keep them culled (a re-equip or another mod may clear the flag)
-            if (o) o->flags.flags |= 1;
-        }
+        g_hh.culled.Keep();  // keep them culled (a re-equip or another mod may clear the flag)
     }
 
     Policy ViewPolicy(int a_camState)
@@ -2127,8 +3065,11 @@ namespace fo4flatvr::camdir
             return g_d.eff;
         }
         // the director has not seen this state yet (one frame): its table entry; FADE_SNAP already fades
+        if (BodyAppliesLocked(a_camState)) {
+            return Policy::kTrack;
+        }
         Policy p = a_camState >= 0 && a_camState < kStates ? g_cfg.table[a_camState] : Policy::kCinema;
-        if (a_camState == kStateThird && p == Policy::kCinema && g_d.freeHooked && g_cfg.thirdGraceMs > 0.0f) {
+        if (a_camState == kStateThird && p == Policy::kCinema && FreeOn() && g_cfg.thirdGraceMs > 0.0f) {
             p = Policy::kFadeSnap;  // free-camera scene view: a new third-person state starts inside its fade grace (Tick)
         }
         return p == Policy::kFadeSnap && g_menuWindow.load() ? Policy::kCinema : p;
@@ -2143,7 +3084,106 @@ namespace fo4flatvr::camdir
     {
         std::scoped_lock l(g_lock);
         return g_d.installed && g_cfg.enabled && a_camState >= 0 && a_camState < kStates && g_d.sceneSt[a_camState] &&
-               g_cfg.table[a_camState] == Policy::kTrack;
+               g_cfg.table[a_camState] == Policy::kTrack && !BodyAppliesLocked(a_camState);
+    }
+
+    bool BodyView(int a_camState)
+    {
+        std::scoped_lock l(g_lock);
+        return BodyAppliesLocked(a_camState);
+    }
+
+    bool LockFirstPerson()
+    {
+        std::scoped_lock l(g_lock);
+        return g_d.installed && g_cfg.enabled && g_cfg.lockFp;
+    }
+
+    bool SameInputAllViews()
+    {
+        std::scoped_lock l(g_lock);
+        return g_cfg.sameInput;
+    }
+
+    bool GameCameraYaw(float& a_yaw)
+    {
+        std::scoped_lock l(g_lock);
+        if (!g_d.installed || !g_cfg.enabled || !g_d.preYawOk || g_d.eff == Policy::kCinema) {
+            return false;
+        }
+        a_yaw = g_d.preYaw;
+        return true;
+    }
+
+    namespace
+    {
+        const char* const kStateLabels[kStates] = { "First person", "Idle orbit", "VATS", "Free camera", "Iron sights", "Transition",
+            "Tween", "Animated camera", "Third person", "Furniture", "Mount", "Bleedout", "Dialogue camera" };
+
+        // the view mode a state is shown in (g_lock held): its policy, the body camera, or an automatic rule that holds
+        // (menu window, fade timeout); not the short blinks on cuts
+        std::string ModeLabelLocked(int a_st)
+        {
+            if (a_st < 0 || a_st >= kStates) return "-";
+            if (!g_d.installed || !g_cfg.enabled) return a_st == 0 ? "TRACK" : "CINEMA";
+            if (BodyAppliesLocked(a_st)) return "TRACK on the body";
+            if (g_d.sceneSt[a_st]) return "SCENE";
+            const Policy p = g_cfg.table[a_st];
+            if (p == Policy::kFadeSnap && g_menuWindow.load()) return "CINEMA (menu window)";
+            if (p == Policy::kFadeSnap && a_st == g_d.state && g_f.timedOut) return "CINEMA (fade timeout)";
+            return PolicyName(p);
+        }
+    }
+
+    void PollNotify()
+    {
+        std::string msg;
+        {
+            std::scoped_lock l(g_lock);
+            const int st = g_d.state;
+            if (st < 0 || st >= kStates) {
+                return;
+            }
+            const std::string mode = ModeLabelLocked(st);
+            const auto        now = Clock::now();
+            if (!g_refused.empty()) {
+                const std::string r = std::move(g_refused);
+                g_refused.clear();
+                // the same refusal again within 3 s (a script retrying, AAF's 0.1 s timers): log only
+                if (g_cfg.hudNotify && (r != g_refusedLastText || Ms(g_refusedAt, now) >= 3000.0)) {
+                    msg = std::format("Camera: {} (first-person lock)", r);
+                    g_refusedAt = now;
+                    g_refusedLastText = r;
+                    ++g_n.refusedShown;
+                }
+            }
+            if (st != g_n.state || mode != g_n.mode) {
+                const bool first = g_n.state == -100;
+                const std::string change = st != g_n.state
+                                               ? std::format("Camera: {} -> {} ({})", g_n.state >= 0 && g_n.state < kStates ? kStateLabels[g_n.state] : "-",
+                                                     kStateLabels[st], mode)
+                                               : std::format("Camera view: {} {} -> {}", kStateLabels[st], g_n.mode, mode);
+                g_n.state = st;
+                g_n.mode = mode;
+                if (!first && g_cfg.hudNotify) {
+                    msg = msg.empty() ? change : msg + "; " + change;
+                    ++g_n.shown;
+                    g_n.last = change;
+                }
+            }
+        }
+        if (msg.empty() || game::MenuOpen("LoadingMenu")) {
+            return;
+        }
+        REX::INFO("camdir: HUD: {}", msg);
+        game::HudMessage(msg);
+    }
+
+    bool CallerShouldShow(const std::string& a_result)
+    {
+        std::scoped_lock l(g_lock);
+        // with the notifications on, a view change / state change is announced by PollNotify; errors and refusals are not
+        return !g_cfg.hudNotify || a_result.rfind("error", 0) == 0 || a_result.rfind("refused", 0) == 0 || a_result.rfind("cycle:", 0) == 0;
     }
 
     bool VatsWorldView()
@@ -2174,6 +3214,15 @@ namespace fo4flatvr::camdir
 
     std::string Command(const std::string& a_arg)
     {
+        if (a_arg == "aftercare") {  // 20 Nov late: Pip-Boy refusal diagnosis / scene leftovers ([Camera] bSceneAftercare)
+            float window;
+            {
+                std::scoped_lock l(g_lock);
+                window = g_cfg.defeatWindowS;
+            }
+            return tq::RunOnMainWait([window]() { return AftercareStatus(window); }, std::chrono::milliseconds(1000),
+                "error: main thread did not answer (loading / paused?)");
+        }
         std::scoped_lock l(g_lock);
         Cfg& c = g_cfg;
         if (a_arg == "on" || a_arg == "off") {
@@ -2185,6 +3234,34 @@ namespace fo4flatvr::camdir
         }
         if (a_arg == "table") {
             return TableString();
+        }
+        if (a_arg.rfind("lock", 0) == 0 || a_arg.rfind("body", 0) == 0) {
+            // 20 Nov: "camdir lock [on|off]" (bLockFirstPerson), "camdir body [on|off]" (bBodyCamera); runtime, not saved
+            const bool lock = a_arg.rfind("lock", 0) == 0;
+            const std::string v = a_arg.size() > 5 ? a_arg.substr(5) : std::string{};
+            if (!v.empty() && v != "on" && v != "off" && v != "1" && v != "0") {
+                return "error: camdir lock|body [on|off]";
+            }
+            if (!g_d.installed) {
+                return std::format("error: director not installed ({})", g_d.installNote);
+            }
+            if (!v.empty()) {
+                const bool on = v == "on" || v == "1";
+                (lock ? c.lockFp : c.bodyCam) = on;
+                if (lock) game::camtweak::SetForced(on);
+                REX::INFO("camdir: {} {} (pipe / VR panel)", lock ? "first-person lock" : "body camera", on ? "ON" : "off");
+            }
+            return std::format("lock={} body={} lockForces={} lastLockForce='{}' bodyTicks={} bodyEyeH={:.1f} follow={} w={:.2f} want={} "
+                               "anim={} disp={:.1f} sceneSignal={} snaps={} blends={} animMiss={} yield={} yields={} lastYield='{}' "
+                               "statePosReads={} gates freeCam={}/{} bleedout={}/{} mount={}/{} 3rd={}/{} furniture={}/{} animated={}/{} "
+                               "(calls/blocked)",
+                c.lockFp ? 1 : 0, c.bodyCam ? 1 : 0, g_d.lockForces, g_d.lockLast, g_d.bodyTicks, g_d.bodyEyeH, c.bodyFollow ? 1 : 0,
+                g_d.bodyFollowW, g_d.bodyFollowWant ? 1 : 0, g_d.bodyAnimOk ? 1 : 0, g_d.bodyDisp, g_d.bodySceneNow ? 1 : 0,
+                g_d.bodyFollowSnaps, g_d.bodyFollowBlends, g_d.bodyAnimMiss, g_d.bodyYield ? 1 : 0, g_d.bodyYields, g_d.bodyYieldWho,
+                g_d.freeStateReads, g_gs[kGFreeCam].calls,
+                g_gs[kGFreeCam].blocked, g_gs[kGBleedout].calls, g_gs[kGBleedout].blocked, g_gs[kGMount].calls, g_gs[kGMount].blocked,
+                g_gs[kGSet3rd].calls + g_gs[kGForce3rd].calls, g_gs[kGSet3rd].blocked + g_gs[kGForce3rd].blocked, g_gs[kGFurniture].calls,
+                g_gs[kGFurniture].blocked, g_gs[kGAnimated].calls, g_gs[kGAnimated].blocked);
         }
         if (a_arg.rfind("policy", 0) == 0) {
             char st[32]{}, po[32]{};
@@ -2199,13 +3276,50 @@ namespace fo4flatvr::camdir
             if (p == Policy::kScene && (i == 0 || i == 4)) {
                 return "error: SCENE is not allowed for FirstPerson / IronSights (first-person path)";
             }
-            if (p == Policy::kScene && i == kStateFree && !g_d.freeHooked) {
-                return "error: Free=SCENE needs the free-camera thunk (bFreeCamScene=1)";
+            if (p == Policy::kScene && i == kStateFree && !FreeOn()) {
+                return "error: Free=SCENE needs the free-camera scene view (bFreeCamScene=1)";
             }
             g_d.sceneSt[i] = p == Policy::kScene;
             c.table[i] = p == Policy::kScene ? Policy::kTrack : p;
             REX::INFO("camdir: policy {} = {} (pipe)", kStateNames[i], PolicyName(p));
             return TableString();
+        }
+        if (a_arg.rfind("cfg ", 0) == 0) {
+            // 20 Nov (VR settings panel, ConfigUI.h): the director's runtime values without a restart
+            char  key[32]{};
+            float v = 0;
+            if (sscanf_s(a_arg.c_str() + 4, "%31s %f", key, static_cast<unsigned>(sizeof(key)), &v) != 2) {
+                return "error: camdir cfg fadems|timeout|jump|return|returns|grace|headhide|lockfp|body|notify|sameinput|follow|eyefwd|yieldpov|statepos <value>";
+            }
+            const std::string k = key;
+            if (k == "fadems") c.fadeMs = (std::max)(v, 0.0f);
+            else if (k == "timeout") c.timeoutS = (std::max)(v, 0.0f);
+            else if (k == "jump") c.jumpUnits = (std::max)(v, 0.0f);
+            else if (k == "return") c.thirdReturn = v != 0.0f;
+            else if (k == "returns") c.thirdReturnS = (std::max)(v, 0.0f);
+            else if (k == "grace") c.thirdGraceMs = (std::max)(v, 0.0f);
+            else if (k == "headhide") {
+                g_hh.cfgRead = true;
+                g_hh.on = v != 0.0f;
+            } else if (k == "lockfp") {
+                c.lockFp = v != 0.0f;
+                game::camtweak::SetForced(c.lockFp);
+            } else if (k == "body") c.bodyCam = v != 0.0f;
+            else if (k == "notify") c.hudNotify = v != 0.0f;
+            else if (k == "sameinput") c.sameInput = v != 0.0f;
+            else if (k == "follow") c.bodyFollow = v != 0.0f;           // 21 Nov: bBodyCameraFollowsAnimation
+            else if (k == "eyefwd") c.bodyEyeFwd = v;                   // fBodyCameraEyeForward
+            else if (k == "yieldpov") c.bodyYieldPov = v != 0.0f;       // bBodyCameraYieldsToPov
+            else if (k == "statepos") c.freeStatePos = v != 0.0f;       // bFreeCamStatePosition
+            else {
+                return "error: camdir cfg fadems|timeout|jump|return|returns|grace|headhide|lockfp|body|notify|sameinput|follow|eyefwd|yieldpov|statepos <value>";
+            }
+            REX::INFO("camdir: cfg {} = {} (pipe / VR panel)", k, v);
+            return std::format("fadeMs={} timeoutS={} jumpUnits={} thirdReturn={} thirdReturnS={} thirdGraceMs={} povHeadHide={} lockFp={} "
+                               "body={} notify={} sameInput={} follow={} eyeFwd={} yieldPov={} statePos={}",
+                c.fadeMs, c.timeoutS, c.jumpUnits, c.thirdReturn ? 1 : 0, c.thirdReturnS, c.thirdGraceMs, g_hh.on ? 1 : 0, c.lockFp ? 1 : 0,
+                c.bodyCam ? 1 : 0, c.hudNotify ? 1 : 0, c.sameInput ? 1 : 0, c.bodyFollow ? 1 : 0, c.bodyEyeFwd, c.bodyYieldPov ? 1 : 0,
+                c.freeStatePos ? 1 : 0);
         }
         if (a_arg == "gates") {
             std::string out = "gates";
@@ -2252,7 +3366,7 @@ namespace fo4flatvr::camdir
             if (st < 0 || st >= kStates) {
                 return "cycle: no camera state";
             }
-            const bool sceneOk = st != 0 && st != 4 && (st != kStateFree || g_d.freeHooked);
+            const bool sceneOk = st != 0 && st != 4 && (st != kStateFree || FreeOn());
             const Policy cur = g_d.sceneSt[st] ? Policy::kScene : c.table[st];
             Policy next;
             if (cur == Policy::kScene) next = Policy::kTrack;
@@ -2270,32 +3384,33 @@ namespace fo4flatvr::camdir
             // disabled the POV control (AAF) does not stop them. Main thread (task).
             const CamFn_t third = g_origForce3rd;  // set only when its prologue was byte-checked (Detour)
             const bool    toThird = g_d.state == 0;
+            if (toThird && c.lockFp) {
+                return "refused: first-person lock is on ([Camera] bLockFirstPerson; camdir lock off)";
+            }
             if (toThird ? !third : !g_force1st) {
                 return toThird ? "error: Force3rdPerson not resolved" : "error: Force1stPerson not resolved";
             }
-            if (const auto tasks = F4SE::GetTaskInterface()) {
-                tasks->AddTask([toThird, third]() {
+            if (tq::RunOnMain([toThird, third]() {  // main-idle queue (ThreadQueues.h)
                     if (auto* pc = RE::PlayerCamera::GetSingleton()) {
                         if (toThird) third(pc);
                         else g_force1st(pc);
                     }
-                });
+                })) {
                 REX::INFO("camdir: pov key -> {}", toThird ? "Force3rdPerson" : "Force1stPerson");
                 return toThird ? "third person" : "first person";
             }
-            return "error: no task interface";
+            return "error: no main-thread queue";
         }
         if (a_arg == "first") {  // PlayerCamera::Force1stPerson on the main thread (task), as Game.ForceFirstPerson
             if (!g_force1st) {
                 return "error: Force1stPerson not resolved";
             }
-            if (const auto tasks = F4SE::GetTaskInterface()) {
-                tasks->AddTask([]() {
+            if (tq::RunOnMain([]() {  // main-idle queue (ThreadQueues.h)
                     if (auto* pc = RE::PlayerCamera::GetSingleton()) g_force1st(pc);
-                });
+                })) {
                 return "first: Force1stPerson queued";
             }
-            return "error: no task interface";
+            return "error: no main-thread queue";
         }
         if (a_arg.rfind("fadetest", 0) == 0) {
             const double hold = a_arg.size() > 8 ? std::strtod(a_arg.c_str() + 8, nullptr) : 500.0;
@@ -2316,13 +3431,21 @@ namespace fo4flatvr::camdir
             " | freeCam={} freeTicks={} sceneYaw={:.2f} freeYawOffset={:.2f} freeSpeed={:.0f} yawCuts={} glideHolds={} glideTimeouts={} "
             "bodyShows={} thirdGraces={} aafThirdPassed={} moveView={}/{} headDelta={} scene={} sceneEntries={} glideLatched={} "
             "thirdReturn={}/{} armed={} queued={} returns={} lastReturn='{}' benchInputReleases={} povHeadHide={} povActor={:08X} "
-            "povDist={:.1f} povNodes={} povHides={} povRestores={} povLast='{}' povWhy='{}' povNoFace={}",
+            "povDist={:.1f} povNodes={} povHides={} povRestores={} povLast='{}' povWhy='{}' povNoFace={} | lockFp={} lockForces={} "
+            "lastLockForce='{}' body={} bodyNow={} bodyTicks={} bodyEyeH={:.1f} sameInput={} hudNotify={} hudShown={} hudRefused={} "
+            "hudLast='{}' mode='{}'",
             d.freeNote, g_freeTicks.load(), Wrap(d.sceneYaw) * kR2D, d.freeYawOffset * kR2D, d.lastSpeed, d.yawCuts, d.glideHolds,
             d.glideTimeouts, d.bodyShows, d.thirdGraces, d.aafThirdPassed, c.freeMoveView ? 1 : 0, d.moveViewCalls,
             c.freeHeadDelta && d.haveFreeOffBase ? 1 : 0, d.state >= 0 && d.state < kStates && d.sceneSt[d.state] ? 1 : 0,
             d.sceneEntries, d.glideLatched ? 1 : 0, c.thirdReturn ? 1 : 0, c.thirdReturnS, d.thirdArmed ? 1 : 0, d.thirdQueued ? 1 : 0,
             d.thirdReturns, d.lastReturn, g_benchInputReleases, g_hh.on ? 1 : 0, g_hh.actor ? g_hh.actor->GetFormID() : 0, g_hh.lastDist,
-            g_hh.culled.size(), g_hh.hides, g_hh.restores, g_hh.last, g_hh.why, g_hh.noFace);
+            g_hh.culled.Size(), g_hh.hides, g_hh.restores, g_hh.last, g_hh.why, g_hh.noFace, c.lockFp ? 1 : 0, d.lockForces, d.lockLast,
+            c.bodyCam ? 1 : 0, d.body ? 1 : 0, d.bodyTicks, d.bodyEyeH, c.sameInput ? 1 : 0, c.hudNotify ? 1 : 0, g_n.shown, g_n.refusedShown,
+            g_n.last, ModeLabelLocked(d.state)) +
+            std::format(" | lockScenes={} defeatWindowS={} sceneFlow={} scenePasses={} lastScenePass='{}' lockForceSkips={} orbitScene={} "
+                        "ownStickYaw={} stickYaw={:.1f} stickTurnUpdates={} aftercare={}",
+                c.lockScenes ? 1 : 0, c.defeatWindowS, d.sceneFlowNow ? 1 : 0, d.scenePasses, d.lastScenePass, d.lockForceSkips,
+                c.orbitScene ? 1 : 0, c.freeOwnStick ? 1 : 0, d.stickYaw * kR2D, d.stickTurnUpdates, c.aftercare ? 1 : 0);
         return std::format(
             "installed={} enabled={} note='{}' state={} name={} policy={} eff={} stateMs={:.0f} ticks={} transitions={} "
             "writes=T{}/F{}/L{}/C{} wrote={} alpha={:.3f} target={} fadeActive={} timedOut={} episodes={} timeouts={} "
@@ -2337,5 +3460,124 @@ namespace fo4flatvr::camdir
             f.headingSnaps, f.paHolds, d.sitSleep, d.tg.x,
             d.tg.y, d.tg.z, d.out.x, d.out.y, d.out.z, d.add.x, d.add.y, d.add.z, d.raw.x, d.raw.y, d.raw.z, d.holdBase.x, d.holdBase.y, d.holdBase.z, d.rootJumps, d.jumpFades, d.lastJump, c.jumpUnits, c.fadeMs, c.timeoutS,
             TableString()) + freeView;
+    }
+    // 20 Nov (live settings, ConfigStore.h): the director's [Camera] keys (and the [Menus] / [General] ones it reads) that
+    // changed are re-read and applied under the director lock. Only changed keys are applied, so pipe / F2 overrides of other
+    // keys stay. Restart-only (installed at load): bCameraDirector, the VATS gates (bGateVats, bVatsKeepCamera, [Menus]
+    // bVatsLiveWorld / bVatsCameraWindow / bVatsNoImod: their detours are installed in Start/Stop pairs only when on), and
+    // bOwnHeading (Roomscale, the first-person yaw path).
+    void ReloadLive(const cfgstore::Changes& a_ch)
+    {
+        const auto path = Settings::Path();
+        auto rdf = [&](const char* sec, const char* k, float def) {
+            char buf[64]{};
+            ::GetPrivateProfileStringA(sec, k, "", buf, sizeof(buf), path.c_str());
+            char*       end = nullptr;
+            const float v = std::strtof(buf, &end);
+            return end != buf ? v : def;
+        };
+        auto rdb = [&](const char* sec, const char* k, bool def) { return ::GetPrivateProfileIntA(sec, k, def ? 1 : 0, path.c_str()) != 0; };
+        std::scoped_lock l(g_lock);
+        if (!g_d.installed) {
+            REX::INFO("camdir: [Camera] change not applied: the director is not installed ({}; restart)", g_d.installNote);
+            return;
+        }
+        Cfg&        c = g_cfg;
+        const Cfg   d{};
+        std::string what;
+        auto F = [&](const char* sec, const char* k, float& v, float def) {
+            if (!a_ch.Has(sec, k)) return;
+            v = rdf(sec, k, def);
+            what += std::format(" {}={}", k, v);
+        };
+        auto B = [&](const char* k, bool& v, bool def) {
+            if (!a_ch.Has("Camera", k)) return;
+            v = rdb("Camera", k, def);
+            what += std::format(" {}={}", k, v ? 1 : 0);
+        };
+        F("Camera", "fFadeMs", c.fadeMs, d.fadeMs);
+        F("Camera", "fFadeTimeoutS", c.timeoutS, d.timeoutS);
+        F("Camera", "fJumpFadeUnits", c.jumpUnits, d.jumpUnits);
+        F("General", "fUnitsPerMeter", c.unitsPerMeter, 70.0f);
+        if (!(c.unitsPerMeter > 1.0f)) c.unitsPerMeter = 70.0f;
+        F("General", "fHeightOffsetCm", c.heightOffsetCm, 0.0f);
+        const bool craft = rdb("Menus", "bCraftingLiveWorld", true);
+        if (a_ch.Has("Camera", "bGateFurniture") || a_ch.Has("Menus", "bCraftingLiveWorld")) {
+            c.gateFurniture = rdb("Camera", "bGateFurniture", false) || craft;
+            what += std::format(" furnitureGate={}", c.gateFurniture ? 1 : 0);
+        }
+        if (a_ch.Has("Camera", "bGateAnimated") || a_ch.Has("Menus", "bCraftingLiveWorld")) {
+            c.gateAnimated = rdb("Camera", "bGateAnimated", false) || craft;
+            what += std::format(" animatedGate={}", c.gateAnimated ? 1 : 0);
+        }
+        if (a_ch.Has("Menus", "bWorkbenchPause") || a_ch.Has("Menus", "bCraftingLiveWorld")) {
+            g_workbenchPause = rdb("Menus", "bWorkbenchPause", true) && craft;
+            what += std::format(" workbenchPause={}", g_workbenchPause ? 1 : 0);
+        }
+        B("bGatePowerArmor", c.gatePowerArmor, d.gatePowerArmor);
+        B("bWorkbenchDirectMenu", c.workbenchDirect, d.workbenchDirect);
+        B("bBlockThirdPerson", c.blockThirdPerson, d.blockThirdPerson);
+        B("bPipboyStopTick", c.pipboyStopTick, d.pipboyStopTick);
+        B("bHeadingSnap", c.headingSnap, d.headingSnap);
+        F("Camera", "fHeadingSnapDeg", c.headingSnapDeg, d.headingSnapDeg);
+        F("Camera", "fPowerArmorHoldS", c.paHoldS, d.paHoldS);
+        B("bFreeCamBody", c.freeBody, d.freeBody);
+        F("Camera", "fFreeCamYawCutDeg", c.freeYawCutDeg, d.freeYawCutDeg);
+        F("Camera", "fFreeCamGlideSpeed", c.freeGlideSpeed, d.freeGlideSpeed);
+        F("Camera", "fFreeCamGlideHoldS", c.freeGlideHoldS, d.freeGlideHoldS);
+        F("Camera", "fThirdPersonGraceMs", c.thirdGraceMs, d.thirdGraceMs);
+        B("bFreeCamAAFThirdPerson", c.freeAafThird, d.freeAafThird);
+        B("bFreeCamMoveWithView", c.freeMoveView, d.freeMoveView);
+        B("bFreeCamHeadDelta", c.freeHeadDelta, d.freeHeadDelta);
+        B("bThirdPersonReturn", c.thirdReturn, d.thirdReturn);
+        F("Camera", "fThirdPersonReturnS", c.thirdReturnS, d.thirdReturnS);
+        if (a_ch.Has("Camera", "bLockFirstPerson")) {
+            c.lockFp = rdb("Camera", "bLockFirstPerson", false);
+            game::camtweak::SetForced(c.lockFp);
+            what += std::format(" bLockFirstPerson={}", c.lockFp ? 1 : 0);
+        }
+        B("bBodyCamera", c.bodyCam, d.bodyCam);
+        B("bCameraHudNotify", c.hudNotify, d.hudNotify);
+        B("bSameInputAllViews", c.sameInput, d.sameInput);
+        B("bLockAllowScenes", c.lockScenes, d.lockScenes);
+        F("Camera", "fDefeatWindowS", c.defeatWindowS, d.defeatWindowS);
+        B("bFreeCamOwnStickYaw", c.freeOwnStick, d.freeOwnStick);
+        B("bSceneAftercare", c.aftercare, d.aftercare);
+        B("bBodyCameraFollowsAnimation", c.bodyFollow, d.bodyFollow);
+        F("Camera", "fBodyCameraEyeForward", c.bodyEyeFwd, d.bodyEyeFwd);
+        B("bBodyCameraYieldsToPov", c.bodyYieldPov, d.bodyYieldPov);
+        B("bFreeCamStatePosition", c.freeStatePos, d.freeStatePos);
+        const bool orbitChanged = a_ch.Has("Camera", "bOrbitStatesScene");
+        B("bOrbitStatesScene", c.orbitScene, d.orbitScene);
+        if (a_ch.Has("Camera", "bPovHeadHide") || a_ch.Has("Camera", "fPovHeadRadius")) {
+            g_hh.cfgRead = false;  // HeadHideConfig re-reads at the next poll (main tick); off restores a hidden head there
+            what += " povHeadHide (re-read)";
+        }
+        // free-camera scene view + the policy table
+        const bool freeChanged = a_ch.Has("Camera", "bFreeCamScene");
+        if (freeChanged) {
+            c.freeScene = rdb("Camera", "bFreeCamScene", true);
+            g_freeSceneLive = c.freeScene && g_d.freeHooked;
+            what += std::format(" bFreeCamScene={}{}", c.freeScene ? 1 : 0, g_d.freeHooked ? "" : " (thunk NOT patched: no scene view)");
+        }
+        for (int i = 0; i < kStates; ++i) {
+            const auto key = std::format("sPolicy{}", kStateNames[i]);
+            if (!a_ch.Has("Camera", key.c_str()) && !(i == kStateFree && freeChanged) && !(orbitChanged && OrbitState(i))) continue;
+            Policy p = kDefaultTable[i];
+            char   buf[32]{};
+            ::GetPrivateProfileStringA("Camera", key.c_str(), "", buf, sizeof(buf), path.c_str());
+            if (buf[0] && !ParsePolicy(buf, p)) {
+                REX::WARN("camdir: [Camera] {}={} not understood; default {}", key, buf, PolicyName(kDefaultTable[i]));
+                p = kDefaultTable[i];
+            }
+            if (c.orbitScene && OrbitState(i) && p == Policy::kTrack) p = Policy::kScene;  // bOrbitStatesScene, as at load
+            if (i == kStateFree && FreeOn()) p = Policy::kScene;  // bFreeCamScene=1 overrides sPolicyFree, as at load
+            if (p == Policy::kScene && (i == 0 || i == 4)) p = Policy::kTrack;
+            if (p == Policy::kScene && i == kStateFree && !FreeOn()) p = Policy::kCinema;
+            g_d.sceneSt[i] = p == Policy::kScene;
+            c.table[i] = p == Policy::kScene ? Policy::kTrack : p;
+            what += std::format(" {}={}", key, PolicyName(p));
+        }
+        REX::INFO("camdir: settings re-read (live):{}", what.empty() ? " nothing of the director's" : what);
     }
 }

@@ -3,10 +3,12 @@
 #include "plugin/GameBridge.h"
 #include "plugin/HudLayer.h"
 #include "plugin/Settings.h"
+#include "plugin/ThreadQueues.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdio>
 #include <future>
 #include <memory>
@@ -790,6 +792,131 @@ namespace fo4flatvr::game
         return found;
     }
 
+    // 20 Nov (Silhouette's picker: "offset to right and in right eye"): the generic mod-menu panel rule (analysis/mod-sam-vr.md
+    // option A2, never built before). A mod / F4SE menu (IMenu vtable outside Fallout4.exe) drawn by FlatScreenModel
+    // (kCustomRendering) that takes input - the any-menu pointer pass's test: kUsesCursor / kUsesMenuContext, or
+    // kAssignCursorToRenderer / kUpdateUsesCursor / kModal / kPausesGame (Silhouette 0x80184D2 has neither 0x4 nor 0x8) - goes on
+    // the anchored menu panel with the pointer, instead of the head-locked overlay that stretches its 16:9 layout over the
+    // 140 deg render frustum (a right-hand window lands 50-65 deg right: only the right eye sees it). [Menus] sPanelMenus adds
+    // vanilla-vtable names, sNoPanelMenus excludes names (comma lists), bPanelModMenus=0 turns the rule off.
+    namespace
+    {
+        struct ModPanelCfg
+        {
+            bool        loaded{ false };
+            bool        on{ true };
+            std::string add, no;  // ",name,name," lower case
+        };
+        ModPanelCfg      g_modPanel;
+        std::mutex       g_modPanelLock;
+        std::string      g_modPanelSeen;  // |name| list, logged once each
+        std::atomic<int> g_modPanelLive{ -1 };  // pipe override (-1 = ini)
+
+        std::string LowerList(const char* a_key)
+        {
+            char buf[1024]{};
+            ::GetPrivateProfileStringA("Menus", a_key, "", buf, sizeof(buf), Settings::Path().c_str());
+            std::string out = ",";
+            for (const char* p = buf; *p; ++p) {
+                if (*p != ' ' && *p != '\t') out += static_cast<char>(std::tolower(static_cast<unsigned char>(*p)));
+            }
+            return out + ",";
+        }
+        bool InList(const std::string& a_list, const char* a_name)
+        {
+            std::string k = "," + std::string(a_name) + ",";
+            for (auto& ch : k) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            return a_list.size() > 2 && a_list.find(k) != std::string::npos;
+        }
+        std::string OwnerModule(const void* a_menu)
+        {
+            HMODULE mod = nullptr;
+            const auto vt = *reinterpret_cast<const void* const*>(a_menu);
+            char       path[MAX_PATH]{};
+            if (::GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCSTR>(vt), &mod) &&
+                ::GetModuleFileNameA(mod, path, MAX_PATH)) {
+                const char* b = std::strrchr(path, '\\');
+                return b ? b + 1 : path;
+            }
+            return "?";
+        }
+    }
+
+    void SetModPanelMenus(int a_on) { g_modPanelLive = a_on; }
+
+    void ReloadPointerSettings()
+    {
+        g_anyMenu = -1;
+        std::scoped_lock l(g_modPanelLock);
+        g_modPanel.loaded = false;
+    }
+
+    std::string ModPanelMenu()
+    {
+        {
+            std::scoped_lock l(g_modPanelLock);
+            if (!g_modPanel.loaded) {
+                g_modPanel.loaded = true;
+                g_modPanel.on = ::GetPrivateProfileIntA("Menus", "bPanelModMenus", 1, Settings::Path().c_str()) != 0;
+                g_modPanel.add = LowerList("sPanelMenus");
+                g_modPanel.no = LowerList("sNoPanelMenus");
+                REX::INFO("menu panel: mod-menu rule {} ([Menus] bPanelModMenus; sPanelMenus '{}', sNoPanelMenus '{}')", g_modPanel.on ? "on" : "off",
+                    g_modPanel.add, g_modPanel.no);
+            }
+        }
+        const int live = g_modPanelLive.load();
+        const bool on = live >= 0 ? live != 0 : g_modPanel.on;
+        auto* ui = RE::UI::GetSingleton();
+        if (!ui || (!on && g_modPanel.add.size() <= 2)) {
+            return {};
+        }
+        static constexpr const char* kNever[] = { "ButtonBarMenu", "CursorMenu", "VATSMenu", "DialogueMenu", "HUDMenu", "PipboyMenu",
+            "FaderMenu", "VignetteMenu", "LoadingMenu", "PromptMenu" };
+        std::string found, logLine;
+        auto&       lock = StackLock();
+        lock.lock_read();
+        const auto& stack = ui->menuStack;
+        for (std::uint32_t i = stack.size(); i-- > 0 && found.empty();) {
+            const auto& m = stack[i];
+            if (!m) {
+                continue;
+            }
+            const std::uint32_t flags = m->menuFlags.underlying();
+            const char*         r = m->customRendererName.c_str();
+            const char*         n = m->menuName.c_str();
+            if (!(flags & 0x8000) || !r || !n || !*n || _stricmp(r, "FlatScreenModel") != 0) {
+                continue;
+            }
+            bool never = false;
+            for (const char* x : kNever) {
+                never = never || _stricmp(n, x) == 0;
+            }
+            if (never || InList(g_modPanel.no, n)) {
+                continue;
+            }
+            const bool listed = InList(g_modPanel.add, n);
+            const bool mod = OutsideExe(m.get());
+            const bool interactive = (flags & (0x4 | 0x8)) != 0 || AnyMenuInteractive(m.get(), n, flags);
+            if (!interactive || !(listed || (on && mod))) {
+                continue;
+            }
+            found = n;
+            std::scoped_lock l(g_anyLock);
+            const std::string tag = "|" + found + "|";
+            if (g_modPanelSeen.find(tag) == std::string::npos) {
+                g_modPanelSeen += tag;
+                logLine = std::format("menu panel: '{}' flags=0x{:X} depth={} module {} -> anchored panel ({})", found, flags,
+                    static_cast<int>(reinterpret_cast<const std::uint8_t*>(m.get())[0x64]), mod ? OwnerModule(m.get()) : std::string("Fallout4.exe"),
+                    listed ? "[Menus] sPanelMenus" : "mod menu rule, [Menus] bPanelModMenus");
+            }
+        }
+        lock.unlock_read();
+        if (!logLine.empty()) {
+            REX::INFO("{}", logLine);
+        }
+        return found;
+    }
+
     bool MenuOpen(const char* a_name)
     {
         auto* ui = RE::UI::GetSingleton();
@@ -964,13 +1091,16 @@ namespace fo4flatvr::game
             if (!m) REX::ERROR("HUD message: ShowHUDMessage bytes differ; no notifications");
             return m;
         }();
-        const auto tasks = F4SE::GetTaskInterface();
-        if (!ok || !tasks) {
+        if (!ok) {
             return;
         }
-        tasks->AddTask([t = a_text]() {
+        tq::RunOnMain([t = a_text]() {  // main-idle queue (ThreadQueues.h; HUD data model owned by the main thread there)
             using Fn = void (*)(const char*, const char*, bool, bool);
-            reinterpret_cast<Fn>(Base() + kShowHudMessage)(t.c_str(), "", false, false);
+            // 21 Nov: sound nullptr, as the game's own silent callers (VATS ShowHUDMessage(msg, 0, ..)). An empty "" sound name
+            // became a BSFixedString entry that HUDMessages::AddQueuedMessage (9D2730) passed to PlayMenuSound, which resolved it
+            // to UITerminalCharScrollLP (SNDR 000980FB): a loop nobody stops. Every notification (camera state changes in VATS /
+            // AAF scenes, Pip-Boy notices, gesture toggles) started one more: the user's stacking "keypress" tick.
+            reinterpret_cast<Fn>(Base() + kShowHudMessage)(t.c_str(), nullptr, false, false);
         });
     }
 
@@ -1138,9 +1268,9 @@ namespace fo4flatvr::game
             }
         }
         if (queued && !g_taskPending.exchange(true)) {
-            if (const auto tasks = F4SE::GetTaskInterface()) {
-                tasks->AddUITask([]() { DrainEvents(); });
-            } else {
+            // 20 Nov (threading audit): main-idle queue = the UI thread after UI::AdvanceMenus, before Swap draws the menus
+            // (ThreadQueues.h); the F4SE UI task ran on job threads too, while the menus rendered on the main thread
+            if (!tq::RunOnUI([]() { DrainEvents(); })) {
                 g_taskPending = false;
             }
         }
@@ -1234,10 +1364,7 @@ namespace fo4flatvr::game
 
     std::string MenuTestCommand(const std::string& a_arg)
     {
-        const auto tasks = F4SE::GetTaskInterface();
-        if (!tasks) {
-            return "error: no task interface";
-        }
+        // 20 Nov: every task below goes to the main-idle queue (ThreadQueues.h: UI thread, no menu advancing / rendering)
         if (a_arg == "hints on" || a_arg == "hints off") {  // button-hint click fallback switch
             g_hintFallback = a_arg == "hints on";
             return "pointer " + a_arg;
@@ -1246,7 +1373,7 @@ namespace fo4flatvr::game
             const std::string name = a_arg.substr(5);
             auto done = std::make_shared<std::promise<std::string>>();
             auto fut = done->get_future();
-            tasks->AddUITask([done, name]() {
+            const bool queued = tq::RunOnUI([done, name]() {
                 auto* ui = RE::UI::GetSingleton();
                 Scaleform::Ptr<RE::IMenu> m = ui ? ui->GetMenu(RE::BSFixedString(name.c_str())) : nullptr;
                 GValue root;
@@ -1258,6 +1385,7 @@ namespace fo4flatvr::game
                 TreeDump(root, 0, 3, s);
                 done->set_value(s);
             });
+            if (!queued) return "error: no main-thread queue";
             if (fut.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
                 return "error: UI task did not run within 2 s";
             }
@@ -1266,7 +1394,7 @@ namespace fo4flatvr::game
         if (a_arg == "probe") {  // pointer probe: AS3 objects under the pointer in the target menu's movie (UI task)
             auto done = std::make_shared<std::promise<std::string>>();
             auto fut = done->get_future();
-            tasks->AddUITask([done]() {
+            const bool queued = tq::RunOnUI([done]() {
                 MenuPointerTarget         info;
                 Scaleform::Ptr<RE::IMenu> m = ResolveTarget(&info);
                 if (!m || !m->uiMovie) {
@@ -1281,6 +1409,7 @@ namespace fo4flatvr::game
                 }
                 done->set_value(s);
             });
+            if (!queued) return "error: no main-thread queue";
             if (fut.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
                 return "error: UI task did not run within 2 s";
             }
@@ -1289,7 +1418,7 @@ namespace fo4flatvr::game
         if (a_arg == "bar") {  // pointer bar: the button-hint bar's AS3 children (UI task)
             auto done = std::make_shared<std::promise<std::string>>();
             auto fut = done->get_future();
-            tasks->AddUITask([done]() {
+            const bool queued = tq::RunOnUI([done]() {
                 auto* ui = RE::UI::GetSingleton();
                 Scaleform::Ptr<RE::IMenu> bar = ui ? ui->GetMenu(RE::BSFixedString("ButtonBarMenu")) : nullptr;
                 if (!bar || !bar->uiMovie) {
@@ -1306,6 +1435,7 @@ namespace fo4flatvr::game
                 }
                 done->set_value(std::format("onStack={} synthClicks={} lastClick {} | {}", bar->OnStack() ? 1 : 0, g_barSynthClicks.load(), last, rep));
             });
+            if (!queued) return "error: no main-thread queue";
             if (fut.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
                 return "error: UI task did not run within 2 s";
             }
@@ -1313,7 +1443,7 @@ namespace fo4flatvr::game
         }
         auto done = std::make_shared<std::promise<std::string>>();
         auto fut = done->get_future();
-        tasks->AddTask([done, a_arg]() {
+        const bool queued = tq::RunOnMain([done, a_arg]() {
             auto* player = RE::PlayerCharacter::GetSingleton();
             if (!player) {
                 done->set_value("error: no player");
@@ -1348,6 +1478,7 @@ namespace fo4flatvr::game
             }
             done->set_value("error: findref <hexBase> | count <hexForm> [hexRef]");
         });
+        if (!queued) return "error: no main-thread queue";
         if (fut.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
             return "error: main thread did not run the task within 2 s";
         }

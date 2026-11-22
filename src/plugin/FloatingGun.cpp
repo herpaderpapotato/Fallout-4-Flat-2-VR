@@ -4,6 +4,7 @@
 // first-person body/arm geometry is culled instead of posed.
 #include "plugin/FloatingGun.h"
 #include "plugin/FloatingGunInternal.h"
+#include "plugin/ConfigStore.h"
 #include "plugin/GameBridge.h"
 #include "plugin/HeadPose.h"
 #include "plugin/Settings.h"
@@ -1404,10 +1405,10 @@ namespace fo4flatvr::gun
         }
     }
 
-    std::string Install()
+    namespace
     {
-        static std::string summary;
-        if (!summary.empty()) return summary;
+        void ReadCfg(Cfg& c, bool a_load)
+        {
         const auto path = Settings::Path();
         // [Weapon] key, else the pre-retirement [Hands] key (the user's test config), else the default
         auto rd = [&](const char* k, float d, bool a_legacy = true) {
@@ -1421,7 +1422,6 @@ namespace fo4flatvr::gun
             }
             return d;
         };
-        Cfg& c = g_cfg;
         c.enabled = rd("bFloatingGun", 1.0f, false) != 0.0f;
         c.hideArms = rd("bHideArms", 1.0f, false) != 0.0f;
         g_diagLog = rd("bArmsDiagLog", 0.0f, false) != 0.0f;
@@ -1458,7 +1458,7 @@ namespace fo4flatvr::gun
         c.meleeNode = rd("bMeleeNode", 1.0f, false) != 0.0f;
         c.inPowerArmor = rd("bInPowerArmor", 1.0f, false) != 0.0f;
         // head authority: the first-person rig fit gets the vanilla translation (GameBridge.h SetRigFitRaw)
-        game::SetRigFitRaw(rd("bStableRig", 1.0f, false) != 0.0f);
+        if (a_load) game::SetRigFitRaw(rd("bStableRig", 1.0f, false) != 0.0f);  // first-person rig fit (head path): load only
         {
             const char* ck[3] = { "fControllerModelOffsetX", "fControllerModelOffsetY", "fControllerModelOffsetZ" };
             const char* cr[3] = { "fControllerModelRotXDeg", "fControllerModelRotYDeg", "fControllerModelRotZDeg" };
@@ -1475,6 +1475,38 @@ namespace fo4flatvr::gun
                 c.ctrlPath[i] = buf;
             }
         }
+        }
+
+        // 20 Nov (live settings, ConfigStore.h): the gun's placement / kickback / recoil / controller-model offsets and
+        // fUnitsPerMeter apply live. Restart-only: bFloatingGun / bHideArms (W1 / A1 patches at load), sWeaponOffsetsDir and
+        // the controller model paths (loaded once), bStableRig (first-person rig fit, head path).
+        void ReloadLive(const cfgstore::Changes&)
+        {
+            Cfg n;
+            ReadCfg(n, false);
+            std::scoped_lock l(g_lock);
+            Cfg& c = g_cfg;
+            n.enabled = c.enabled;
+            n.hideArms = c.hideArms;
+            n.jsonDir = c.jsonDir;
+            n.ctrlPath[0] = c.ctrlPath[0];
+            n.ctrlPath[1] = c.ctrlPath[1];
+            c = n;
+            REX::INFO("gun: settings re-read (live): grip off=({},{},{})cm rot=({},{},{})deg align={} anchor={} aimFromMuzzle={} noGunLowering={} "
+                      "kickback={} recoil={} melee={} inPA={} controllerModels={} unitsPerMeter={}",
+                c.offCm[0], c.offCm[1], c.offCm[2], c.rotDeg[0], c.rotDeg[1], c.rotDeg[2], c.align, c.gripAnchor, c.aimFromMuzzle ? 1 : 0,
+                c.noGunLowering ? 1 : 0, c.kickback ? 1 : 0, c.recoilRot ? 1 : 0, c.meleeNode ? 1 : 0, c.inPowerArmor ? 1 : 0,
+                c.ctrlModels ? 1 : 0, c.unitsPerMeter);
+        }
+    }
+
+    std::string Install()
+    {
+        static std::string summary;
+        if (!summary.empty()) return summary;
+        Cfg& c = g_cfg;
+        ReadCfg(c, true);
+        cfgstore::Subscribe("gun", "Weapon,Hands,General/fUnitsPerMeter", &ReloadLive);
         if (!c.enabled) {
             summary = "off ([Weapon] bFloatingGun=0): not patched, arms not hidden";
             REX::INFO("gun: {}", summary);

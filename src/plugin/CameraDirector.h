@@ -75,6 +75,44 @@ namespace fo4flatvr::camdir
     // driver's stall test outside first person (a game-pausing menu over a SCENE / third-person / furniture camera).
     std::uint64_t Ticks();
 
+    // ---- 20 Nov (user: "completely ignore any calls to move the camera away from our first person camera (single exception
+    // is VATS) ... from its position on the player body"; "a HUD notification" on camera changes; inputs must not change with
+    // the view mode). analysis/third-person-vr.md section 8.
+    // [Camera] bLockFirstPerson (pipe "camdir lock on|off"): every engine request to leave first person is refused except
+    //   VATS: Set3rdPerson / Force3rdPerson (POV toggle, wheel zoom, scripts, AAF), ToggleFreeCameraMode (tfc / AAF free
+    //   camera, entering only), StartFurnitureMode (chairs, beds, workbenches, terminals, power armour: HUD mode only),
+    //   StartAnimatedMode (PA enter/exit, scripted cams), StartBleedoutMode, StartMountMode; the dialogue camera, kill cams,
+    //   the VATS death cam and the idle orbit through camtweak (forced on); any other non-first-person state that still
+    //   appears (a save loaded in third person, a mod's own PushState) -> PlayerCamera::Force1stPerson. F3 to third refused.
+    // [Camera] bBodyCamera (pipe "camdir body on|off"): in every camera state except first person / iron sights (already
+    //   there) and VATS, the camera position is the first-person eye on the player body (capsule + first-person eye height +
+    //   the head offset, as head authority builds it), rotation Rz(owned heading) x head; the policy table is ignored
+    //   (TRACK); the player's head is hidden (the third-person body is shown in those states).
+    //   21 Nov: bBodyCameraFollowsAnimation (default 1): while the body is animated away from the capsule (scene / furniture /
+    //   bleedout signal, or the animated eye > 24 u from the capsule eye) the eye is the third-person Head bone +
+    //   fBodyCameraEyeForward along the face (read in the director tick: after UpdateAnimation + UpdateScenegraph, this
+    //   frame's pose). bBodyCameraYieldsToPov (default 1): the free camera at ANOTHER actor's head (AAF POV on an NPC) is
+    //   shown as SCENE. bFreeCamStatePosition (default 1): the free camera's position comes from the state (after AAF's write).
+    // 20 Nov late (analysis/mod-aaf-vr.md section 13): [Camera] bLockAllowScenes (AAF / defeat scenes keep their cameras under
+    //   the lock; defeat window fDefeatWindowS after a bleedout), bOrbitStatesScene (TRACK on an orbit camera = SCENE),
+    //   bFreeCamOwnStickYaw (free-camera stick turn kept as our own yaw; AAF POV auto mode no longer pulls it back),
+    //   bSceneAftercare (PipboyHandler hooked: refused Pip-Boy presses diagnosed, scene leftovers released; pipe
+    //   "camdir aftercare").
+    bool BodyView(int a_camState);      // bBodyCamera applies to this state
+    bool LockFirstPerson();
+    // [Camera] bSameInputAllViews (default 1): controls keep the first-person gameplay mapping in every camera view
+    // (SCENE, CINEMA, third person, free camera ...) while no menu is open. 0 = the earlier flat-screen (menu) mapping there.
+    bool SameInputAllViews();
+    // The game camera's yaw (heading convention) the last director tick saw before it rewrote the root (the frame the game
+    // moves the player in outside first person). False before a tick or outside a world-view state.
+    bool GameCameraYaw(float& a_yaw);
+    // [Camera] bCameraHudNotify (default 1): a HUD message on every camera state change and every view mode change
+    // (SCENE/TRACK/CINEMA/LOCK/FADE_SNAP, by F2, gesture, panel, pipe or an automatic rule) and on a refused camera request.
+    // Main thread, every frame (Presenter).
+    void PollNotify();
+    // the F2 / F3 / gesture result text a caller would show itself; false when PollNotify will announce it anyway
+    bool CallerShouldShow(const std::string& a_result);
+
     // Pipe "camdir [on|off|policy <state> <policy>|fadetest [holdMs]|table]".
     std::string Command(const std::string& a_arg);
 
