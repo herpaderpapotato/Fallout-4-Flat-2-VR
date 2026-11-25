@@ -13,3 +13,5 @@ __pycache__/
 /testdata/
 # NVIDIA runtime DLLs (59 MB + 166 MB; the exporter copies them here, BUILD.md lists them as prerequisites)
 /prereqs/
+/tests/
+/tools/
