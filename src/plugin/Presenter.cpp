@@ -5,9 +5,11 @@
 #include "plugin/CameraTweaks.h"
 #include "plugin/Comfort.h"
 #include "plugin/ConfigUI.h"
+#include "plugin/PanelHost.h"
 #include "plugin/ControllerBindings.h"
 #include "plugin/Dialogue.h"
 #include "plugin/GameBridge.h"
+#include "plugin/GameWindow.h"
 #include "plugin/HeadPose.h"
 #include "plugin/HudLayer.h"
 #include "plugin/MenuPointer.h"
@@ -27,6 +29,8 @@
 #include "plugin/Gestures.h"
 #include "plugin/Haptics.h"
 #include "plugin/ThreadQueues.h"
+#include "plugin/ConfigStore.h"
+#include "plugin/Settings.h"
 #include "xr/XrRuntime.h"
 
 #include <Windows.h>
@@ -60,6 +64,7 @@ namespace fo4flatvr::present
             ID3D11Device*        device{ nullptr };
             ID3D11DeviceContext* context{ nullptr };
             Settings             settings;
+            std::string          handPickBlockedBy;   // 26 Nov: the sNoHandPickMenus menu that holds the hand-ray pick off
             Present_t            original{ nullptr };
 
             xr::Runtime runtime;
@@ -140,6 +145,39 @@ namespace fo4flatvr::present
         };
         Pacing g_pacing;
 
+        // Perf pass (26 Nov, PERF-PASS.md): [Performance] keys, live (cfgstore subscriber "perf").
+        struct PerfCfg
+        {
+            std::atomic<bool> directEye{ true };         // bDirectEyeCopy: eye regions straight into the swapchain images (1 copy, was 3 passes)
+            std::atomic<int>  mirrorEvery{ 1 };          // iMirrorEvery: the desktop mirror window is presented every Nth frame (1 = every frame)
+            std::atomic<bool> gpuQueueAdaptive{ true };  // bGpuQueueAdaptive: iGpuQueueFrames=0 relaxes to 1 while frames miss the display period
+            std::atomic<bool> keepFocusRate{ true };     // bKeepFocusFrameRate: no out-of-focus frame-rate cap while the VR session runs (GameWindow.h)
+        };
+        PerfCfg g_perf;
+        void    ReadPerfCfg()
+        {
+            const auto& p = Settings::Path();
+            g_perf.directEye = ::GetPrivateProfileIntA("Performance", "bDirectEyeCopy", 1, p.c_str()) != 0;
+            g_perf.mirrorEvery = std::clamp(static_cast<int>(::GetPrivateProfileIntA("Performance", "iMirrorEvery", 1, p.c_str())), 1, 90);
+            g_perf.gpuQueueAdaptive = ::GetPrivateProfileIntA("Performance", "bGpuQueueAdaptive", 1, p.c_str()) != 0;
+            g_perf.keepFocusRate = ::GetPrivateProfileIntA("Performance", "bKeepFocusFrameRate", 1, p.c_str()) != 0;
+            REX::INFO("perf: [Performance] bDirectEyeCopy={} iMirrorEvery={} bGpuQueueAdaptive={}", g_perf.directEye.load(), g_perf.mirrorEvery.load(),
+                g_perf.gpuQueueAdaptive.load());
+        }
+        // GPU queue, adaptive (HIGH IMPACT: head-path timing). With iGpuQueueFrames=0 the CPU waits every frame for the GPU to
+        // finish the frame before the next pose is predicted: frame time = CPU work + GPU tail. When that sum no longer fits
+        // the display period the wait only costs frame rate (the frame is late either way), so it is relaxed to the
+        // shipped default (1 frame may be unfinished) until CPU work + GPU tail fits again.
+        struct GpuQueueAdaptive
+        {
+            LARGE_INTEGER last{};
+            bool          relaxed{ false };
+            int           over{ 0 }, fits{ 0 }, relaxedFrames{ 0 }, switches{ 0 };
+            double        tailEma{ 0.0 };    // GPU wait measured while strict (ms)
+            double        lastXrWait{ 0.0 }, lastGpuWait{ 0.0 };
+        };
+        GpuQueueAdaptive g_gpuAd;
+
         double QpcMs(const LARGE_INTEGER& a, const LARGE_INTEGER& b)
         {
             static LARGE_INTEGER f{};
@@ -201,7 +239,40 @@ namespace fo4flatvr::present
             g_pacing.behindSum += behind;
             g_pacing.behindMax = (std::max)(g_pacing.behindMax, behind);
             ++g_pacing.behindN;
-            const int           keep = std::clamp(a_frames, 0, 2);
+            int keep = std::clamp(a_frames, 0, 2);
+            {
+                auto&         ad = g_gpuAd;
+                LARGE_INTEGER now{};
+                ::QueryPerformanceCounter(&now);
+                const double dt = ad.last.QuadPart ? QpcMs(ad.last, now) : 0.0;
+                ad.last = now;
+                if (keep == 0 && a_limit && g_perf.gpuQueueAdaptive.load(std::memory_order_relaxed) && a_periodMs > 0.0 && dt > 0.0 && dt < 250.0) {
+                    const double work = dt - ad.lastXrWait - ad.lastGpuWait;  // CPU side of the last frame
+                    if (!ad.relaxed) {
+                        ad.over = dt > 1.08 * a_periodMs ? ad.over + 1 : 0;
+                        if (ad.over >= 12) {
+                            ad.relaxed = true;
+                            ad.fits = 0;
+                            ++ad.switches;
+                        }
+                    } else {
+                        ad.fits = work + ad.tailEma < 0.92 * a_periodMs ? ad.fits + 1 : 0;
+                        if (ad.fits >= 180) {
+                            ad.relaxed = false;
+                            ad.over = 0;
+                            ++ad.switches;
+                        }
+                    }
+                    if (ad.relaxed) {
+                        keep = 1;
+                        ++ad.relaxedFrames;
+                    }
+                } else if (ad.relaxed) {
+                    ad.relaxed = false;
+                    ad.over = ad.fits = 0;
+                }
+                ad.lastGpuWait = 0.0;
+            }
             const std::uint64_t target = v > static_cast<std::uint64_t>(keep) ? v - keep : 0;
             if (!a_limit || done >= target) {
                 return;
@@ -217,6 +288,10 @@ namespace fo4flatvr::present
             }
             ::QueryPerformanceCounter(&t1);
             const double ms = QpcMs(t0, t1);
+            g_gpuAd.lastGpuWait = ms;
+            if (keep == 0) {
+                g_gpuAd.tailEma = g_gpuAd.tailEma > 0.0 ? 0.9 * g_gpuAd.tailEma + 0.1 * ms : ms;
+            }
             ++g_pacing.gpuWaits;
             g_pacing.gpuWaitSum += ms;
             g_pacing.gpuWaitMax = (std::max)(g_pacing.gpuWaitMax, ms);
@@ -660,7 +735,30 @@ namespace fo4flatvr::present
             const auto&     c = s.runtime.Controllers();
             const bool      left = s.settings.leftHanded;
             const xr::Pose& hand = left ? c.leftAim : c.rightAim;
-            const bool      ok = a_began && c.active && (left ? c.leftAimValid : c.rightAimValid) && s.pubHeadValid;
+            bool            ok = a_began && c.active && (left ? c.leftAimValid : c.rightAimValid) && s.pubHeadValid;
+            // 26 Nov: no hand-ray activation pick while a [Controllers] sNoHandPickMenus menu is open (character creation)
+            if (ok && !s.settings.noHandPickMenus.empty()) {
+                std::size_t a = 0;
+                const auto& list = s.settings.noHandPickMenus;
+                while (a < list.size()) {
+                    const auto  b = list.find(',', a);
+                    std::string m = list.substr(a, b == std::string::npos ? std::string::npos : b - a);
+                    m.erase(0, m.find_first_not_of(" \t"));
+                    m.erase(m.find_last_not_of(" \t") + 1);
+                    if (!m.empty() && game::MenuOpen(m.c_str())) {
+                        if (s.handPickBlockedBy != m) REX::INFO("aim: hand-ray pick off while {} is open ([Controllers] sNoHandPickMenus)", m);
+                        s.handPickBlockedBy = m;
+                        ok = false;
+                        break;
+                    }
+                    if (b == std::string::npos) break;
+                    a = b + 1;
+                }
+                if (ok && !s.handPickBlockedBy.empty()) {
+                    REX::INFO("aim: hand-ray pick back ({} closed)", s.handPickBlockedBy);
+                    s.handPickBlockedBy.clear();
+                }
+            }
             float           pos[3]{}, dir[3]{};
             if (ok) {
                 const auto&    hq = s.pubHead.orientation;
@@ -676,8 +774,27 @@ namespace fo4flatvr::present
             game::UpdateHandRay(pos, dir, ok);
         }
 
+        // 26 Nov diag (new-game crash at Fallout4.exe+A8107C: LooksMenu reads g_characterCreation[g_characterIndex], null):
+        // log every change of the character-creation globals (F4SE GameCustomization.cpp: index 327A880, array 327A8A8)
+        void WatchCharGen()
+        {
+            static const auto base = reinterpret_cast<std::uintptr_t>(::GetModuleHandleW(nullptr));
+            static std::uint32_t lastIdx = 0xFFFFFFFF;
+            static std::uintptr_t lastCc[4]{ 1, 1, 1, 1 };
+            const auto idx = *reinterpret_cast<const std::uint32_t*>(base + 0x327A880);
+            const auto* cc = reinterpret_cast<const std::uintptr_t*>(base + 0x327A8A8);
+            bool changed = idx != lastIdx;
+            for (int i = 0; i < 4; ++i) changed = changed || cc[i] != lastCc[i];
+            if (!changed) return;
+            lastIdx = idx;
+            for (int i = 0; i < 4; ++i) lastCc[i] = cc[i];
+            REX::INFO("chargen: index {} | characterCreation [{:X}, {:X}, {:X}, {:X}] | menus {}", idx, cc[0], cc[1], cc[2], cc[3],
+                game::MenuOpen("LooksMenu") ? "LooksMenu" : "-");
+        }
+
         void VrFrame(State& s)
         {
+            WatchCharGen();
             if (!s.xrTried) {
                 InitXr(s);
             }
@@ -1009,6 +1126,7 @@ namespace fo4flatvr::present
             // 1. Finish the XR frame begun at the previous Present: the backbuffer now holds the image
             //    the game rendered from the pose/FOV published when that frame began.
             std::string eyeCapStem;  // stereo PoC E7 capture taken in this frame (see g_stereoEyeCapStem)
+            stereo::GpuProfMark("fo4flatvr present 1: eye images to the swapchains, panorama capture, vignette");
             if (s.frameOpen) {
                 if (s.frameShouldRender && s.submitting && backBuffer) {
                     if (worldView && s.haveRenderPose) {
@@ -1041,7 +1159,6 @@ namespace fo4flatvr::present
                             }
                         }
                         stereo::EyeFrame u;
-                        ID3D11Texture2D *eyeL = nullptr, *eyeR = nullptr;
                         const bool stereoNow = !s.afr && stereo::StereoSubmitActive();
                         if (stereoNow) {
                             std::scoped_lock reqLock(g_reqLock);
@@ -1053,15 +1170,16 @@ namespace fo4flatvr::present
                         }
                         if (s.afr) {
                             s.runtime.SubmitEye(s.context, backBuffer, s.renderEye, s.renderPose, used);
-                        } else if (stereo::StereoSubmitActive() && stereo::UsedEyes(u) &&
-                                   stereo::SplitDoubleWide(s.context, backBuffer, eyeL, eyeR)) {
+                        } else if (unsigned ex[2]{}, ew = 0, eh = 0;
+                                   stereo::StereoSubmitActive() && stereo::UsedEyes(u) && stereo::EyeRegions(backBuffer, ex, ew, eh)) {
                             // Single-pass stereo (iMode 2/3): the back buffer is [left | right]; each half
                             // goes to its eye with the pose/FOV its constants were built from.
                             for (int e = 0; e < 2; ++e) {
                                 const xr::Pose p{ { u.eyeQ[e][0], u.eyeQ[e][1], u.eyeQ[e][2], u.eyeQ[e][3] },
                                     { u.eyeP[e][0], u.eyeP[e][1], u.eyeP[e][2] } };
                                 const xr::Fov f{ u.fov[e][0], u.fov[e][1], u.fov[e][2], u.fov[e][3] };
-                                if (!s.runtime.SubmitEye(s.context, e ? eyeR : eyeL, e, p, f)) {
+                                // perf pass: the eye's region of the back buffer straight into its swapchain image ([Performance] bDirectEyeCopy)
+                                if (!s.runtime.SubmitEyeRegion(s.context, backBuffer, ex[e], ew, eh, e, p, f, g_perf.directEye.load(std::memory_order_relaxed))) {
                                     REX::WARN("stereo: SubmitEye({}) failed: {}", e, s.runtime.lastError());
                                 }
                             }
@@ -1107,6 +1225,7 @@ namespace fo4flatvr::present
                         if (vigOn) {  // C8 comfort vignette: head-locked, above the world, below the HUD
                             vigSent = s.runtime.SubmitVignette(s.context, vigAlpha, vigInner, vigOuter);
                         }
+                        stereo::GpuProfMark("fo4flatvr present 2: HUD pieces, menu panel, settings / mod panels, beam");
                         hud::Submit(s.runtime, s.context);  // HUD copied during this frame's render (D1)
                         pipboy::Submit(s.runtime, s.context);  // wrist Pip-Boy screen on the off-hand grip (D3)
                         dlg::Submit(s.runtime, s.context, s.pubHead, s.pubHeadValid);  // dialogue option panel (world quad 1)
@@ -1194,6 +1313,7 @@ namespace fo4flatvr::present
                     }
                     // 20 Nov: VR settings panel (ConfigUI.h) on the top world quad, over menu panels and the flat window
                     configui::Submit(s.runtime, s.context);
+                    panelhost::Submit(s.runtime, s.context);  // 26 Nov: other plugins' panels (PanelHost.h)
                     // pointer beam + end dot (PointerBeam.h): over the menus/panels it ends on, below the fade
                     beam::Submit(s.runtime, s.context);
                     // camera step 1: director fade (black quad over every layer); never over a view-taking menu
@@ -1204,7 +1324,9 @@ namespace fo4flatvr::present
                 {
                     LARGE_INTEGER e0{}, e1{};
                     ::QueryPerformanceCounter(&e0);
+                    stereo::GpuProfMark("fo4flatvr present 3: xrEndFrame (staged eye blits when not direct)");
                     s.runtime.EndFrame();
+                    stereo::GpuProfMark("fo4flatvr present 4: after xrEndFrame (GPU queue wait, xrWaitFrame, HUD / pip-boy capture)");
                     ::QueryPerformanceCounter(&e1);
                     const double ms = QpcMs(e0, e1);  // pacing diagnostic: time blocked in xrEndFrame
                     g_pacing.endSum += ms;
@@ -1248,10 +1370,13 @@ namespace fo4flatvr::present
                               "gpuq {} behind avg {:.2f} max {} waits {} avg {:.2f} max {:.2f} ms timeouts {}; end avg {:.2f} max {:.2f} ms; "
                               "present avg {:.2f} max {:.2f} ms",
                         g.sum / 600.0, g.max, s.periodMs, g.slow, g.waitSum / 600.0, g.waitMax, head::PoseSyncStats(true),
-                        s.settings.gpuQueueLimit ? std::format("on({})", s.settings.gpuQueueFrames) : std::string("off"),
+                        s.settings.gpuQueueLimit ? std::format("on({}{})", s.settings.gpuQueueFrames,
+                                                       g_gpuAd.relaxedFrames ? std::format(", adaptive: 1 for {}/600 frames, {} switches", g_gpuAd.relaxedFrames, g_gpuAd.switches) : std::string())
+                                                 : std::string("off"),
                         g.behindN ? g.behindSum / g.behindN : 0.0, g.behindMax, g.gpuWaits, g.gpuWaits ? g.gpuWaitSum / g.gpuWaits : 0.0,
                         g.gpuWaitMax, g.gpuTimeouts, g.endSum / 600.0, g.endMax, g.presentN ? g.presentSum / g.presentN : 0.0, g.presentMax);
                     g_pacing = Pacing{};
+                    g_gpuAd.relaxedFrames = 0;
                 }
             }
             g_pacing.last = now;
@@ -1292,6 +1417,7 @@ namespace fo4flatvr::present
             ::QueryPerformanceCounter(&w1);
             {
                 const double w = QpcMs(w0, w1);
+                g_gpuAd.lastXrWait = w;
                 g_pacing.waitSum += w;
                 g_pacing.waitMax = (std::max)(g_pacing.waitMax, w);
             }
@@ -1321,6 +1447,9 @@ namespace fo4flatvr::present
                 ::GetWindowThreadProcessId(::GetForegroundWindow(), &fgPid);
                 configui::UpdateFrame(s.runtime, s.device, s.context, began, began && fi.headValid ? &fi.head : nullptr,
                     fgPid == ::GetCurrentProcessId());
+                // 26 Nov: other plugins' panels (PanelHost.h); the settings panel's hand stays its own
+                panelhost::UpdateFrame(s.runtime, s.device, s.context, began, began && fi.headValid ? &fi.head : nullptr,
+                    configui::PointerHand());
             }
             const bool pipPointer = pipboy::UpdateFrame(s.runtime, began, began && fi.headValid ? &fi.head : nullptr);  // head: projected PA Pip-Boy
             hud::UpdateFrame(s.runtime, began, began && fi.headValid ? &fi.head : nullptr);  // 20 Nov: HUD split (chin compass frame, raise gesture)
@@ -1352,7 +1481,7 @@ namespace fo4flatvr::present
                 // bSameInputAllViews: on the flat window only while it shows a menu (a CINEMA camera view without one keeps the
                 // gameplay trigger)
                 ((sameInput ? !worldView && (!s.lastMenu.empty() || game::MenuOpen("DialogueMenu")) : !inputWorld) || panelNow || vatsWin) &&
-                    s.submitting && s.runtime.running() && !configui::OwnsPointer());
+                    s.submitting && s.runtime.running() && !configui::OwnsPointer() && !panelhost::OwnsPointer());
             dlg::UpdateXr(s.runtime, began);  // dialogue: haptic pulse when the options appear
             if (began) {
                 haptics::Drain(s.runtime);  // gesture pulses + FRIK-flat's Vibrate (Haptics.h)
@@ -1363,6 +1492,7 @@ namespace fo4flatvr::present
                 // 20 Nov: the VR settings panel keeps its pointing hand's trigger / stick / face buttons (ConfigUI.h)
                 xr::ControllerState cmask = s.runtime.Controllers();
                 configui::MaskControllers(cmask);
+                panelhost::MaskControllers(cmask);
                 const auto& c = cmask;
                 pad::State  p;
                 p.active = began && c.active;
@@ -1528,9 +1658,11 @@ namespace fo4flatvr::present
                 head::Tracking() ? 1 : 0, head::OverrideActive() ? 1 : 0, head::TargetFov(),
                 s.afr ? "afr" : s.mono ? "mono" : "cinema", s.renderFov.angleRight * 2 * 57.2958f, s.renderFov.angleUp * 2 * 57.2958f,
                 s.xrOk ? s.runtime.runtimeName() : std::string{}, s.runtime.lastError(), s.runtime.FadeLayersSubmitted()) +
-                std::format(" viewMenu='{}' menuPanel='{}' quadAnchors={} backdropFrames={} layers={} overlay='{}' overlayFrames={} stereoSubmits={}",
-                    s.lastMenu, s.lastPanel, s.anchors, s.runtime.BackdropFrames(), s.runtime.LastLayerCount(), s.overlayMenu,
+                std::format(" viewMenu='{}' menuPanel='{}' quadAnchors={} backdropFrames={} layers={} maxLayers={} overLimitFrames={} overlay='{}' overlayFrames={} stereoSubmits={}",
+                    s.lastMenu, s.lastPanel, s.anchors, s.runtime.BackdropFrames(), s.runtime.LastLayerCount(), s.runtime.MaxLayerCount(),
+                    s.runtime.FramesOverLayerLimit(), s.overlayMenu,
                     s.vatsOverlayFrames, g_stereoSubmits) +
+                " " + s.runtime.EyeCopyStatus() + std::format(" mirrorEvery={} ", g_perf.mirrorEvery.load()) + window::FocusKeeperStatus() +
                 std::format(" vatsPivot={:.3f},{:.3f}", s.vatsPivotU, s.vatsPivotV) +
                 [&] {
                     xr::Pose qp;
@@ -1561,6 +1693,7 @@ namespace fo4flatvr::present
                 game::TraceWorldCamera();  // htrace C: the camera this frame was rendered with (if nothing updated it since)
                 stereo::OnPresent();  // stereo PoC: stats, stereocap write-out, latch the stereo-frame flag
                 dlss::OnPresent();    // 20 Nov: DLSS/NR frame counter, GPU timer read-back, NR toggle key (render thread)
+                stereo::GpuProfMark("fo4flatvr present 0: before the XR frame");
                 std::string capturePath;
                 bool        recenter = false;
                 {
@@ -1619,6 +1752,7 @@ namespace fo4flatvr::present
                 tq::OnPresent();        // 20 Nov: render-thread queue (tq::RunOnRender); game::AimTick moved to the main ticks
                 if (s->frames % 30 == 1) {
                     UpdateStatus(*s);
+                    window::SetFocusKeeper(g_perf.keepFocusRate.load(std::memory_order_relaxed), s->xrOk && s->runtime.running());
                 }
             }
             // While the headset paces the game (xrWaitFrame), monitor vsync only adds a second clock
@@ -1626,9 +1760,16 @@ namespace fo4flatvr::present
             if (a_this == s->swapChain && s->xrOk && s->runtime.running()) {
                 a_sync = 0;
             }
+            stereo::GpuProfMark("the real Present (desktop mirror window)");
             LARGE_INTEGER p0{}, p1{};
             ::QueryPerformanceCounter(&p0);
-            const HRESULT hr = s->original(a_this, a_sync, a_flags);
+            // perf pass: the window is only a mirror while the headset shows the frame; [Performance] iMirrorEvery=N presents it
+            // every Nth frame (the back buffer is unchanged otherwise; the next frame renders into it as before)
+            const int     mirrorEvery = g_perf.mirrorEvery.load(std::memory_order_relaxed);
+            const bool    skipMirror = mirrorEvery > 1 && a_this == s->swapChain && !(a_flags & DXGI_PRESENT_TEST) && s->xrOk && s->runtime.running() &&
+                                    s->submitting && (s->frames.load() % static_cast<std::uint64_t>(mirrorEvery)) != 0;
+            const HRESULT hr = skipMirror ? S_OK : s->original(a_this, a_sync, a_flags);
+            stereo::GpuProfMark("");
             if (a_this == s->swapChain && !(a_flags & DXGI_PRESENT_TEST)) {
                 ::QueryPerformanceCounter(&p1);
                 const double ms = QpcMs(p0, p1);  // pacing diagnostic: the real Present (DXGI frame-latency throttle)
@@ -1660,6 +1801,8 @@ namespace fo4flatvr::present
                 REX::ERROR("VirtualProtect on swapchain vtable failed ({})", ::GetLastError());
                 return;
             }
+            ReadPerfCfg();
+            cfgstore::Subscribe("perf", "Performance", [](const cfgstore::Changes&) { ReadPerfCfg(); });
             vtbl[kPresentSlot] = reinterpret_cast<void*>(&HkPresent);
             ::VirtualProtect(&vtbl[kPresentSlot], sizeof(void*), oldProtect, &oldProtect);
             ::FlushInstructionCache(::GetCurrentProcess(), &vtbl[kPresentSlot], sizeof(void*));

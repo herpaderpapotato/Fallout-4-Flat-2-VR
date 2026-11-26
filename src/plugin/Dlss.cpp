@@ -37,6 +37,7 @@
 #include <thread>
 #include <vector>
 
+namespace fo4flatvr::stereo { void GpuProfMark(const char* a_name); }  // GpuProf.inl ("gpuprof")
 namespace fo4flatvr::dlss
 {
     namespace
@@ -3168,7 +3169,9 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID, uint index 
                 ev.InPreExposure = 1.0f;
                 ev.InExposureScale = 1.0f;
                 ev.InFrameTimeDeltaInMsec = dtMs;
+                stereo::GpuProfMark("DLSS evaluate (both eyes)");
                 const NVSDK_NGX_Result r = NGX_D3D11_EVALUATE_DLSS_EXT(g_ctx, f.h, f.p, &ev);
+                stereo::GpuProfMark("");
                 SafeRelease(mask);
                 if (NVSDK_NGX_FAILED(r)) {
                     ++g_evalFail;

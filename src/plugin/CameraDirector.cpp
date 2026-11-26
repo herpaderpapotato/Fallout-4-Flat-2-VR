@@ -693,6 +693,14 @@ namespace fo4flatvr::camdir
                 ++g_gs[kGFurniture].calls;
                 if (pa) ++g_paFurniture;
                 gate = (pa ? g_cfg.gatePowerArmor : g_cfg.gateFurniture) || g_cfg.lockFp;
+                if (gate) {
+                    const auto base = reinterpret_cast<std::uintptr_t>(::GetModuleHandleW(nullptr));
+                    const auto* cc = reinterpret_cast<const std::uintptr_t*>(base + 0x327A8A8);
+                    if (cc[0] || cc[1]) {
+                        gate = false;
+                        REX::INFO("camdir gate: StartFurnitureMode during character creation - the game's camera (mirror) is kept");
+                    }
+                }
                 if (gate) ++g_gs[kGFurniture].blocked;
                 if (gate && g_cfg.lockFp) g_refused = pa ? "power armour camera refused" : "furniture camera refused";
                 g_lastGate = std::format("StartFurnitureMode {:08X} pa={} {}", a_ref ? a_ref->GetFormID() : 0, pa ? 1 : 0,

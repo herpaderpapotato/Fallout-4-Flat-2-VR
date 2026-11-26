@@ -10,6 +10,8 @@
 #include "plugin/CameraTweaks.h"
 #include "plugin/ConfigStore.h"
 #include "plugin/ConfigUI.h"
+#include "plugin/PanelHost.h"
+#include "plugin/ModsResetGuard.h"
 #include "plugin/Comfort.h"
 #include "plugin/ComfortEffects.h"
 #include "plugin/Dialogue.h"
@@ -611,8 +613,17 @@ namespace fo4flatvr::command
                 present::RequestRecenter();
                 return "requested";
             }
+            if (verb == "gpuprof") {
+                return stereo::Command(verb, arg);  // perf pass: GPU ms per render pass (GpuProf.inl): gpuprof <frames> | gpuprof
+            }
             if (verb == "dlss") {
                 return dlss::Command(arg);  // 20 Nov: DLSS / neural rendering (Dlss.h)
+            }
+            if (verb == "modsreset") {
+                return modsreset::Status();  // 26 Nov: mod-change reset prompt guard (ModsResetGuard.h)
+            }
+            if (verb == "panels") {
+                return panelhost::Command(arg);  // 26 Nov: other plugins' VR panels (PanelHost.h)
             }
             if (verb == "cfgui") {
                 return configui::Command(arg);  // 20 Nov: VR settings panel (ConfigUI.h)

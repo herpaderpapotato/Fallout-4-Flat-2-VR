@@ -1304,6 +1304,7 @@ namespace fo4flatvr::configui
     bool  Enabled() { return g_enabled.load(); }
     float MenuHoldSeconds() { return g_menuHoldS.load(); }
     bool  OwnsPointer() { return g_ownsPointer.load(); }
+    int   PointerHand() { return g_maskHand.load(); }
 
     void RequestToggle(const char* a_why)
     {

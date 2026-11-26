@@ -689,7 +689,17 @@ namespace fo4flatvr::game
         if (!ui) {
             return nullptr;
         }
+        // perf pass 26 Nov: the names are interned once (was a BSFixedString built per menu per call, twice a frame)
+        static const std::vector<RE::BSFixedString> kNames = [] {
+            std::vector<RE::BSFixedString> v;
+            for (const char* m : kMenus) {
+                v.emplace_back(m);
+            }
+            return v;
+        }();
+        std::size_t i = 0;
         for (const char* m : kMenus) {
+            const auto& name = kNames[i++];
             if ((a_ignore && std::strcmp(m, a_ignore) == 0) || (a_skip && a_skip(m))) {
                 continue;
             }
@@ -697,7 +707,7 @@ namespace fo4flatvr::game
             if (std::strcmp(m, "VATSMenu") == 0 && camdir::VatsWorldView()) {
                 continue;
             }
-            if (ui->GetMenuOpen(m)) {
+            if (ui->GetMenuOpen(name)) {
                 return m;
             }
         }

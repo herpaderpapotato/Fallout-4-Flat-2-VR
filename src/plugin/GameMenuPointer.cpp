@@ -920,7 +920,25 @@ namespace fo4flatvr::game
     bool MenuOpen(const char* a_name)
     {
         auto* ui = RE::UI::GetSingleton();
-        return ui && a_name && ui->GetMenuOpen(a_name);
+        if (!ui || !a_name) {
+            return false;
+        }
+        // perf pass 26 Nov: callers ask every frame with literal names; the interned name is kept per thread, keyed by the
+        // pointer and checked against the text (a reused buffer with another name just re-interns)
+        struct Entry
+        {
+            std::string       text;
+            RE::BSFixedString name;
+        };
+        thread_local std::unordered_map<const char*, Entry> cache;
+        auto                                                it = cache.find(a_name);
+        if (it == cache.end() || it->second.text != a_name) {
+            if (cache.size() > 256) {
+                cache.clear();
+            }
+            it = cache.insert_or_assign(a_name, Entry{ a_name, RE::BSFixedString(a_name) }).first;
+        }
+        return ui->GetMenuOpen(it->second.name);
     }
 
     bool VatsTargetScreen(float& a_u, float& a_v)

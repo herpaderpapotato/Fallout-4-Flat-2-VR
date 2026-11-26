@@ -27,6 +27,15 @@ namespace fo4flatvr::window
     // can change at any time: SetWindowPos (async, no activation). The game window is the one CreateWindowExA made, else the
     // swapchain's output window (SetGameWindow). 0 = leave. Any thread.
     void SetGameWindow(void* a_hwnd);
+
+    // Perf pass 26 Nov ([Performance] bKeepFocusFrameRate): High FPS Physics Fix caps the game at its OutOfFocusFPS (60 by
+    // default) from the moment the game window gets WM_KILLFOCUS, and the headset then gets 60 fps for as long as any other
+    // window has the focus (SteamVR, Virtual Desktop, Discord, MO2 ...). While a VR session runs, the game window's
+    // WM_KILLFOCUS is not passed on (the window is subclassed after that mod's own subclass, so it never sees the message);
+    // WM_ACTIVATE / WM_ACTIVATEAPP still pass, so cursor clipping is released as before. Any thread.
+    void InstallFocusKeeper(void* a_hwnd);
+    void SetFocusKeeper(bool a_enabled, bool a_vrRunning);
+    std::string FocusKeeperStatus();
     std::string ResizeClient(int a_clientWidth, int a_clientHeight);
 
 }

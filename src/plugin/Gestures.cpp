@@ -6,6 +6,7 @@
 
 #include "plugin/CameraDirector.h"
 #include "plugin/ConfigUI.h"
+#include "plugin/PanelHost.h"
 #include "plugin/FaceDiag.h"
 #include "plugin/FrikBridge.h"
 #include "plugin/GameBridge.h"
@@ -47,9 +48,10 @@ namespace fo4flatvr::gestures
             kPov = 3,
             kCycle = 4,
             kConfig = 5,  // 20 Nov: the VR settings panel (ConfigUI.h), default on right Up+Down
+            kModPanel = 6,  // 26 Nov: other plugins' panels (PanelHost.h, e.g. the Vioxsis menu), default on right Down+Up
             kActions
         };
-        constexpr const char* kActionNames[kActions] = { "none", "key", "recentre", "pov", "cycle", "config" };
+        constexpr const char* kActionNames[kActions] = { "none", "key", "recentre", "pov", "cycle", "config", "modpanel" };
 
         // Key list of the MCM dropdowns (index -> virtual-key code). APPEND ONLY: the MCM ini stores the index.
         // plugin/tools/gen_mcm_config.py reads the names between the markers for config.json.
@@ -242,7 +244,10 @@ namespace fo4flatvr::gestures
                     const std::string base = std::string("i") + kHandKey[h] + kSlotNames[i];
                     auto& sl = c.slot[h][i];
                     // 20 Nov: right Up+Down opens the VR settings panel unless assigned otherwise
-                    const int def = (h == 1 && std::string(kSlotNames[i]) == "UpDown") ? kConfig : kNone;
+                    // 26 Nov: right Down+Up toggles other plugins' panels (PanelHost.h) unless assigned otherwise
+                    const int def = (h == 1 && std::string(kSlotNames[i]) == "UpDown")   ? kConfig
+                                    : (h == 1 && std::string(kSlotNames[i]) == "DownUp") ? kModPanel
+                                                                                          : kNone;
                     sl.action = std::clamp(r.I("Gestures", (base + "Action").c_str(), def), 0, kActions - 1);
                     sl.key = std::clamp(r.I("Gestures", (base + "Key").c_str(), 0), 0, kKeyCount - 1);
                     sl.mod = std::clamp(r.I("Gestures", (base + "Mod").c_str(), 0), 0, 3);
@@ -386,6 +391,7 @@ namespace fo4flatvr::gestures
                 break;
             }
             case kConfig: configui::RequestToggle("gesture"); break;
+            case kModPanel: panelhost::GestureToggle(); break;
             default: break;
             }
         }

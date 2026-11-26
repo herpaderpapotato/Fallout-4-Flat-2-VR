@@ -172,6 +172,13 @@ namespace xr
         // submitted. A SubmitMono in the same frame takes precedence (the eye images are kept).
         // Returns false if nothing was stored (no frame begun, bad args, or an error: see lastError()).
         bool SubmitEye(ID3D11DeviceContext* a_ctx, ID3D11Texture2D* a_src, int a_eye, const Pose& a_renderPose, const Fov& a_renderFov);
+        // Perf pass 26 Nov: the same for the region [a_x, a_x + a_width) x [0, a_height) of a_src (the double-wide back buffer),
+        // without the caller's split copy. a_direct: the region is copied straight into the acquired swapchain image (one
+        // copy per eye; needs an 8-bit source of the swapchain's format family, else the stage path is used). Frames with no
+        // new eye image then show the swapchain's last released image again.
+        bool SubmitEyeRegion(ID3D11DeviceContext* a_ctx, ID3D11Texture2D* a_src, unsigned a_x, unsigned a_width, unsigned a_height, int a_eye,
+            const Pose& a_renderPose, const Fov& a_renderFov, bool a_direct);
+        std::string EyeCopyStatus() const;
 
         // HUD overlay: a_src (alpha kept, same copy/gamma/state rules as SubmitQuad, own swapchain sized
         // to a_src) on a head-locked quad layer. a_poseInView is the quad centre/orientation in VIEW space
@@ -208,7 +215,8 @@ namespace xr
         // Layer order at EndFrame: projection, vignette, HUD, world quads (slot order), cinema quad, fade.
         // Between BeginFrame and EndFrame; returns false if nothing was queued.
         // 20 Nov: slot kTopWorldQuad (4, the VR settings panel) is layered after the cinema quad instead (below the beams).
-        static constexpr int kMaxWorldQuads = 5;
+        // 26 Nov: slots above kTopWorldQuad (5..7) are other plugins' panels (PanelHost.h), layered with it after the cinema quad.
+        static constexpr int kMaxWorldQuads = 8;
         static constexpr int kTopWorldQuad = 4;
         bool SubmitWorldQuad(ID3D11DeviceContext* a_ctx, ID3D11Texture2D* a_src, const Pose& a_poseInRef, float a_widthMeters,
             bool a_alphaBlend = false, bool a_premultiplied = true, int a_slot = 0);
@@ -230,6 +238,8 @@ namespace xr
         [[nodiscard]] std::uint64_t VignetteLayersSubmitted() const noexcept;  // diagnostics: frames with a vignette layer
         [[nodiscard]] std::uint64_t VignetteUploads() const noexcept;          // diagnostics: image regenerations
         [[nodiscard]] std::uint32_t LastLayerCount() const noexcept;           // layers in the last xrEndFrame
+        [[nodiscard]] std::uint32_t MaxLayerCount() const noexcept;          // 26 Nov: the runtime's composition layer limit (0 unknown)
+        [[nodiscard]] std::uint64_t FramesOverLayerLimit() const noexcept;   // frames that left layers out to stay within it
 
         // Pointer beams (laser pointer; plugin/PointerBeam.h decides when and where). Slot 0..kMaxBeams-1 (one per hand):
         // a ribbon quad from a_from to a_to (REFERENCE space), a_widthMeters wide, turned about its own axis to face

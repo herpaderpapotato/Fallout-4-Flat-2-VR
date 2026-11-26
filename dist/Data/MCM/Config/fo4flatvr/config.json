@@ -843,6 +843,49 @@
           }
         },
         {
+          "text": "Performance",
+          "type": "section"
+        },
+        {
+          "id": "bKeepFocusFrameRate:Performance",
+          "text": "Full frame rate without window focus",
+          "type": "switcher",
+          "help": "High FPS Physics Fix limits the game to 60 fps (its OutOfFocusFPS) whenever another window has the focus, and the headset then gets 60 fps too. On: the game window does not report losing focus while the VR session runs.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bGpuQueueAdaptive:Performance",
+          "text": "GPU queue 0: relax when frames are late",
+          "type": "switcher",
+          "help": "Only with 'GPU frames queued at most' = 0. While frames miss the display period the wait for the GPU only costs frame rate, so 1 frame may be queued until CPU + GPU fit the period again. Changes head-pose timing while relaxed.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bDirectEyeCopy:Performance",
+          "text": "Direct eye copy",
+          "type": "switcher",
+          "help": "Each eye's part of the frame is copied straight into the headset's image (1 copy instead of 3 full-size passes per eye). Off = the previous path.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "iMirrorEvery:Performance",
+          "text": "Desktop mirror: every Nth frame",
+          "type": "slider",
+          "help": "The game window on the desktop is only a mirror. 1 = updated every frame; 3 = every third frame (a little GPU time back; a recording of the window gets a third of the frames).",
+          "valueOptions": {
+            "min": 1,
+            "max": 10,
+            "step": 1,
+            "sourceType": "ModSettingInt"
+          }
+        },
+        {
           "text": "DLSS",
           "type": "section"
         },
@@ -2166,7 +2209,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -2303,7 +2347,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -2440,7 +2485,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -2577,7 +2623,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -2714,7 +2761,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -2851,7 +2899,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -2988,7 +3037,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -3125,7 +3175,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -3262,7 +3313,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -3399,7 +3451,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -3536,7 +3589,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -3673,7 +3727,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -3810,7 +3865,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -3947,7 +4003,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -4084,7 +4141,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -4221,7 +4279,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -4358,7 +4417,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -4495,7 +4555,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -4632,7 +4693,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -4769,7 +4831,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -4906,7 +4969,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -5043,7 +5107,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -5180,7 +5245,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -5317,7 +5383,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -5454,7 +5521,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -5591,7 +5659,8 @@
               "Recentre view",
               "First / third person",
               "Camera view cycle (SCENE / TRACK / CINEMA)",
-              "VR settings panel (open / close)"
+              "VR settings panel (open / close)",
+              "Mod panels (open / close; e.g. the Vioxsis menu)"
             ]
           }
         },
@@ -6256,6 +6325,32 @@
           "text": "Panel haptics",
           "type": "switcher",
           "help": "",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "text": "Diagnostics",
+          "type": "section"
+        },
+        {
+          "id": "bCrashLog:General",
+          "text": "Crash report",
+          "type": "switcher",
+          "help": "On a crash: the stack in fo4flatvr.log and a minidump in My Games\\Fallout4\\F4SE. Restart: installed at game start.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "text": "Mod panels",
+          "type": "section"
+        },
+        {
+          "id": "bEnabled:PanelHost",
+          "text": "Other mods' VR panels",
+          "type": "switcher",
+          "help": "Lets other F4SE mods (e.g. Vioxsis Anatomy Bridge) show their own panels here; the gesture action 'Mod panels' opens them. Restart: mods register their panels at game start.",
           "valueOptions": {
             "sourceType": "ModSettingBool"
           }

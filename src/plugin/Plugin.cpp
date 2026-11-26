@@ -5,6 +5,9 @@
 #include "plugin/CommandChannel.h"
 #include "plugin/Comfort.h"
 #include "plugin/ConfigUI.h"
+#include "plugin/CrashLog.h"
+#include "plugin/ModsResetGuard.h"
+#include "plugin/PanelHost.h"
 #include "plugin/ConfigStore.h"
 #include "plugin/ComfortEffects.h"
 #include "plugin/ControllerBindings.h"
@@ -296,6 +299,7 @@ namespace fo4flatvr
             REX::INFO("{}: renderer {}x{} device {} swapchain {}", a_when, h.width, h.height, h.device, h.swapChain);
             present::Install(h.swapChain, h.device, h.context, g_settings);
             window::SetGameWindow(h.hwnd);  // 20 Nov: live [Window] size
+            window::InstallFocusKeeper(h.hwnd);  // 26 Nov perf pass: no out-of-focus frame-rate cap while in VR
             rendersize::HookResize(h.swapChain);
         }
 
@@ -307,6 +311,7 @@ namespace fo4flatvr
                 break;
             case F4SE::MessagingInterface::kGameDataReady:
                 TryInstallPresenter("GameDataReady");
+                crashlog::Install("game data ready");  // again: the game / other plugins may have set their own filter since
                 game::InstallCameraHook();
                 head::SetTracking(g_settings.headTracking);
                 head::SetPositionTracking(g_settings.positionTracking);
@@ -426,6 +431,7 @@ namespace fo4flatvr
         gun::Install();     // floating gun (FO4VR baseline): call site C351F3 (byte-checked, chainable; [Weapon] keys)
         frikbridge::Install();  // FRIK-flat bridge: own chained hook at C351F3 + export API ([FRIK] bEnable); FRIK.dll active -> gun placement steps aside
         dlg::Install();     // VR dialogue: D-look call sites BB0039/BB0251/BB0376 (byte-checked; [Dialogue] keys)
+        modsreset::Install();  // 26 Nov: hold the mod-change reset prompt while character creation is open ([General] bModsResetGuard)
         facediag::Install();  // FaceGen customization render guard: call sites 6DF69B/6EC07E (byte-checked; [Stereo] bFaceGenOffscreen)
         dlss::Install();      // 20 Nov: per-eye DLSS + neural rendering at the TAA draw ([DLSS], [NeuralRendering]; Dlss.h)
         // Code patches go in now, before the game's main loop runs (no other thread can be inside them).
@@ -491,7 +497,9 @@ namespace fo4flatvr
             REX::INFO("menu pointer {} (hand {}, cursor {})", mc.enabled ? "on" : "off", mc.leftHanded ? "left" : "right", mc.cursorDot ? 1 : 0);
         }
         // 20 Nov: VR settings panel ([ConfigUI] bEnabled; ConfigUI.h) - no hooks, drawn and submitted from the Presenter
+        crashlog::Install("load");  // 26 Nov: crash report + minidump ([General] bCrashLog; CrashLog.h)
         configui::Install();
+        panelhost::Install();  // 26 Nov: other plugins' VR panels ([PanelHost] bEnabled; PanelHost.h, export FO4FLATVR_GetPanelHost)
         // 20 Nov (threading audit, analysis/threading.md): our own main-thread queue at OnIdle C34794 (Console::ExecuteQueuedCommand
         // call, after WaitForThreads / UI::AdvanceMenus) replaces F4SE AddTask / AddUITask (which run on whichever thread drains
         // them, job threads included). The polls below changed scene-graph / actor state at Present while the job threads ran

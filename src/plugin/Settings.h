@@ -48,6 +48,10 @@ namespace fo4flatvr
         int         cameraCycleKey{ 0x71 };  // [Keys] iCameraCycle (VK_F2): cycle this camera state's policy SCENE/TRACK/CINEMA
         int         povToggleKey{ 0x72 };    // [Keys] iPovToggle (VK_F3): first <-> third person (Force1st/3rdPerson)
         bool        aimWithController{ true };  // [Controllers] fire + activation ray from the aim-hand controller
+        // 26 Nov: [Controllers] sNoHandPickMenus: while one of these menus is open the activation pick is the game's own
+        // (camera / cursor), not the hand ray. Default empty: the new-game crash reproduced with and without the hand-ray
+        // pick in LooksMenu (it is not the cause), and the ray is how a Nate / Nora choice is made in VR.
+        std::string noHandPickMenus;
         bool        leftHanded{ false };        // [Controllers] aim hand = left controller
         bool        handLineOfFire{ true };       // [Controllers] bHandLineOfFire: gun lowering / iron-sight tests from the hand
         bool        suppressCameraRecoil{ true }; // [Controllers] bSuppressCameraRecoil: recoil does not turn the view

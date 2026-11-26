@@ -47,6 +47,7 @@ namespace fo4flatvr::configui
     // Presenter, before the controller bindings: the pointing hand's trigger / stick / face buttons go to the panel.
     void MaskControllers(xr::ControllerState& a_c);
     bool OwnsPointer();  // a ray is on the panel or a click is held: the menu pointer stays out
+    int  PointerHand();  // 26 Nov: the hand whose ray is on the panel this frame (-1 none); PanelHost leaves it alone
     // Keyboard: true while the panel's hotkey modifier is held and a_vk is the panel key (the camera cycle on F2 skips it).
     bool HotkeyClaims(int a_vk);
     // Presenter, between BeginFrame and EndFrame of the frame being finished: the panel quad.

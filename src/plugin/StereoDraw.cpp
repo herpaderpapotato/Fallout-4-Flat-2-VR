@@ -42,6 +42,7 @@
 #include <cstdio>
 #include <cstring>
 #include <format>
+#include <map>
 #include <fstream>
 #include <mutex>
 #include <shared_mutex>
@@ -388,6 +389,7 @@ namespace fo4flatvr::stereo
         };
         Stats g_stats;
 #include "StereoShadow.inl"
+#include "GpuProf.inl"
         int   g_censusLogs = 0;
         std::atomic<std::uint64_t> g_otherCtxDraws{ 0 };  // hook reached with a context other than g_ctx
         ID3D11DeviceContext*       g_lastOtherCtx = nullptr;
@@ -882,6 +884,7 @@ namespace fo4flatvr::stereo
             o_clearState(a_this);
             if (IsOurs(a_this)) {
                 GpuFrameBegin();  // Renderer::Begin clears the state once per frame: start of the frame's GPU work
+                GpFrameMark();    // "gpuprof": per-pass GPU time (GpuProf.inl)
             }
         }
 
@@ -1033,6 +1036,7 @@ namespace fo4flatvr::stereo
                 g_s.rtv0 = next;
                 g_curDsv = a_dsv;
                 GpuOnRenderTarget(next);
+                GpOnTarget(next, a_dsv, a_n);
             }
             o_omSetRT(a_this, a_n, a_rtv, a_dsv);
         }
@@ -2434,6 +2438,7 @@ float2 ps(float4 pos : SV_Position) : SV_Target
         void STDMETHODCALLTYPE HkDispatch(ID3D11DeviceContext* a_this, UINT a_x, UINT a_y, UINT a_z)
         {
             if (IsOurs(a_this)) {
+                GpOnDispatch();
                 ++g_stats.dispatches;
                 if (g_gateCam.load(std::memory_order_relaxed)) {
                     ++g_stats.gateDispatches;
@@ -2456,6 +2461,7 @@ float2 ps(float4 pos : SV_Position) : SV_Target
         Action Prepare(ID3D11DeviceContext* a_ctx, const char* a_kind, UINT a_instances, UINT a_count)
         {
             const bool secondCam = g_secondCam.load(std::memory_order_relaxed);
+            GpOnDraw(g_s.psInfo ? g_s.psInfo->group : std::uint16_t{ 0xFFFF });
             if (!secondCam) {
                 ShadowSigOnDraw(a_ctx, a_instances, a_count);  // main view only
             }
@@ -3777,6 +3783,26 @@ float2 ps(float4 pos : SV_Position) : SV_Target
             static_cast<void*>(a_immediate));
     }
 
+    bool EyeRegions(ID3D11Texture2D* a_src, unsigned a_x[2], unsigned& a_width, unsigned& a_height)
+    {
+        if (!a_src) {
+            return false;
+        }
+        D3D11_TEXTURE2D_DESC d{};
+        a_src->GetDesc(&d);
+        if (d.Width < 2 || d.SampleDesc.Count != 1) {
+            return false;
+        }
+        const UINT pad = (g_seamPad > 0 && std::abs(static_cast<double>(d.Width) - g_seamFullW) < 0.5 && d.Width / 2 > static_cast<UINT>(g_seamPad))
+                             ? static_cast<UINT>(g_seamPad) : 0u;
+        a_width = d.Width / 2 - pad;
+        a_height = d.Height;
+        for (UINT eye = 0; eye < 2; ++eye) {
+            a_x[eye] = eye * (d.Width / 2) + pad / 2;
+        }
+        return true;
+    }
+
     bool SplitDoubleWide(ID3D11DeviceContext* a_ctx, ID3D11Texture2D* a_src, ID3D11Texture2D*& a_left, ID3D11Texture2D*& a_right)
     {
         D3D11_TEXTURE2D_DESC d{};
@@ -3853,6 +3879,11 @@ float2 ps(float4 pos : SV_Position) : SV_Target
         return std::format("offscreen mode {} ({}) renders {} (gate set at entry {}, last entry gate {}) draws {} gated {}{}", m,
             m == 0 ? "bypass" : m == 1 ? "pass" : "force", g_offRenders.load(), g_offGatedEntry.load(), g_offEntryGate, g_offDraws.load(),
             g_offGated.load(), m == 0 ? " (not converted)" : "");
+    }
+
+    void GpuProfMark(const char* a_name)
+    {
+        GpMark(a_name);
     }
 
     bool StereoSubmitActive()
@@ -4172,6 +4203,8 @@ float2 ps(float4 pos : SV_Position) : SV_Target
                 g_eyeRel[0].pos[1], g_eyeRel[0].pos[2], g_eyeRel[1].pos[0], g_eyeRel[1].pos[1], g_eyeRel[1].pos[2]) +
                    std::format(" | eye fwd in head: L ({:.5f} {:.5f} {:.5f}) R ({:.5f} {:.5f} {:.5f})", g_eyeRel[0].rot[0][2], g_eyeRel[0].rot[1][2],
                        g_eyeRel[0].rot[2][2], g_eyeRel[1].rot[0][2], g_eyeRel[1].rot[1][2], g_eyeRel[1].rot[2][2]);
+        } else if (a_verb == "gpuprof") {
+            return GpCommand(a_arg);  // per-pass GPU time (GpuProf.inl): gpuprof <frames> | gpuprof
         } else if (a_verb == "stereoshadow") {
             // depth-only pass signatures (shadow cascades) for the next n frames (log: stereoshadow lines)
             if (a_arg == "dump") {

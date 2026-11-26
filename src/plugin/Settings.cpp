@@ -137,6 +137,7 @@ namespace fo4flatvr
         s.cameraCycleKey = ReadInt(p, "Keys", "iCameraCycle", s.cameraCycleKey);
         s.povToggleKey = ReadInt(p, "Keys", "iPovToggle", s.povToggleKey);
         s.aimWithController = ReadInt(p, "Controllers", "bAimWithController", s.aimWithController ? 1 : 0) != 0;
+        s.noHandPickMenus = ReadString(p, "Controllers", "sNoHandPickMenus", "");
         s.noSpread = ReadInt(p, "Weapon", "bNoSpread", s.noSpread ? 1 : 0) != 0;
         s.noSpreadPellets = ReadInt(p, "Weapon", "bNoSpreadPellets", s.noSpreadPellets ? 1 : 0) != 0;
         s.leftHanded = ReadInt(p, "Controllers", "bLeftHanded", s.leftHanded ? 1 : 0) != 0;

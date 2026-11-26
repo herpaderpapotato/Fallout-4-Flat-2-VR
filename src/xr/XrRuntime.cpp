@@ -476,6 +476,8 @@ float4 ps(float4 pos : SV_Position) : SV_Target
         float                    vigKey[3]{ -1.0f, -1.0f, -1.0f };  // alpha (quantised), inner, outer of the last image
         std::uint64_t            vigFrames{ 0 }, vigUploads{ 0 };
         std::uint32_t            lastLayerCount{ 0 };
+        std::uint32_t            maxLayerCount{ 0 };   // 26 Nov: the runtime's limit (XrSystemGraphicsProperties); 0 = unknown
+        std::uint64_t            layersDropped{ 0 };
 
         // Pointer beams (SubmitBeam): one shared ribbon image (colour baked in, re-uploaded on a colour change) and one
         // end-dot image (two 64x64 cells: normal | pressed). Uploaded through the vignette's stage/blit path; the layers
@@ -510,6 +512,13 @@ float4 ps(float4 pos : SV_Position) : SV_Target
         XrPosef        eyeRenderPose[2]{ { { 0, 0, 0, 1 }, { 0, 0, 0 } }, { { 0, 0, 0, 1 }, { 0, 0, 0 } } };
         XrFovf         eyeRenderFov[2]{};
         bool           eyeCaptureEnabled{ false };
+        // Direct eye copy (perf pass 26 Nov, SubmitEyeRegion): the eye region of the source goes straight into the acquired
+        // swapchain image (one copy) instead of split texture -> stage -> shader blit (three full-size passes per eye).
+        bool                    eyeDirectNow[2]{};     // this frame's image of eye e was released at submit
+        bool                    eyeStageValid[2]{};    // eye e's stage holds its latest image (old path, or filled on demand)
+        ComPtr<ID3D11Texture2D> eyeDirectSrc[2];       // the frame's source, kept until EndFrame (panorama capture fills the stage from it)
+        D3D11_BOX               eyeDirectBox[2]{};
+        std::uint64_t           eyeDirectFrames{ 0 }, eyeStagedFrames{ 0 }, eyeReusedFrames{ 0 };
         ComPtr<ID3D11Texture2D> eyeCapture[2];
 
         // World panorama (CapturePanorama / SubmitPanorama): cube in the game-world orientation + per-eye show swapchains.
@@ -684,6 +693,11 @@ float4 ps(float4 pos : SV_Position) : SV_Target
             sgi.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
             if (!Check(xrGetSystem(instance, &sgi, &systemId), "xrGetSystem"))
                 return false;
+            {   // 26 Nov: the composition layer limit (more panels: PanelHost.h); xrEndFrame fails past it
+                XrSystemProperties sp{ XR_TYPE_SYSTEM_PROPERTIES };
+                if (XR_SUCCEEDED(xrGetSystemProperties(instance, systemId, &sp)))
+                    maxLayerCount = sp.graphicsProperties.maxLayerCount;
+            }
 
             // Required before xrCreateSession, and tells us which adapter the runtime composites on.
             XrGraphicsRequirementsD3D11KHR req{ XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR };
@@ -1160,6 +1174,10 @@ float4 ps(float4 pos : SV_Position) : SV_Target
             monoSubmitted = false;
             monoReleased = false;  // swapchains go with the session
             eyeSubmitted = false;
+            for (int i = 0; i < 2; ++i) {
+                eyeDirectNow[i] = eyeStageValid[i] = false;
+                eyeDirectSrc[i].Reset();
+            }
             backdropWanted = false;
             hudSubmitted = false;
             headValid = false;
@@ -1395,6 +1413,38 @@ float4 ps(float4 pos : SV_Position) : SV_Target
             a_sc.stageLinear = fmt.linear;
             a_sc.hasContent = true;
             return true;
+        }
+
+        // The a_box region of a_src into a_sc's intermediate texture (sized to the box).
+        bool CopyToStageBox(ID3D11DeviceContext* a_ctx, ID3D11Texture2D* a_src, const D3D11_BOX& a_box, ColorSwapchain& a_sc)
+        {
+            D3D11_TEXTURE2D_DESC sd{};
+            a_src->GetDesc(&sd);
+            if (sd.SampleDesc.Count > 1 || a_box.right <= a_box.left || a_box.bottom <= a_box.top || a_box.right > sd.Width || a_box.bottom > sd.Height)
+                return false;
+            const SourceFormat fmt = ClassifySource(sd.Format);
+            sd.Width = a_box.right - a_box.left;
+            sd.Height = a_box.bottom - a_box.top;
+            if (!EnsureStage(a_sc, sd, fmt))
+                return false;
+            a_ctx->CopySubresourceRegion(a_sc.stage.Get(), 0, 0, 0, 0, a_src, 0, &a_box);
+            a_sc.stageLinear = fmt.linear;
+            a_sc.hasContent = true;
+            return true;
+        }
+
+        // A raw copy into an sRGB swapchain image gives the same picture as the stage blit (which writes the sRGB-encoded
+        // source values unchanged) only for an 8-bit source of the swapchain's own format family.
+        static bool DirectCopyOk(DXGI_FORMAT a_src, DXGI_FORMAT a_swapchain)
+        {
+            switch (a_swapchain) {
+            case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+                return a_src == DXGI_FORMAT_R8G8B8A8_UNORM || a_src == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || a_src == DXGI_FORMAT_R8G8B8A8_TYPELESS;
+            case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+                return a_src == DXGI_FORMAT_B8G8R8A8_UNORM || a_src == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || a_src == DXGI_FORMAT_B8G8R8A8_TYPELESS;
+            default:
+                return false;
+            }
         }
 
         // Acquire the next image of a_sc (recreated to the stage size), blit the stage into it, release.
@@ -1931,7 +1981,11 @@ float4 ps(float4 pos : SV_Position) : SV_Target
             // one eye per call, alternating (half the cost; the eyes overlap almost entirely)
             for (int k = 0; k < 2; ++k) {
                 const int e = (d.pano.nextEye + k) & 1;
-                if (d.eyeSc[e].hasContent && d.eyeSc[e].stageSrv) {
+                if (d.eyeDirectNow[e] && !d.eyeStageValid[e] && d.eyeDirectSrc[e]) {
+                    // direct eye copy: the stage is only filled when the panorama samples it
+                    d.eyeStageValid[e] = d.CopyToStageBox(a_ctx, d.eyeDirectSrc[e].Get(), d.eyeDirectBox[e], d.eyeSc[e]);
+                }
+                if (d.eyeSc[e].hasContent && d.eyeSc[e].stageSrv && d.eyeStageValid[e]) {
                     d.PanoCapture(a_ctx, d.eyeSc[e], d.eyeRenderPose[e], d.eyeRenderFov[e], r);
                     d.pano.nextEye = e ^ 1;
                     return true;
@@ -2449,6 +2503,8 @@ float4 ps(float4 pos : SV_Position) : SV_Target
     std::uint64_t Runtime::VignetteLayersSubmitted() const noexcept { return _impl->vigFrames; }
     std::uint64_t Runtime::VignetteUploads() const noexcept { return _impl->vigUploads; }
     std::uint32_t Runtime::LastLayerCount() const noexcept { return _impl->lastLayerCount; }
+    std::uint32_t Runtime::MaxLayerCount() const noexcept { return _impl->maxLayerCount; }
+    std::uint64_t Runtime::FramesOverLayerLimit() const noexcept { return _impl->layersDropped; }
 
     ID3D11Texture2D* Runtime::CapturedHudImage() const
     {
@@ -2480,12 +2536,75 @@ float4 ps(float4 pos : SV_Position) : SV_Target
             return false;
         if (!d.CopyToStage(a_ctx, a_src, d.eyeSc[a_eye]))
             return false;
+        d.eyeStageValid[a_eye] = true;
+        d.eyeDirectNow[a_eye] = false;
         d.eyeSubmitted = true;
         const auto& o = a_renderPose.orientation;
         const auto& p = a_renderPose.position;
         d.eyeRenderPose[a_eye] = { { o.x, o.y, o.z, o.w }, { p.x, p.y, p.z } };
         d.eyeRenderFov[a_eye] = { a_renderFov.angleLeft, a_renderFov.angleRight, a_renderFov.angleUp, a_renderFov.angleDown };
         return true;
+    }
+
+    bool Runtime::SubmitEyeRegion(ID3D11DeviceContext* a_ctx, ID3D11Texture2D* a_src, unsigned a_x, unsigned a_width, unsigned a_height,
+        int a_eye, const Pose& a_renderPose, const Fov& a_renderFov, bool a_direct)
+    {
+        auto& d = *_impl;
+        if (!d.frameBegun || !a_ctx || !a_src || a_eye < 0 || a_eye > 1 || !a_width || !a_height)
+            return false;
+        auto&                sc = d.eyeSc[a_eye];
+        const D3D11_BOX      box{ a_x, 0, 0, a_x + a_width, a_height, 1 };
+        D3D11_TEXTURE2D_DESC sd{};
+        a_src->GetDesc(&sd);
+        if (sd.SampleDesc.Count != 1 || box.right > sd.Width || box.bottom > sd.Height)
+            return false;
+        bool done = false;
+        if (a_direct && d.EnsureSwapchain(sc, a_width, a_height) && Impl::DirectCopyOk(sd.Format, sc.format)) {
+            std::uint32_t index = 0;
+            if (!d.Check(xrAcquireSwapchainImage(sc.handle, nullptr, &index), "xrAcquireSwapchainImage"))
+                return false;
+            XrSwapchainImageWaitInfo wi{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+            wi.timeout = XR_INFINITE_DURATION;
+            const XrResult wr = xrWaitSwapchainImage(sc.handle, &wi);
+            if (wr != XR_SUCCESS) {
+                if (XR_FAILED(wr))
+                    d.Check(wr, "xrWaitSwapchainImage");
+                else
+                    d.error = "xrWaitSwapchainImage: timed out";
+                return false;
+            }
+            a_ctx->CopySubresourceRegion(sc.images[index], 0, 0, 0, 0, a_src, 0, &box);
+            if (d.eyeCaptureEnabled)
+                d.Capture(a_ctx, sc.images[index], d.eyeCapture[a_eye]);  // test hook: the image as the runtime gets it
+            if (!d.Check(xrReleaseSwapchainImage(sc.handle, nullptr), "xrReleaseSwapchainImage"))
+                return false;
+            sc.hasContent = true;
+            sc.stageLinear = false;
+            d.eyeDirectNow[a_eye] = true;
+            d.eyeStageValid[a_eye] = false;
+            d.eyeDirectSrc[a_eye] = a_src;
+            d.eyeDirectBox[a_eye] = box;
+            done = true;
+        }
+        if (!done) {   // stage path without the split copy
+            if (!d.CopyToStageBox(a_ctx, a_src, box, sc))
+                return false;
+            d.eyeStageValid[a_eye] = true;
+            d.eyeDirectNow[a_eye] = false;
+        }
+        d.eyeSubmitted = true;
+        const auto& o = a_renderPose.orientation;
+        const auto& p = a_renderPose.position;
+        d.eyeRenderPose[a_eye] = { { o.x, o.y, o.z, o.w }, { p.x, p.y, p.z } };
+        d.eyeRenderFov[a_eye] = { a_renderFov.angleLeft, a_renderFov.angleRight, a_renderFov.angleUp, a_renderFov.angleDown };
+        return true;
+    }
+
+    std::string Runtime::EyeCopyStatus() const
+    {
+        const auto& d = *_impl;
+        return "eyeCopy direct=" + std::to_string(d.eyeDirectFrames) + " staged=" + std::to_string(d.eyeStagedFrames) + " reused=" +
+               std::to_string(d.eyeReusedFrames);
     }
 
     void Runtime::SetEyeCapture(bool a_enable) noexcept { _impl->eyeCaptureEnabled = a_enable; }
@@ -2554,9 +2673,15 @@ float4 ps(float4 pos : SV_Position) : SV_Target
             d.device->GetImmediateContext(&ctx);
             haveProj = true;
             for (int i = 0; i < 2; ++i) {
-                if (!d.BlitStageToSwapchain(ctx.Get(), d.eyeSc[i], d.eyeCaptureEnabled ? std::addressof(d.eyeCapture[i]) : nullptr)) {
+                if (d.eyeDirectNow[i]) {
+                    ++d.eyeDirectFrames;  // direct eye copy: this frame's image was released at submit
+                } else if (!d.eyeStageValid[i] && d.eyeSc[i].handle != XR_NULL_HANDLE) {
+                    ++d.eyeReusedFrames;  // no new image after direct submits: the swapchain's last released image is shown again
+                } else if (!d.BlitStageToSwapchain(ctx.Get(), d.eyeSc[i], d.eyeCaptureEnabled ? std::addressof(d.eyeCapture[i]) : nullptr)) {
                     haveProj = false;
                     break;
+                } else {
+                    ++d.eyeStagedFrames;
                 }
                 auto& v = views[i];
                 v.pose = d.eyeRenderPose[i];
@@ -2649,10 +2774,8 @@ float4 ps(float4 pos : SV_Position) : SV_Target
             layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&l);
             ++d.worldFrames[i];
         };
-        for (int i = 0; i < kMaxWorldQuads; ++i) {
-            if (i != kTopWorldQuad)
-                emitWorld(i);
-        }
+        for (int i = 0; i < kTopWorldQuad; ++i)
+            emitWorld(i);
 
         XrCompositionLayerQuad quad{ XR_TYPE_COMPOSITION_LAYER_QUAD };
         if (d.quadSubmitted && d.shouldRender) {
@@ -2680,7 +2803,9 @@ float4 ps(float4 pos : SV_Position) : SV_Target
             quad.size = { qw, qw * cropAspect };
             layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad);
         }
-        emitWorld(kTopWorldQuad);  // VR settings panel: over menu panels and the flat window
+        // VR settings panel, then other plugins' panels (26 Nov, PanelHost.h): over menu panels and the flat window
+        for (int i = kTopWorldQuad; i < kMaxWorldQuads; ++i)
+            emitWorld(i);
 
         // Pointer beams over everything they can end on (menus, panels, Pip-Boy), then their end dots; below the fade.
         XrCompositionLayerQuad beamL[kMaxBeams]{}, dotL[kMaxBeams]{};
@@ -2738,12 +2863,34 @@ float4 ps(float4 pos : SV_Position) : SV_Target
             layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&fade);
             ++d.fadeFrames;
         }
+        // 26 Nov: over the runtime's layer limit (xrEndFrame would fail and drop the whole frame): leave out the HUD pieces,
+        // then the vignette, then the lower world quads (Pip-Boy, dialogue, menu panel), last first
+        if (d.maxLayerCount && layerCount > d.maxLayerCount) {
+            std::vector<const XrCompositionLayerBaseHeader*> drop;
+            for (int i = 0; i < kMaxHudPieces; ++i) drop.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&piece[i]));
+            drop.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&vig));
+            for (int i = kTopWorldQuad - 1; i >= 0; --i) drop.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&world[i]));
+            for (const auto* victim : drop) {
+                if (layerCount <= d.maxLayerCount) break;
+                for (std::uint32_t k = 0; k < layerCount; ++k) {
+                    if (layers[k] != victim) continue;
+                    for (std::uint32_t m = k + 1; m < layerCount; ++m) layers[m - 1] = layers[m];
+                    --layerCount;
+                    break;
+                }
+            }
+            ++d.layersDropped;
+        }
         d.fadeSubmitted = false;
         d.vigSubmitted = false;
         d.lastLayerCount = layerCount;
         d.quadSubmitted = false;
         d.monoSubmitted = false;
         d.eyeSubmitted = false;
+        for (int i = 0; i < 2; ++i) {
+            d.eyeDirectNow[i] = false;
+            d.eyeDirectSrc[i].Reset();
+        }
         d.backdropWanted = false;
         d.pano.submitted = false;
         d.hudSubmitted = false;

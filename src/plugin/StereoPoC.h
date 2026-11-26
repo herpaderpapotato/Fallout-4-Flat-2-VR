@@ -128,6 +128,11 @@ namespace fo4flatvr::stereo
     // Per-frame bookkeeping: statistics log, pending capture write-out. Call once per Present (game thread),
     // before the real Present; AfterPresent right after it returns (CPU frame time = AfterPresent -> OnPresent).
     void OnPresent();
+    // "gpuprof" (GpuProf.inl): names the GPU work from here to the next mark; "" = back to per-render-target keys. Render thread.
+    void GpuProfMark(const char* a_name);
+    // Perf pass 26 Nov: the two eyes' real pixels inside the double-wide back buffer (guard bands left out; the same
+    // regions SplitDoubleWide copies): eye e = [a_x[e], a_x[e] + a_width) x [0, a_height).
+    bool EyeRegions(ID3D11Texture2D* a_src, unsigned a_x[2], unsigned& a_width, unsigned& a_height);
     void AfterPresent();
     // VATS camera window (VatsWindow.cpp): set around its own second-camera render so the frame-level hooks (per-eye
     // MV fix, post split, shadow signatures) leave it alone; its draws are gate 0 (own NiCamera) anyway.

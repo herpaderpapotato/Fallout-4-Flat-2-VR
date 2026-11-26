@@ -83,6 +83,66 @@ namespace fo4flatvr::window
         g_renderH = a_height;
     }
 
+    namespace
+    {
+        std::atomic<WNDPROC>       g_prevProc{ nullptr };
+        std::atomic<bool>          g_keepOn{ true }, g_keepVr{ false }, g_keepUnicode{ false };
+        std::atomic<std::uint64_t> g_keptKills{ 0 }, g_passedKills{ 0 };
+
+        LRESULT CALLBACK FocusProc(HWND a_hwnd, UINT a_msg, WPARAM a_w, LPARAM a_l)
+        {
+            if (a_msg == WM_KILLFOCUS) {
+                if (g_keepOn.load(std::memory_order_relaxed) && g_keepVr.load(std::memory_order_relaxed)) {
+                    if (++g_keptKills == 1) {
+                        REX::INFO("window: WM_KILLFOCUS not passed on while the VR session runs ([Performance] bKeepFocusFrameRate): "
+                                  "no out-of-focus frame-rate cap from High FPS Physics Fix");
+                    }
+                    return 0;
+                }
+                ++g_passedKills;
+            }
+            const WNDPROC prev = g_prevProc.load(std::memory_order_relaxed);
+            return g_keepUnicode.load(std::memory_order_relaxed) ? ::CallWindowProcW(prev, a_hwnd, a_msg, a_w, a_l)
+                                                                 : ::CallWindowProcA(prev, a_hwnd, a_msg, a_w, a_l);
+        }
+    }
+
+    void InstallFocusKeeper(void* a_hwnd)
+    {
+        const HWND hwnd = static_cast<HWND>(a_hwnd);
+        if (!hwnd || !::IsWindow(hwnd) || g_prevProc.load()) {
+            return;
+        }
+        const bool uni = ::IsWindowUnicode(hwnd) != FALSE;
+        g_keepUnicode = uni;
+        // the previous procedure must be known before ours can run: read it first, then swap
+        const auto cur = reinterpret_cast<WNDPROC>(uni ? ::GetWindowLongPtrW(hwnd, GWLP_WNDPROC) : ::GetWindowLongPtrA(hwnd, GWLP_WNDPROC));
+        if (!cur) {
+            REX::WARN("window: focus keeper not installed (no window procedure)");
+            return;
+        }
+        g_prevProc = cur;
+        const auto old = reinterpret_cast<WNDPROC>(uni ? ::SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&FocusProc))
+                                                       : ::SetWindowLongPtrA(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&FocusProc)));
+        if (old && old != cur) {
+            g_prevProc = old;  // someone subclassed between the read and the swap
+        }
+        REX::INFO("window: focus keeper installed on {} ({} window, previous procedure {})", static_cast<void*>(hwnd), uni ? "unicode" : "ansi",
+            reinterpret_cast<void*>(g_prevProc.load()));
+    }
+
+    void SetFocusKeeper(bool a_enabled, bool a_vrRunning)
+    {
+        g_keepOn.store(a_enabled, std::memory_order_relaxed);
+        g_keepVr.store(a_vrRunning, std::memory_order_relaxed);
+    }
+
+    std::string FocusKeeperStatus()
+    {
+        return std::format("focusKeeper installed={} on={} vr={} kept={} passed={}", g_prevProc.load() != nullptr, g_keepOn.load(), g_keepVr.load(),
+            g_keptKills.load(), g_passedKills.load());
+    }
+
     void SetGameWindow(void* a_hwnd)
     {
         HWND expected = nullptr;
