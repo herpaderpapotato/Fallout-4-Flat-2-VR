@@ -517,6 +517,14 @@ namespace fo4flatvr::game
         return page < 5 ? static_cast<int>(page) : -1;
     }
 
+    int PipboyTab()
+    {
+        const int page = PipboyPage();
+        if (page < 0) return -1;
+        const std::uint32_t tab = *reinterpret_cast<const std::uint32_t*>(Base() + kTabPerPage + 4 * static_cast<std::uintptr_t>(page));
+        return tab < 16 ? static_cast<int>(tab) : -1;
+    }
+
     namespace
     {
         // Pip-Boy light (flat 1.11.240, read in Ghidra 20 Nov). PipboyHandler::HandleEvent (1077010): Pipboy button held

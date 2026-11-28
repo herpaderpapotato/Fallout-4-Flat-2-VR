@@ -9,6 +9,9 @@
 #include "plugin/Dialogue.h"
 #include "plugin/Haptics.h"
 #include "plugin/GameBridge.h"
+#include "plugin/GameMenuPointer.h"
+#include "plugin/Scope.h"
+#include "plugin/QuickMenu.h"
 #include "plugin/GamePipboy.h"
 #include "plugin/Gestures.h"
 #include "plugin/Settings.h"
@@ -255,6 +258,10 @@ namespace fo4flatvr::bindings
             Btn      oTrigBtn;
             Pulse    pipboyTap;
             unsigned pipboyTaps{ 0 }, lightHolds{ 0 }, lightDirect{ 0 };
+            // 27 Nov: Pip-Boy page buttons (PipboyPageButtons): stick-click edges seen, and a primary grip held into the
+            // Pip-Boy sends no LB until released
+            bool     pipOClick{ false }, pipPClick{ false }, pipGripCarry{ false };
+            unsigned pipOClicks{ 0 }, pipPClicks{ 0 };
             // 20 Nov: input carried across a context change (generalised "no tap/hold carried" of the buttons): a stick held
             // when the context changes drives nothing in the new one until it is back in the dead zone; the off trigger
             // (Pip-Boy open -> Pip-Boy select) likewise until released
@@ -272,7 +279,10 @@ namespace fo4flatvr::bindings
             Clock::time_point wsNextHold{};
             unsigned          wsToggles{ 0 }, wsHoldSteps{ 0 }, wsEnters{ 0 };
             bool     clickUsedForHolster{ false };
+            bool     qmClick{ false };  // 28 Nov quick menu: the primary click as the game sees it (last frame)
+            Btn      qmCloseBtn;  // VR quick menu: close request edge
             bool     holster{ false };
+            bool     breathGrip{ false };  // 27 Nov (scopes, Scope.h): this primary-grip press holds breath (scoped), never reload / grenade
             StickDir up, down;
             Ctx      ctx{ Ctx::Gameplay };
             pad::State last;
@@ -308,6 +318,54 @@ namespace fo4flatvr::bindings
         bool GlyphRemapOn() { return IniOnce(g_glyphRemap, "Controllers", "bGlyphRemap", 1) != 0; }
         // 1 = primary stick up pushes a held workshop object away (down pulls it closer); 0 = the reverse
         bool WorkshopUpFarther() { return IniOnce(g_wsUpFarther, "Controllers", "bWorkshopStickUpFarther", 1) != 0; }
+        // 27 Nov (user: "there's no ability to see current effects in the stat screen"): the flat Pip-Boy pages' own pad
+        // buttons (Pipboy_*Page.swf BSButtonHintData; FO4VR's VR SWFs put them on the L stick click / its options list):
+        //   STAT: EFFECTS = Xenon_R1 (user event RShoulder; FO4VR OCR_L_Stick_Center) -> off stick click (and primary B);
+        //         Radaway = Xenon_X, PREV / NEXT PERK = L1 / R1
+        //   INV:  DROP X, FAV R1, CYCLE DAMAGE L1, INSPECT R3, SORT / COMPONENT VIEW L3
+        //   DATA: Show on Map X, quest summary L1;  MAP: world / local map X, caravans L1
+        // Touch: primary A -> X, primary B -> RB, primary grip -> LB, off stick click -> L3 (STAT page: RB = EFFECTS),
+        // primary stick click -> R3 (VRIK button delay while right gestures are on). Off grip alone closes.
+        // 0 = as before (both grips close, nothing sends X / LB / RB / L3 / R3 in the Pip-Boy).
+        std::atomic<int> g_pipButtons{ INT_MIN };
+        bool PipboyPageButtons() { return IniOnce(g_pipButtons, "Controllers", "bPipboyPageButtons", 1) != 0; }
+        // 28 Nov (PA/LooksMenu agent): LooksMenu (face / body sculpt) as FO4VR: Touch A = Accept (Xenon_A: FACE in the start
+        // screen, sculpt the highlighted feature: FO4VR TutorialFacegen01/02_VW "[OCR_A]"); the generic menu layout sent A as
+        // pad Y, which is LooksMenu's $SEX (LooksMenu.swf hint Xenon_Y) - pressing A switched the character's sex ($SEX now on
+        // the off trigger, FO4VR WandTrigger -> ChangeSex; a grip = ConfirmCloseMenu, FO4VR WandGrip). The
+        // highlight follows the pointer (GameMenuPointer bLooksMenuPointerCursor). 0 = the generic menu layout.
+        std::atomic<int> g_looksFO4VR{ INT_MIN };
+        bool LooksMenuFO4VR() { return IniOnce(g_looksFO4VR, "Controllers", "bLooksMenuFO4VR", 1) != 0; }
+        // 28 Nov (user: "choosing a direction with a stick will mean that stick stops working for movement until it's
+        // rehomed ... vats targeting ... priming a move after coming out of vats"): 1 = a stick held over a context change
+        // (VATS, dialogue, menus, Pip-Boy, quick loot ...) drives the new context at once, as FO4VR / flat do: the gamepad
+        // device sends a ThumbstickEvent every poll while a stick is off centre (flat BSWin32GamepadDevice poll 1677880 ->
+        // ProcessThumbstickValue 1674B30 / event 0xB / 0xC whenever the stick or its last value is non-zero), so the new
+        // context's handler gets the held value on its first frame. 0 = the 20 Nov latch: the stick is held at zero until
+        // it comes back to the centre (and snap turn waits for a re-centre).
+        std::atomic<int> g_stickCarryOver{ INT_MIN };
+        // 28 Nov (user: "the vr quick menu was the only way to holster before ... implemented in the same way the vr version
+        // does"): FO4VR's quick menu = its VR FavoritesMenu (world_Favorites.swf: 12 favourites + "SHEATHE WEAPON" on the
+        // grip). FO4VR (Ghidra 1.2.72): FavoritesHandler FUN_1412f1390 opens it on the primary hand's WandThumbClick (stick
+        // click) in gameplay; in the menu the stick direction highlights (FUN_1412f4060), the trigger release uses the entry
+        // ("just_released" -> useQuickkey), WandGrip (FUN_1412f4900) calls Actor::DrawWeaponMagicHands (vtable 0xC9) with
+        // draw = weapon not drawn: holster / draw. Here: the primary stick click (held still fButtonDelayS while right-hand
+        // gestures are on, as sprint) opens FavoritesMenu (pad D-pad up) with FO4VR's movie on the primary hand (QuickMenu.h:
+        // 12-entry ring, stick direction + haptic tick, trigger release uses, weapon hint), the primary grip in it holsters /
+        // draws through the same engine call with the menu open, the off grip / B / a second click close it. 0 = no quick
+        // menu (stick click + grip still holsters in gameplay).
+        std::atomic<int> g_quickMenu{ INT_MIN };
+        bool QuickMenuOn() { return IniOnce(g_quickMenu, "Controllers", "bQuickMenu", 1) != 0; }
+        std::atomic<unsigned> g_qmOpens{ 0 }, g_qmSheathe{ 0 }, g_qmDraw{ 0 };
+        std::atomic<bool>     g_qmPipeReq{ false };  // pipe "bindings quickmenu holster": what the grip in the menu does
+        // ActorState (Actor+0x128) +0xC bits 1..3 = WEAPON_STATE, read raw (FloatingGun WeaponState; CommonLib's
+        // GetWeaponMagicDrawn read 1 with the weapon holstered, measured 28 Nov): >= 3 drawn
+        int PlayerWeaponState()
+        {
+            const auto* pl = RE::PlayerCharacter::GetSingleton();
+            return pl ? static_cast<int>((*reinterpret_cast<const std::uint32_t*>(reinterpret_cast<const std::uint8_t*>(pl) + 0x134) >> 1) & 7) : -1;
+        }
+        bool StickCarryOverOn() { return IniOnce(g_stickCarryOver, "Controllers", "bStickCarryOver", 1) != 0; }
         float WorkshopStatsScale()
         {
             float v = g_wsStatsScale.load();
@@ -555,6 +613,8 @@ namespace fo4flatvr::bindings
         //  - end while held: the input stays masked until it is physically released (no fresh press = no grenade hold),
         //    also when the context changes to a menu while it is held (as the stale-stick rule of a context change).
         std::atomic<std::uint32_t> g_claimL[FO4FLATVR_CLAIM_OWNER_MAX + 1]{}, g_claimR[FO4FLATVR_CLAIM_OWNER_MAX + 1]{};
+        std::atomic<std::uint32_t> g_addL[FO4FLATVR_CLAIM_OWNER_MAX + 1]{}, g_addR[FO4FLATVR_CLAIM_OWNER_MAX + 1]{};  // v10 adds
+        std::atomic<std::uint64_t> g_addFrames{ 0 };
         std::atomic<int>           g_claimsOn{ INT_MIN };
         bool ClaimsOn() { return IniOnce(g_claimsOn, "ROCK", "bInputClaims", 1) != 0; }
         std::atomic<std::uint32_t> g_effMask[2]{};  // physical hand: bits masked by the last Map() (claimed or latched)
@@ -615,8 +675,15 @@ namespace fo4flatvr::bindings
                 g_claimPrevEff[h] = eff[h];
                 g_effMask[h].store(eff[h], std::memory_order_relaxed);
             }
-            if (!eff[0] && !eff[1]) return a_c;
-            ++g_claimMaskedFrames;
+            std::uint32_t add[2]{ 0, 0 };
+            if (a_world && ClaimsOn() && a_c.active) {
+                for (std::uint32_t o = 1; o <= FO4FLATVR_CLAIM_OWNER_MAX; ++o) {
+                    add[0] |= g_addL[o].load(std::memory_order_relaxed);
+                    add[1] |= g_addR[o].load(std::memory_order_relaxed);
+                }
+            }
+            if (!eff[0] && !eff[1] && !add[0] && !add[1]) return a_c;
+            if (eff[0] || eff[1]) ++g_claimMaskedFrames;
             a_tmp = a_c;
             for (int h = 0; h < 2; ++h) {
                 const bool left = h == 0;
@@ -626,6 +693,16 @@ namespace fo4flatvr::bindings
                 if (m & FO4FLATVR_CLAIM_LOWER) (left ? a_tmp.x : a_tmp.a) = false;
                 if (m & FO4FLATVR_CLAIM_UPPER) (left ? a_tmp.y : a_tmp.b) = false;
                 if (m & FO4FLATVR_CLAIM_STICKCLICK) (left ? a_tmp.leftStickClick : a_tmp.rightStickClick) = false;
+            }
+            if (add[0] || add[1]) ++g_addFrames;
+            for (int h = 0; h < 2; ++h) {  // v10 adds: after the claims (an owner may claim the source and add the target)
+                const bool left = h == 0;
+                const auto m = add[h];
+                if (m & FO4FLATVR_CLAIM_GRIP) (left ? a_tmp.leftGrip : a_tmp.rightGrip) = 1.0f;
+                if (m & FO4FLATVR_CLAIM_TRIGGER) (left ? a_tmp.leftTrigger : a_tmp.rightTrigger) = 1.0f;
+                if (m & FO4FLATVR_CLAIM_LOWER) (left ? a_tmp.x : a_tmp.a) = true;
+                if (m & FO4FLATVR_CLAIM_UPPER) (left ? a_tmp.y : a_tmp.b) = true;
+                if (m & FO4FLATVR_CLAIM_STICKCLICK) (left ? a_tmp.leftStickClick : a_tmp.rightStickClick) = true;
             }
             return a_tmp;
         }
@@ -691,7 +768,7 @@ namespace fo4flatvr::bindings
             if (MenuOpen(ui, "WorkshopMenu")) return GCtx::Workshop;
             if (MenuOpen(ui, "LevelUpMenu")) return GCtx::LevelUp;
             if (IsWorkbenchMenu(ui)) return GCtx::Workbench;
-            if (MenuOpen(ui, "PipboyMenu")) return g_pipWrist.load() ? GCtx::Pipboy : GCtx::Menu;
+            if (MenuOpen(ui, "PipboyMenu")) return g_pipWrist.load() || PipboyPageButtons() ? GCtx::Pipboy : GCtx::Menu;
             static constexpr const char* kMenus[] = { "ContainerMenu", "BarterMenu", "TerminalMenu", "PauseMenu", "BookMenu",
                 "SleepWaitMenu", "LooksMenu", "SPECIALMenu", "Workshop_CaravanMenu", "ExamineConfirmMenu", "TerminalHolotapeMenu",
                 "PipboyHolotapeMenu", "CreditsMenu", "MainMenu" };
@@ -732,6 +809,17 @@ namespace fo4flatvr::bindings
                 if (game::PipboyPage() == 0) {
                     if (n == "Xenon_Y") return Role::OTrig;
                     if (n == "Xenon_A") return Role::PTrig;
+                    if (n == "Xenon_R1" && PipboyPageButtons() && game::PipboyTab() != 2) return Role::OClick;  // EFFECTS (FO4VR L stick click)
+                }
+                // 27 Nov: the tab hints (PipboyMenu.swf LT / RT = Xenon_L2_Alt / Xenon_R2_Alt): X previous / Y next
+                if (n == "Xenon_L2_Alt") return Role::OLower;
+                if (n == "Xenon_R2_Alt") return Role::OUpper;
+                if (PipboyPageButtons()) {  // the pages' own buttons (PipboyPageButtons above)
+                    if (n == "Xenon_X") return Role::PLower;
+                    if (n == "Xenon_R1") return Role::PUpper;
+                    if (n == "Xenon_L1") return Role::PGrip;
+                    if (n == "Xenon_L3") return Role::OClick;
+                    if (n == "Xenon_R3") return Role::PClick;
                 }
                 if (n == "Xenon_A") return Role::OTrig;
                 if (n == "Xenon_B") return Role::OGrip;
@@ -742,7 +830,7 @@ namespace fo4flatvr::bindings
                 return Role::None;
             case GCtx::Favorites:
                 if (n == "Xenon_A") return Role::PTrig;
-                if (n == "Xenon_B") return Role::PGrip;
+                if (n == "Xenon_B") return QuickMenuOn() ? Role::OGrip : Role::PGrip;
                 if (n == "Xenon_LS" || dpad) return Role::PStick;
                 return Role::None;
             case GCtx::Vats:
@@ -776,6 +864,11 @@ namespace fo4flatvr::bindings
             case GCtx::Workbench:
             case GCtx::LevelUp:
                 if (c == GCtx::Menu && n == "Xenon_Y" && game::PipboyPage() == 0) return Role::OTrig;  // flat-window Pip-Boy STAT: perk chart
+                if (c == GCtx::Menu && LooksMenuFO4VR() && MenuOpen(RE::UI::GetSingleton(), "LooksMenu")) {
+                    if (n == "Xenon_A") return Role::PLower;  // FACE / sculpt (FO4VR [OCR_A])
+                    if (n == "Xenon_Y") return Role::OTrig;   // $SEX: off trigger (FO4VR WandTrigger -> ChangeSex)
+                    if (n == "Xenon_Start") return Role::PGrip; // DONE: a grip (FO4VR WandGrip -> ConfirmCloseMenu; Y too)
+                }
                 if (n == "Xenon_A") return Role::PTrig;  // select / take (the pointer's trigger)
                 if (n == "Xenon_B") return c == GCtx::LevelUp ? Role::PGrip : Role::PUpper;
                 if (n == "Xenon_X") return Role::OLower;
@@ -947,10 +1040,17 @@ namespace fo4flatvr::bindings
         }
     }
 
+    namespace
+    {
+        std::atomic<std::uint8_t> g_inputContext{ 0 };  // 28 Nov, bridge v13: the context the last Map() ran in (Ctx values)
+    }
+    std::uint8_t InputContext() { return g_inputContext.load(std::memory_order_relaxed); }
+
     void Map(const xr::ControllerState& a_raw, const Context& a, pad::State& p)
     {
         // VR gestures (Gestures.h, 16 Nov): stick click + hand motion / both hands up, before the sticks are mapped
         const Ctx  ctx0 = Enabled() ? Detect(a) : Ctx::Gameplay;
+        g_inputContext.store(static_cast<std::uint8_t>(Enabled() ? ctx0 : Detect(a)), std::memory_order_relaxed);  // bridge v13
         // 21 Nov, bridge v8: inputs claimed by a physics-hands client (ROCK-flat) read as released from here on, in gameplay /
         // quick loot only (the generic layout: its world view without a menu)
         xr::ControllerState        claimedCopy;
@@ -963,7 +1063,7 @@ namespace fo4flatvr::bindings
         // workshop: the primary stick click is the game's too (R stick click held still = tag / supply line), so it gets the
         // same VRIK button delay as the off hand's sprint click
         gestures::Update({ &c, a.head, gestureWorld, a.camState, a.leftHanded, true,
-            Enabled() && ctx0 == Ctx::Workshop && WorkshopFO4VR() });
+            Enabled() && ((ctx0 == Ctx::Workshop && WorkshopFO4VR()) || (InWorld(ctx0) && QuickMenuOn()) || ((ctx0 == Ctx::Pipboy || (ctx0 == Ctx::Menu && game::PipboyPage() >= 0)) && PipboyPageButtons())) });
         if (!Enabled()) {
             MapGeneric(c, a, p);
             std::scoped_lock l(g_lock);
@@ -989,6 +1089,7 @@ namespace fo4flatvr::bindings
         QcEnsureSink(now);
         const Ctx  ctx = Detect(a);
         g_lastCtx = static_cast<int>(ctx), g_pipWrist = a.pipboyWrist, g_leftHanded = L;
+        quickmenu::SetEnabled(QuickMenuOn());
         uisound::SetContextName(CtxName(ctx));
         const int pPhys = L ? 0 : 1, oPhys = 1 - pPhys;
         {
@@ -1017,8 +1118,9 @@ namespace fo4flatvr::bindings
             // 20 Nov: nor a stick / the off trigger. Each context routes the sticks differently (V.A.T.S.: primary stick = pad
             // LS; gameplay: off stick = LS ...), so a stick held over the change would jump straight into the new context's
             // job (turn / walk / scroll / part select) and the game's handlers saw the switch as one stick event.
-            s.stickCarry[0] = std::hypot(psx, psy) > 0.35f;
-            s.stickCarry[1] = std::hypot(osx, osy) > 0.35f;
+            const bool latch = !StickCarryOverOn();  // 28 Nov: 1 (default) = no latch, see StickCarryOverOn
+            s.stickCarry[0] = latch && std::hypot(psx, psy) > 0.35f;
+            s.stickCarry[1] = latch && std::hypot(osx, osy) > 0.35f;
             s.oTrigCarry = oTrigOn;
             s.stickCarries += (s.stickCarry[0] ? 1u : 0u) + (s.stickCarry[1] ? 1u : 0u);
             s.trigCarries += s.oTrigCarry ? 1u : 0u;
@@ -1046,7 +1148,12 @@ namespace fo4flatvr::bindings
             REX::INFO("bindings: EDI dialogue list navigation {}", listNav ? "active" : "inactive");
         }
 
-        switch (ctx) {
+        // 27 Nov: a Pip-Boy shown as a normal menu on the flat window (direct open refused: third person ...) gets the same
+        // Pip-Boy mapping as the wrist / projected one while bPipboyPageButtons is on (before: the generic menu mapping, no
+        // tabs, no page buttons). Its select click comes from the menu pointer instead of the Pip-Boy pointer.
+        const bool pipFlat = ctx == Ctx::Menu && PipboyPageButtons() && game::PipboyPage() >= 0;
+        const Ctx  mapCtx = pipFlat ? Ctx::Pipboy : ctx;
+        switch (mapCtx) {
         case Ctx::Gameplay:
         case Ctx::QuickLoot: {
             // quick loot (FO4VR quick menu): the stick of the hand whose ray picks the container (s.actHand: primary, or the
@@ -1058,7 +1165,7 @@ namespace fo4flatvr::bindings
                 const float hy[2] = { psy, osy };
                 for (int h = 0; h < 2; ++h) {
                     if (ql && s.qlHand == h) s.qlLatch[h] = true;
-                    else if (s.qlLatch[h] && std::abs(hy[h]) < QlNav::kOff) s.qlLatch[h] = false;
+                    else if (s.qlLatch[h] && (std::abs(hy[h]) < QlNav::kOff || (h == 1 && StickCarryOverOn()))) s.qlLatch[h] = false;  // 28 Nov: the off (move) stick walks at once; the primary keeps its jump guard
                 }
                 s.ql.Update(ql, s.qlHand == 1 ? osy : psy, s.qlHand == 1 ? osx : psx, now);
             }
@@ -1134,9 +1241,29 @@ namespace fo4flatvr::bindings
             if (!s.pGrip.down) s.holster = false;
             (void)pClickReleased;
             p.x = s.holster || s.transfer.On(now);
+            if (g_qmPipeReq.exchange(false)) {
+                // pipe "bindings quickmenu holster": the quick menu's grip action (Actor::DrawWeaponMagicHands, QuickMenu.h)
+                const bool drawn = PlayerWeaponState() >= 3;
+                ++(drawn ? g_qmSheathe : g_qmDraw);
+                quickmenu::ToggleDrawn();
+            }
+            if (QuickMenuOn() && !ql) {
+                // 28 Nov: FO4VR quick menu (QuickMenuOn): the primary stick click opens FavoritesMenu, once per press
+                const bool pc = gestures::ClickToGame(pPhys, psClick);
+                if (pc && !s.qmClick && !s.holster && !s.clickUsedForHolster) s.favorites.Fire(now, 120), ++g_qmOpens;
+                s.qmClick = pc;
+            }
             p.dpadUp = s.favorites.On(now) || qlUp;
+            // 27 Nov (scopes, Scope.h): while the game's scope is up the primary grip holds breath (FO4VR's ScopeMenu hint on the
+            // grip; flat: the sprint button, pad L3); that press is never a reload or a grenade, even if the scope ends first
+            if (pGripPressed && !s.holster) s.breathGrip = scope::GripHoldsBreath() && scope::ViewActive();
+            if (s.breathGrip) {
+                s.pGrip.heldFired = true;
+                p.ls = p.ls || s.pGrip.down;
+                if (!s.pGrip.down) s.breathGrip = false;
+            }
             // primary grip: tap = reload (X tap), hold >= 350 ms = grenade (RB held until release)
-            if (!s.holster) {
+            if (!s.holster && !s.breathGrip) {
                 if (s.pGrip.down && !s.pGrip.heldFired && s.pGrip.HeldMs(now) >= 350.0) s.pGrip.heldFired = true;
                 if (pGripReleased && !s.pGrip.heldFired) s.reload.Fire(now, 120);
                 p.rb = s.pGrip.down && s.pGrip.heldFired;
@@ -1190,14 +1317,57 @@ namespace fo4flatvr::bindings
             // which nothing sent before. On the STAT page the off trigger is that; select stays on the primary trigger.
             const bool statPage = game::PipboyPage() == 0;
             p.y = statPage && oTrigUse;                          // perk chart / level up
-            p.a = (oTrigUse && !statPage) || (trigOn && !a.pipPointerOnQuad);  // select / equip (the primary trigger clicks via the pointer when on the screen)
+            const bool pipOnQuad = pipFlat ? a.menuPointerOnQuad : a.pipPointerOnQuad;
+            p.a = (oTrigUse && !statPage) || (trigOn && !pipOnQuad);  // select / equip (the primary trigger clicks via the pointer when on the screen)
             p.b = s.pGrip.down || s.oGrip.down;                 // close (FO4VR: lower the arm / grip)
+            if (PipboyPageButtons()) {
+                // 27 Nov: the pages' own buttons (PipboyPageButtons). Stick clicks reach the game as the gestures allow
+                // (a hand with gestures on: after fButtonDelayS held still, as sprint / the workshop's R stick click).
+                const bool oc = gestures::ClickToGame(oPhys, osClickRaw), pc = gestures::ClickToGame(pPhys, psClick);
+                p.b = s.oGrip.down;                              // close: the off (Pip-Boy arm) grip
+                p.x = pLower;                                    // Radaway / drop / show on map / world-local map
+                // FO4VR (PipboyMenu FUN_140ba5480): the stick click on STAT = RShoulder (EFFECTS), except in the PERKS section
+                const bool statEffects = statPage && game::PipboyTab() != 2;
+                p.rb = pUpper || (statEffects && oc);            // EFFECTS (FO4VR L stick click) / fav / next perk
+                if (ctxChanged) s.pipGripCarry = s.pGrip.down;
+                if (!s.pGrip.down) s.pipGripCarry = false;
+                p.lb = s.pGrip.down && !s.pipGripCarry;          // cycle damage / quest summary / caravans / prev perk
+                p.ls = oc && !statPage;                          // sort / component view
+                p.rs = pc;                                       // inspect
+                if (oc && !s.pipOClick) ++s.pipOClicks;
+                if (pc && !s.pipPClick) ++s.pipPClicks;
+                s.pipOClick = oc, s.pipPClick = pc;
+            }
             break;
         }
         case Ctx::Favorites: {
             p.lx = psx, p.ly = psy;      // highlight with the primary stick
             p.a = trigOn || pLower;      // use
             p.b = s.pGrip.down || s.oGrip.down || pUpper;
+            if (QuickMenuOn() && quickmenu::Active()) {
+                // 28 Nov, FO4VR quick menu with its own movie (QuickMenu.h): the stick picks one of the 12 entries by direction,
+                // the trigger's release uses it, the primary grip draws / puts away the weapon (the menu stays open); close =
+                // off grip, B or a new primary stick click. Nothing of this goes to the flat pad handling.
+                p.lx = p.ly = 0.0f;
+                p.a = false;
+                quickmenu::Input(pPhys, psx, psy, trigOn, pGripPressed);
+                if (pGripPressed) ++(PlayerWeaponState() >= 3 ? g_qmSheathe : g_qmDraw);
+                {
+                    // the VR movie ignores the pad's Cancel: close through the UI message queue (FO4VR also hides it so)
+                    bool opr, orl;
+                    s.qmCloseBtn.Update(s.oGrip.down || pUpper || pClickPressed, now, opr, orl);
+                    if (opr) quickmenu::Close(s.oGrip.down ? "off grip" : pUpper ? "B" : "primary stick click");
+                }
+                p.b = false;
+            } else if (QuickMenuOn()) {
+                // flat movie (world_Favorites.swf not installed): primary grip = holster / draw with the menu open (the same
+                // engine call as the VR movie's grip, QuickMenu.h ToggleDrawn); close = off grip, B or a new primary stick click
+                if (pGripPressed) {
+                    ++(PlayerWeaponState() >= 3 ? g_qmSheathe : g_qmDraw);
+                    quickmenu::ToggleDrawn();
+                }
+                p.b = s.oGrip.down || pUpper || pClickPressed;
+            }
             break;
         }
         case Ctx::Vats: {
@@ -1363,6 +1533,16 @@ namespace fo4flatvr::bindings
                     p.y = oTrigUse;
                     p.a = trigOn && !trigClickByPointer;
                     p.start = p.start || (oUpper && !s.offUpper.heldFired);
+                } else if (LooksMenuFO4VR() && MenuOpen(ui, "LooksMenu")) {
+                    // 28 Nov, FO4VR LooksMenu (VR LooksMenu::HandleEvent(ButtonEvent) 140B60B70): A = Accept (face / sculpt),
+                    // never pad Y; the off trigger = $SEX (FO4VR WandTrigger -> ChangeSex); a grip = FO4VR WandGrip ->
+                    // ConfirmCloseMenu = the done prompt (that AS3 function is not reachable on flat's menu object - Invoke
+                    // fails - so the grip sends the flat DONE button, which opens the same prompt); B = Cancel / back; the
+                    // primary trigger is the pointer's mouse button (feature pick, drag sculpt).
+                    p.b = pUpper;
+                    p.a = (trigOn && !trigClickByPointer) || pLower;
+                    p.y = oTrigUse;
+                    p.start = p.start || (oUpper && !s.offUpper.heldFired) || s.pGrip.down || s.oGrip.down;
                 } else if (IsWorkbenchMenu(ui)) {
                     // 20 Nov, FO4VR workbenches: Y scrap (HelpCraftingVR / modding station texts) = flat YButton; X rename /
                     // tag / repair = flat XButton (above)
@@ -1379,7 +1559,8 @@ namespace fo4flatvr::bindings
             game::SetPickHand(0);
         }
         // FO4VR: no left-trigger aim (aim down sights = raise the gun to the eye); the workshop's LT = object rotation
-        if (ctx != Ctx::Pipboy && ctx != Ctx::Workshop) p.lt = 0.0f;
+        // 27 Nov (scopes, Scope.h): raised to the eye with a scoped gun = the game's aim held (FO4VR EF7B00 / EFAA60), gameplay only
+        if (mapCtx != Ctx::Pipboy && ctx != Ctx::Workshop) p.lt = (InWorld(ctx) && scope::HoldAim()) ? 1.0f : 0.0f;
         {
             const bool ws = ctx == Ctx::Workshop && WorkshopFO4VR();
             g_wsPanelHidden = ws && s.wsMin;
@@ -1436,8 +1617,21 @@ namespace fo4flatvr::bindings
 
     void Claims(std::uint32_t& a_left, std::uint32_t& a_right) { ClaimedMasks(a_left, a_right); }
 
+    bool SetAdds(std::uint32_t a_owner, std::uint32_t a_left, std::uint32_t a_right)
+    {
+        if (a_owner < 1 || a_owner > FO4FLATVR_CLAIM_OWNER_MAX) return false;
+        a_left &= FO4FLATVR_CLAIM_ALL, a_right &= FO4FLATVR_CLAIM_ALL;
+        const auto pl = g_addL[a_owner].exchange(a_left), pr = g_addR[a_owner].exchange(a_right);
+        if ((pl != a_left || pr != a_right) && g_claimLogged.fetch_add(1) < 200)
+            REX::INFO("bindings: input adds owner {}{}: L[{}] R[{}] (honoured {}, gameplay / quick loot only; frames so far {})", a_owner,
+                a_owner == FO4FLATVR_CLAIM_OWNER_ROCK ? " (ROCK)" : "", ClaimBits(a_left), ClaimBits(a_right), ClaimsOn() ? "yes" : "no: [ROCK] bInputClaims=0",
+                g_addFrames.load());
+        return ClaimsOn();
+    }
+
     bool DialogueListNavActive() { return g_dlgListNavActive.load(std::memory_order_relaxed) && dlg::Open(); }
 
+    bool  StickCarryOver() { return StickCarryOverOn(); }
     bool  WorkshopPanelHidden() { return g_wsPanelHidden.load(std::memory_order_relaxed); }
     float WorkshopPanelScale() { return g_wsStatsShown.load(std::memory_order_relaxed) ? WorkshopStatsScale() : 1.0f; }
 
@@ -1461,6 +1655,10 @@ namespace fo4flatvr::bindings
                 g_wsUpFarther = INT_MIN;
                 g_lightDirect = INT_MIN;
                 g_glyphRemap = INT_MIN;
+                g_pipButtons = INT_MIN;
+                g_looksFO4VR = INT_MIN;
+                g_stickCarryOver = INT_MIN;
+                g_quickMenu = INT_MIN;
                 g_wsStatsScale = -1.0f;
                 REX::INFO("bindings: [Controllers] switches re-read (live): FO4VR bindings {} workshop FO4VR {} stick up farther {} glyphs {} "
                           "stats scale {:.2f}",
@@ -1565,6 +1763,75 @@ namespace fo4flatvr::bindings
             std::scoped_lock l(g_lock);
             return std::format("bindings light direct={} holds={} viaEngine={} pipboyTaps={}{} | {}", LightDirect() ? 1 : 0, g_s.lightHolds, g_s.lightDirect,
                 g_s.pipboyTaps, w == "toggle" ? (queued ? " (toggle queued)" : " (engine calls unavailable)") : "", game::PipboyLightReport());
+        }
+        if (v == "quickmenu") {  // 28 Nov: "bindings quickmenu [holster]": FO4VR quick menu state; holster = what the grip in it does
+            std::string w;
+            is >> w;
+            if (w == "holster") g_qmPipeReq = true;
+            if (w == "toggle" || w == "vars" || w == "tree" || w == "get" || w == "call") {
+                std::string rest;
+                std::getline(is, rest);
+                return "bindings " + quickmenu::Command(w + rest);
+            }
+            return std::format("bindings quickmenu on={} opens={} holsters={} draws={} ws={} open={}{}", QuickMenuOn() ? 1 : 0, g_qmOpens.load(),
+                g_qmSheathe.load(), g_qmDraw.load(), PlayerWeaponState(),
+                MenuOpen(RE::UI::GetSingleton(), "FavoritesMenu") ? 1 : 0, w == "holster" ? " (toggle queued)" : "") + " | " + quickmenu::Status();
+        }
+        if (v == "menuobj") {  // 28 Nov: "bindings menuobj <Menu> get <member> | call <fn>": the menu object (test aid, main thread)
+            std::string mn, op, name;
+            is >> mn >> op >> name;
+            return "bindings menuobj " + tq::RunOnMainWait([mn, op, name]() -> std::string {
+                auto* ui = RE::UI::GetSingleton();
+                auto  menu = ui ? ui->GetMenu(RE::BSFixedString(mn.c_str())) : nullptr;
+                if (!menu) return mn + ": not open";
+                auto& o = menu->menuObj;
+                if (!o.IsObject()) return mn + ": menuObj not an object";
+                if (op == "call") return std::format("{}.{}() -> {}", mn, name, o.Invoke(name.c_str()) ? "ok" : "failed");
+                Scaleform::GFx::Value r;
+                if (!o.GetMember(name.c_str(), &r)) return mn + "." + name + " = (not found)";
+                using T = Scaleform::GFx::Value::ValueType;
+                switch (r.GetType()) {
+                case T::kBoolean: return mn + "." + name + " = bool " + (r.GetBoolean() ? "true" : "false");
+                case T::kInt: return std::format("{}.{} = int {}", mn, name, r.GetInt());
+                case T::kUInt: return std::format("{}.{} = uint {}", mn, name, r.GetUInt());
+                case T::kNumber: return std::format("{}.{} = number {}", mn, name, r.GetNumber());
+                case T::kString: return mn + "." + name + " = string '" + r.GetString() + "'";
+                default: return std::format("{}.{} = type {}", mn, name, static_cast<int>(r.GetType()));
+                }
+            }, std::chrono::milliseconds(1000), "main thread busy");
+        }
+        if (v == "pipvar") {  // 27 Nov: "bindings pipvar <path>": a PipboyMenu movie variable (test aid, read on the main thread)
+            std::string path;
+            is >> path;
+            return "bindings pipvar " + tq::RunOnMainWait([path]() -> std::string {
+                auto* ui = RE::UI::GetSingleton();
+                static const RE::BSFixedString kPip("PipboyMenu");
+                auto menu = ui ? ui->GetMenu(kPip) : nullptr;
+                if (!menu || !menu->uiMovie) return "no PipboyMenu movie";
+                Scaleform::GFx::Value v;
+                if (!menu->uiMovie->GetVariable(&v, path.c_str())) return path + " = (not found)";
+                if (v.IsBoolean()) return path + " = bool " + (v.GetBoolean() ? "true" : "false");
+                if (v.IsNumber()) return std::format("{} = number {}", path, v.GetNumber());
+                if (v.IsString()) return path + " = string '" + v.GetString() + "'";
+                if (v.IsDisplayObject()) {
+                    Scaleform::GFx::Value vis;
+                    const bool hv = v.GetMember("visible", &vis) && vis.IsBoolean();
+                    auto num = [&](const char* m) {
+                        Scaleform::GFx::Value n;
+                        return v.GetMember(m, &n) && n.IsNumber() ? std::format("{:.1f}", n.GetNumber()) : std::string("?");
+                    };
+                    return path + " = displayobject visible=" + (hv ? (vis.GetBoolean() ? "true" : "false") : "?") + " x=" + num("x") +
+                           " y=" + num("y") + " alpha=" + num("alpha") + " height=" + num("height") + " frame=" + num("currentFrame");
+                }
+                if (v.IsObject()) return path + " = object";
+                return path + (v.IsUndefined() ? " = undefined" : " = other");
+            }, std::chrono::milliseconds(1000), "main thread busy");
+        }
+        if (v == "pipboy") {  // 27 Nov: "bindings pipboy": Pip-Boy page buttons ([Controllers] bPipboyPageButtons)
+            std::scoped_lock l(g_lock);
+            return std::format("bindings pipboy pageButtons={} page={} tab={} offClicks={} primaryClicks={} gripCarry={} | edges x={} lb={} rb={} ls={} rs={} | {}",
+                PipboyPageButtons() ? 1 : 0, game::PipboyPage(), game::PipboyTab(), g_s.pipOClicks, g_s.pipPClicks, g_s.pipGripCarry ? 1 : 0, g_s.n[2], g_s.n[4], g_s.n[5],
+                g_s.n[6], g_s.n[7], g_s.lastText);
         }
         if (v == "ql") {  // "bindings ql [on|off]": quick-loot stick ([Controllers] bQuickLootStick) + quick-container state
             std::string w;

@@ -68,6 +68,8 @@ namespace fo4flatvr::game
     bool WorldScreenMenu(const char* a_name);
     void SetWorldScreenEnabled(bool a_on);
     bool WorldScreenEnabled();
+    // 28 Nov: invoke a LooksMenu AS3 function on its menu object (FO4VR WandGrip -> "ConfirmCloseMenu"). Any thread (main queue).
+    void LooksMenuCall(const char* a_fn);
     // The aim ray (camera-local metres / unit direction relative to the camera root on screen, as PublishHandRay builds it)
     // against the terminal's "Screen:0" with the engine's own NiPick (NiPick ctor 16FD560 / PickObjects 16FD660 / dtor 16FD610,
     // set up as UIUtils::PickScreen 1087930 does, prologues byte-checked once): movie uv of the hit (record +0x24/+0x28) and
@@ -95,6 +97,15 @@ namespace fo4flatvr::game
     std::string ModPanelMenu();
     void        SetModPanelMenus(int a_on);  // pipe "menupanel modmenus on|off|ini": live override (-1 = ini)
     void        ReloadPointerSettings();     // 20 Nov (live settings): [Menus] bPointerAnyMenu / bPanelModMenus / sPanelMenus / sNoPanelMenus read again
+    // 28 Nov (menus agent): the menu shown on the menu panel (Presenter, every frame; "" = none). A main tick gives that menu's
+    // movie the aspect of the user's flat display while it has the whole buffer (mod menus: SAM, ...) and puts it back after.
+    // [Menus] bModMenuFlatAspect, fModMenuAspect (0 = Fallout4Prefs iSize W/H). FitReport: pipe "pointer".
+    void        SetPanelMenu(const std::string& a_name);
+    void        FitPanelViewportTick();
+    std::string FitReport();
+    // 28 Nov (menus agent): aspect audit - the 16:9..2.0 "aspect gap" hooks (HUD floating markers, VATS part labels); load time.
+    void        InstallAspectGapHooks();
+    std::string AspectGapReport();
 
     // Menus with kUsesBlurredBackground (0x400000: PauseMenu, VATSMenu) raise UI+0x1F8 [measured: 1 with PauseMenu or
     // VATSMenu open, 0 with the Pip-Boy (flag absent)], and the frame then shows a blurred copy of the scene taken when

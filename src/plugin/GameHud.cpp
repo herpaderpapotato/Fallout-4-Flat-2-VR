@@ -2,6 +2,7 @@
 #include "plugin/HudLayer.h"
 #include "plugin/Dialogue.h"
 #include "plugin/PipboyLayer.h"
+#include "plugin/Scope.h"
 #include "plugin/Settings.h"
 #include "plugin/ThreadQueues.h"
 
@@ -249,6 +250,10 @@ namespace fo4flatvr::game
         {
             g_origDrawPostFX(a_renderer);
             ++g_h1Calls;
+            // 27 Nov (scopes, Scope.h): the game's scope overlay (ScopeMenu.swf after its post FX) for the scope image
+            if (scope::WantOverlayTargets() && _stricmp(RendererName(a_renderer), "ScopeMenu") == 0) {
+                scope::OnOverlayTargets(RtTexture(kRtGlass), RtTexture(kRtMovie));
+            }
             // VR dialogue (D-cap): the FlatScreenModel draw while DialogueMenu is its only menu = the option panel
             if (_stricmp(RendererName(a_renderer), "FlatScreenModel") == 0) {
                 // the pooled glass targets this menu draw used: cleared after its RenderMain (pause-menu decal, HudLayer.h)
@@ -294,6 +299,22 @@ namespace fo4flatvr::game
             }
             const char* name = RendererName(a_renderer);
             NoteRenderer(name, a_dest);
+            // 27 Nov (scopes, Scope.h): the ScopeMenu renderer has no post FX (renderer +0x60 = 0); its movie (the game's scope
+            // overlay) is in its offscreen target, Interface3D::Renderer::InitialOffscreenTarget (A3EB20, byte-checked)
+            if (scope::WantOverlayTargets() && _stricmp(name, "ScopeMenu") == 0) {
+                static const bool initOk = [] {
+                    static constexpr std::uint8_t kPro[] = { 0x8B, 0x41, 0x60, 0x48, 0x8B, 0xD1, 0x44, 0x8B, 0x81, 0xC4, 0x01, 0x00 };
+                    return std::memcmp(reinterpret_cast<const void*>(Base() + 0xA3EB20), kPro, sizeof(kPro)) == 0;
+                }();
+                const int id = initOk ? reinterpret_cast<int (*)(void*)>(Base() + 0xA3EB20)(a_renderer) : -1;
+                const auto* r = static_cast<const std::uint8_t*>(a_renderer);
+                scope::NoteOverlayRenderer(id, *reinterpret_cast<const int*>(r + 0x60), *reinterpret_cast<const int*>(r + 0x68),
+                    *reinterpret_cast<const int*>(r + 0x6C), *reinterpret_cast<const int*>(r + 0x1C0), *reinterpret_cast<const int*>(r + 0x1C4));
+                scope::OnOverlayTargets(id >= 0 && id < 0x70 ? RtTexture(id) : nullptr, RtTexture(kRtMovie));
+                if (scope::SkipScopeMenuDraw()) {
+                    return;  // on the scope image instead: not screen-space across the double-wide stereo frame
+                }
+            }
             if (_stricmp(name, "FlatScreenModel") == 0) {
                 if (dlg::SkipWorldFlat()) {  // dialogue options on their own panel
                     dlg::NoteWorldFlatSkipped();

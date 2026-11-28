@@ -5,6 +5,7 @@
 #include "plugin/FloatingGun.h"
 #include "plugin/FloatingGunInternal.h"
 #include "plugin/ConfigStore.h"
+#include "plugin/FrikBridge.h"  // R35 bridge v12 kick callback
 #include "plugin/EngineCull.h"  // 22 Nov: hides / shows through the engine's SetAppCulled
 #include "plugin/GameBridge.h"
 #include "plugin/HeadPose.h"
@@ -300,6 +301,10 @@ namespace fo4flatvr::gun
             double        lastK{ 0 }, maxD{ 0 };
             int           kFrames{ 0 };     // W1 frames since the shot over which k is still taken (max)
             double        r68Prev{ 0 };
+            // R35 (bridge v12): a FRIK recoil controller (ROCK) took this frame's kick: apply xf (the kickback node local it
+            // returned; identity = none) instead of (rot, (0,-d,0)). Set per placed frame.
+            bool          ctl{ false };
+            Xf            xf;
         };
         Kick   g_kick;
         double g_kickTUs = 0;
@@ -676,10 +681,11 @@ namespace fo4flatvr::gun
                 const V target = Mul(H, Xf{ M3{}, V{ a_c.handleOffCm[0], a_c.handleOffCm[1], a_c.handleOffCm[2] } * (0.01 * a_c.unitsPerMeter), 1.0 }).t;
                 w.t = target - Mul(w.R, *a_handleLocal) * w.s;
             }
-            if (a_kick && (a_kick->d != 0.0 || a_kick->rotDeg != 0.0)) {
+            if (a_kick && (a_kick->ctl || a_kick->d != 0.0 || a_kick->rotDeg != 0.0)) {
                 // the kickback node (child of PrimaryWeaponToWandNode = wand . T(0,-4,1)) moves everything below it
                 const Xf K = Mul(wand, Xf{ M3{}, kWandToOffset, 1.0 });
-                Xf       k{ a_kick->rot, V{ 0.0, -a_kick->d, 0.0 }, 1.0 };
+                Xf       k = a_kick->ctl ? a_kick->xf : Xf{ a_kick->rot, V{ 0.0, -a_kick->d, 0.0 }, 1.0 };
+                k.s = 1.0;
                 const Xf ws = w;
                 w = Mul(Mul(Mul(K, k), Inv(K)), ws);
                 w.s = ws.s;
@@ -1108,7 +1114,24 @@ namespace fo4flatvr::gun
                     k.rot = Mul(Rz(am[2]), Rx(am[3]));
                     k.rotDeg = AngleDeg(k.rot, M3{});
                 }
+                k.ctl = false;
                 kick = k;
+            }
+            // R35 (bridge v12, FO4VR PrimaryWeaponKickbackRecoilNode contract): FO4VR's engine writes this kick into the kickback
+            // node and FRIK offers it to its recoil controllers; ROCK then delivers it to the hand carrying the gun (its owned
+            // carry / two-handed / left-hand poses) or asks for none (EmergencyDisableRecoil). Offered every placed frame (a
+            // zero kick too, as FRIK samples the node every frame), before the weapon is placed. Not for melee (no kick node).
+            if (active && !melee) {
+                RE::NiTransform kin, kout;
+                ToNi(Xf{ kick.rot, V{ 0.0, -kick.d, 0.0 }, 1.0 }, kin);
+                if (frikbridge::FilterGunKick(kin, kout)) {
+                    kick.ctl = true;
+                    kick.xf = FromNi(kout);
+                    kick.xf.R = Ortho(kick.xf.R);
+                }
+                std::scoped_lock l(g_lock);
+                g_kick.ctl = kick.ctl;
+                g_kick.xf = kick.xf;
             }
             if (active) {
                 const double s = before.s;

@@ -49,6 +49,7 @@ namespace fo4flatvr::camdir
         constexpr std::uint8_t   kFreeCamThunkBytes[5] = { 0xE9, 0xEB, 0x19, 0x80, 0xFF };
         constexpr int            kStateFree = 3;
         constexpr int            kStateThird = 8;
+        constexpr int            kStateFurniture = 9;
         constexpr int            kStates = 13;
 
         constexpr float kPi = 3.14159265358979f;
@@ -182,6 +183,16 @@ namespace fo4flatvr::camdir
             bool   headingSnap{ false };      // bHeadingSnap: game-driven heading jump >= fHeadingSnapDeg -> fade-snap the view to it
             float  headingSnapDeg{ 45.0f };
             float  paHoldS{ 0.1f };          // fPowerArmorHoldS: longest black hold for a power-armour enter/exit (was 12 s)
+            // 28 Nov (PA agent; user: "power armour is 3rd person camera"): furniture sequences need the game's furniture camera
+            // (StartFurnitureMode switches to state 9 and the third-person body + graph; flat's first-person graph has no
+            // enter animation: refused, the sit stalls at state 1 - power-armour frames, chairs, couches, beds ...). The furniture
+            // gates (bLockFirstPerson, bGateFurniture / bCraftingLiveWorld, bGatePowerArmor) now hold only furniture with a
+            // first-person replacement (workbenches -> bWorkbenchDirectMenu, terminals -> bTerminalInWorld); every other
+            // furniture runs the game's sequence and the lock's backstop waits for it. [Camera] bFurnitureSequencePass.
+            // bFurnitureSequenceScene: while such a sequence holds the furniture camera, it is shown as SCENE like the other
+            // third-person / orbit states.
+            bool   furnPass{ true };          // bFurnitureSequencePass
+            bool   furnScene{ true };         // bFurnitureSequenceScene
             // Free-camera scene view (AAF scenes; analysis/mod-aaf-vr.md option B). [Camera] bFreeCamScene (default 1):
             // the director also ticks in the free camera (thunk 1026290) and state 3 is a head-tracked world view:
             // translation = the free camera's (+ raw head offset), rotation = Rz(free-camera yaw) x head (game pitch
@@ -249,6 +260,7 @@ namespace fo4flatvr::camdir
             std::uint64_t     headingSnaps{ 0 }, paHolds{ 0 }, paHoldTimeouts{ 0 };
             float             lastHeadingJumpDeg{ 0.0f };
             double            lastPaHoldMs{ -1 };
+            std::uint64_t     furnPasses{ 0 };        // bFurnitureSequencePass: gated furniture passed to the game
         };
 
         struct Dir
@@ -296,6 +308,8 @@ namespace fo4flatvr::camdir
             float             moveViewYaw{ 0 }, moveViewPitch{ 0 };  // that view (heading convention; pitch + = up)
             // SCENE states (the AAF method for every game camera; Install fills it from the table)
             bool              sceneSt[kStates]{};
+            bool              paSeq{ false }, paSeqSeen9{ false };  // 28 Nov: power-armour enter / exit on the game's camera
+            Clock::time_point paSeqStart{}, paSeqEnd{};
             bool              sceneKeepHead{ false };  // entry from another SCENE state: keep the head-motion base (continuity)
             bool              glideLatched{ false };   // one glide hold per glide (no strobe when the hold is short)
             Clock::time_point glideQuietSince{};
@@ -435,6 +449,7 @@ namespace fo4flatvr::camdir
         std::string       g_lastGate{ "-" };
         bool              g_vatsBlocked = false;   // a StartVATSMode/ForceVATSMode was skipped (StopVATSMode then skips too)
         std::atomic<bool> g_paRequest{ false };     // power-armour furniture gated: director starts a held fade
+        std::atomic<bool> g_furnSeqReq{ false };    // furniture passed to the game: a furniture sequence starts (Tick)
         std::atomic<bool> g_menuWindow{ false };    // Presenter: a view-taking menu is in the flat window (SetMenuWindow)
 
         using StartFurn_t = void (*)(RE::PlayerCamera*, RE::TESObjectREFR*);
@@ -684,15 +699,43 @@ namespace fo4flatvr::camdir
             return kw && kwf->HasKeyword(kw, nullptr);
         }
 
+        // 28 Nov: furniture the gates replace in first person (FO4VR's way): workbenches with bWorkbenchDirectMenu (crafting
+        // menu opened directly), terminals with bTerminalInWorld (on their own monitor in the world). g_lock held.
+        bool FirstPersonReplacement(RE::TESObjectREFR* a_ref)
+        {
+            if (!a_ref) return false;
+            auto* base = a_ref->data.objectReference;
+            if (base && base->GetFormType() == RE::ENUM_FORM_ID::kTERM) return game::WorldScreenEnabled();
+            if (g_cfg.workbenchDirect && g_showCrafting && g_isFurnitureRef && g_isWorkbench && g_isFurnitureRef(a_ref)) {
+                void* b = *reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(a_ref) + 0xE0);
+                return b && g_isWorkbench(b, a_ref);
+            }
+            return false;
+        }
+
         void HkStartFurniture(RE::PlayerCamera* a_cam, RE::TESObjectREFR* a_ref)
         {
             const bool pa = IsPowerArmorFurniture(a_ref);
             bool       gate;
+            bool       seqPass = false;
             {
                 std::scoped_lock l(g_lock);
                 ++g_gs[kGFurniture].calls;
                 if (pa) ++g_paFurniture;
                 gate = (pa ? g_cfg.gatePowerArmor : g_cfg.gateFurniture) || g_cfg.lockFp;
+                // 28 Nov (PA agent): a gated furniture without a first-person replacement never completes (flat's player runs
+                // the first-person graph, which has no enter animation: sit state 1 for good; FO4VR's player always runs the
+                // third-person graph, so FO4VR can gate this camera). Measured under bLockFirstPerson: PA frame and chair stalled,
+                // workbenches / terminals / beds completed. Only furniture we replace stays gated; the rest passes to the game,
+                // the lock's backstop waits (Tick: furniture sequence). [Camera] bFurnitureSequencePass.
+                if (gate && g_cfg.furnPass && !FirstPersonReplacement(a_ref)) {
+                    gate = false;
+                    seqPass = true;
+                }
+                // 26 Nov: never in character creation. The bathroom mirror (MQ101's FaceGenSink) is a furniture whose camera is
+                // the mirror view; refused, LooksMenu never finishes closing, MQ101 still ends character creation when the player
+                // gets up (Game.PrecacheCharGenClear) and LooksMenu reads the cleared data: crash at A8107C (new game, 26 Nov).
+                // CharacterCreation data exists only from NEW until character creation ends (F4SE g_characterCreation 327A8A8).
                 if (gate) {
                     const auto base = reinterpret_cast<std::uintptr_t>(::GetModuleHandleW(nullptr));
                     const auto* cc = reinterpret_cast<const std::uintptr_t*>(base + 0x327A8A8);
@@ -704,11 +747,13 @@ namespace fo4flatvr::camdir
                 if (gate) ++g_gs[kGFurniture].blocked;
                 if (gate && g_cfg.lockFp) g_refused = pa ? "power armour camera refused" : "furniture camera refused";
                 g_lastGate = std::format("StartFurnitureMode {:08X} pa={} {}", a_ref ? a_ref->GetFormID() : 0, pa ? 1 : 0,
-                    gate ? "gated" : "passed");
+                    gate ? "gated" : seqPass ? "passed (sequence: no first-person replacement)" : "passed");
             }
             REX::INFO("camdir gate: StartFurnitureMode ref {:08X} (power armour {}) -> {}", a_ref ? a_ref->GetFormID() : 0, pa,
-                gate ? "HUD mode only (first person kept)" : "original");
+                gate ? "HUD mode only (first person kept)" : seqPass ? "original (bFurnitureSequencePass: no first-person replacement)" : "original");
             if (!gate) {
+                if (seqPass) ++g_f.furnPasses;
+                g_furnSeqReq = true;  // Tick: the furniture sequence (SCENE view of state 9, lock backstop waits)
                 g_origStartFurn(a_cam, a_ref);
                 return;
             }
@@ -1261,8 +1306,26 @@ namespace fo4flatvr::camdir
             const bool body = BodyAppliesLocked(st);
             if (body) pol = Policy::kTrack;
             d.body = body;
+            // 28 Nov: a furniture sequence on the game's camera (StartFurnitureMode passed: PA frame, chair, bed ...): runs until
+            // the camera has been in the furniture state and left it, at most 20 s (walk to a PA frame + climb: about 3-8 s)
+            if (g_furnSeqReq.exchange(false)) {
+                d.paSeq = true;
+                d.paSeqSeen9 = false;
+                d.paSeqStart = now;
+            }
+            if (d.paSeq) {
+                if (st == kStateFurniture) d.paSeqSeen9 = true;
+                if ((d.paSeqSeen9 && st != kStateFurniture) || Ms(d.paSeqStart, now) > 20000.0) {
+                    d.paSeq = false;
+                    d.paSeqEnd = now;
+                    REX::INFO("camdir: furniture sequence over after {:.0f} ms (camera state {} {})", Ms(d.paSeqStart, now), st, StateName(st));
+                }
+            }
+            const bool paScene = d.paSeq && g_cfg.furnScene && st == kStateFurniture && !body;
+            if (paScene) pol = Policy::kTrack;
             auto       sceneOf = [&](int a_st) {
-                return g_cfg.enabled && a_st >= 0 && a_st < kStates && d.sceneSt[a_st] && !BodyAppliesLocked(a_st);
+                return g_cfg.enabled && a_st >= 0 && a_st < kStates && (d.sceneSt[a_st] || (a_st == st && paScene)) &&
+                       !BodyAppliesLocked(a_st);
             };
             // SCENE (the AAF free-camera method for every game camera without its own handling): this state is head-tracked
             // from the game camera's position and yaw
@@ -1380,10 +1443,14 @@ namespace fo4flatvr::camdir
             // 20 Nov late (bLockAllowScenes): not while an AAF / defeat scene runs, nor for 2 s after its last signal (AAF's unlock
             // goes 3 -> 8 -> 0 itself; Violate's surrender asks for third person seconds before AAF's walk). User log 22:44:06: the
             // backstop pulled the camera out of a running AAF scene.
-            const bool sceneHold = g_cfg.lockScenes && d.sceneFlowSeen.time_since_epoch().count() && Ms(d.sceneFlowSeen, now) < 2000.0;
+            // 28 Nov: nor while a furniture sequence runs on the game's camera (bFurnitureSequencePass; 1 s after it)
+            const bool furnSeqHold = d.paSeq || (d.paSeqEnd.time_since_epoch().count() && Ms(d.paSeqEnd, now) < 1000.0);
+            const bool sceneHold = furnSeqHold ||
+                                   (g_cfg.lockScenes && d.sceneFlowSeen.time_since_epoch().count() && Ms(d.sceneFlowSeen, now) < 2000.0);
             if (g_cfg.lockFp && sceneHold && g_force1st && st >= 0 && st != 0 && st != 2 && st != 4 && changed) {
                 ++d.lockForceSkips;
-                REX::INFO("camdir: first-person lock: camera state {} {} kept for the AAF / defeat scene (bLockAllowScenes)", st, StateName(st));
+                REX::INFO("camdir: first-person lock: camera state {} {} kept for the {}", st, StateName(st),
+                    furnSeqHold ? "furniture sequence (bFurnitureSequencePass)" : "AAF / defeat scene (bLockAllowScenes)");
             }
             if (g_cfg.lockFp && !sceneHold && g_force1st && st >= 0 && st != 0 && st != 2 && st != 4 &&
                 (changed || Ms(d.lockForceAt, now) >= 500.0)) {
@@ -1602,10 +1669,10 @@ namespace fo4flatvr::camdir
                 if (clear || heldMs >= g_cfg.paHoldS * 1000.0) {
                     if (!clear) {
                         ++f.paHoldTimeouts;
-                        REX::WARN("camdir: power-armour hold timeout after {:.0f} ms (sit/sleep state {})", heldMs, sitSleep);
+                        REX::WARN("camdir: power-armour hold timeout after {:.0f} ms (sit/sleep state {}, camera state {})", heldMs, sitSleep, st);
                     }
                     f.lastPaHoldMs = heldMs;
-                    REX::INFO("camdir: power-armour hold released after {:.0f} ms (sit/sleep state {})", heldMs, sitSleep);
+                    REX::INFO("camdir: power-armour hold released after {:.0f} ms (sit/sleep state {}, camera state {})", heldMs, sitSleep, st);
                     f.hold = 0;
                 } else {
                     holding = true;
@@ -2286,6 +2353,8 @@ namespace fo4flatvr::camdir
         c.headingSnap = rdb("bHeadingSnap", false);
         c.headingSnapDeg = rdf("Camera", "fHeadingSnapDeg", c.headingSnapDeg);
         c.paHoldS = rdf("Camera", "fPowerArmorHoldS", c.paHoldS);
+        c.furnPass = rdb("bFurnitureSequencePass", true);
+        c.furnScene = rdb("bFurnitureSequenceScene", true);
         c.freeScene = rdb("bFreeCamScene", true);
         c.freeBody = rdb("bFreeCamBody", true);
         c.freeYawCutDeg = rdf("Camera", "fFreeCamYawCutDeg", c.freeYawCutDeg);
@@ -3305,7 +3374,7 @@ namespace fo4flatvr::camdir
             char  key[32]{};
             float v = 0;
             if (sscanf_s(a_arg.c_str() + 4, "%31s %f", key, static_cast<unsigned>(sizeof(key)), &v) != 2) {
-                return "error: camdir cfg fadems|timeout|jump|return|returns|grace|headhide|lockfp|body|notify|sameinput|follow|eyefwd|yieldpov|statepos <value>";
+                return "error: camdir cfg fadems|timeout|jump|return|returns|grace|headhide|lockfp|furnpass|furnscene|body|notify|sameinput|follow|eyefwd|yieldpov|statepos <value>";
             }
             const std::string k = key;
             if (k == "fadems") c.fadeMs = (std::max)(v, 0.0f);
@@ -3321,6 +3390,8 @@ namespace fo4flatvr::camdir
                 c.lockFp = v != 0.0f;
                 game::camtweak::SetForced(c.lockFp);
             } else if (k == "body") c.bodyCam = v != 0.0f;
+            else if (k == "furnpass") c.furnPass = v != 0.0f;    // 28 Nov: bFurnitureSequencePass
+            else if (k == "furnscene") c.furnScene = v != 0.0f;  // 28 Nov: bFurnitureSequenceScene
             else if (k == "notify") c.hudNotify = v != 0.0f;
             else if (k == "sameinput") c.sameInput = v != 0.0f;
             else if (k == "follow") c.bodyFollow = v != 0.0f;           // 21 Nov: bBodyCameraFollowsAnimation
@@ -3328,7 +3399,7 @@ namespace fo4flatvr::camdir
             else if (k == "yieldpov") c.bodyYieldPov = v != 0.0f;       // bBodyCameraYieldsToPov
             else if (k == "statepos") c.freeStatePos = v != 0.0f;       // bFreeCamStatePosition
             else {
-                return "error: camdir cfg fadems|timeout|jump|return|returns|grace|headhide|lockfp|body|notify|sameinput|follow|eyefwd|yieldpov|statepos <value>";
+                return "error: camdir cfg fadems|timeout|jump|return|returns|grace|headhide|lockfp|furnpass|furnscene|body|notify|sameinput|follow|eyefwd|yieldpov|statepos <value>";
             }
             REX::INFO("camdir: cfg {} = {} (pipe / VR panel)", k, v);
             return std::format("fadeMs={} timeoutS={} jumpUnits={} thirdReturn={} thirdReturnS={} thirdGraceMs={} povHeadHide={} lockFp={} "
@@ -3343,11 +3414,11 @@ namespace fo4flatvr::camdir
                 out += std::format(" {}=patched:{}/calls:{}/blocked:{}", kGateNames[i], g_gs[i].patched ? 1 : 0, g_gs[i].calls, g_gs[i].blocked);
             }
             return out + std::format(" | furniture={} powerArmor={} animated={} block3rd={} vats={} pipboyStop={} headingSnap={} snapDeg={} "
-                                     "paFurniture={} paHolds={} paHoldTimeouts={} lastPaHoldMs={:.0f} headingSnaps={} lastHeadingJump={:.1f} "
+                                     "paFurniture={} paHolds={} paHoldTimeouts={} lastPaHoldMs={:.0f} furnPass={} furnPasses={} furnScene={} furnSeq={} headingSnaps={} lastHeadingJump={:.1f} "
                                      "sitSleep={} vatsCam={} camEnabledByte={}/{}/{} wbPause={}/{} wbDirect={} wbClosesKept={} wbReentries={} wbStops={} last='{}'",
                        c.gateFurniture ? 1 : 0, c.gatePowerArmor ? 1 : 0, c.gateAnimated ? 1 : 0, c.blockThirdPerson ? 1 : 0, c.gateVats ? 1 : 0,
                        c.pipboyStopTick ? 1 : 0, c.headingSnap ? 1 : 0, c.headingSnapDeg, g_paFurniture, g_f.paHolds, g_f.paHoldTimeouts,
-                       g_f.lastPaHoldMs, g_f.headingSnaps, g_f.lastHeadingJumpDeg, g_d.sitSleep, c.vatsKeepCamera ? 1 : 0, g_camEnabledBefore,
+                       g_f.lastPaHoldMs, c.furnPass ? 1 : 0, g_f.furnPasses, g_cfg.furnScene ? 1 : 0, g_d.paSeq ? 1 : 0, g_f.headingSnaps, g_f.lastHeadingJumpDeg, g_d.sitSleep, c.vatsKeepCamera ? 1 : 0, g_camEnabledBefore,
                        g_camEnabledAfter, CamEnabledByte(), g_origWbCtor ? (g_workbenchPause ? 1 : 0) : -1, g_workbenchPauseSet,
                        g_workbenchDirectOpens, g_workbenchClosesKept, g_directReentriesIgnored, g_directStops, g_lastGate);
         }
@@ -3537,6 +3608,8 @@ namespace fo4flatvr::camdir
         B("bHeadingSnap", c.headingSnap, d.headingSnap);
         F("Camera", "fHeadingSnapDeg", c.headingSnapDeg, d.headingSnapDeg);
         F("Camera", "fPowerArmorHoldS", c.paHoldS, d.paHoldS);
+        B("bFurnitureSequencePass", c.furnPass, d.furnPass);
+        B("bFurnitureSequenceScene", c.furnScene, d.furnScene);
         B("bFreeCamBody", c.freeBody, d.freeBody);
         F("Camera", "fFreeCamYawCutDeg", c.freeYawCutDeg, d.freeYawCutDeg);
         F("Camera", "fFreeCamGlideSpeed", c.freeGlideSpeed, d.freeGlideSpeed);

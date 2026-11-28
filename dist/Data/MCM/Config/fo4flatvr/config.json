@@ -113,6 +113,32 @@
           }
         },
         {
+          "id": "bFurnitureSequencePass:Camera",
+          "text": "Furniture without a first-person version still works",
+          "type": "switcher",
+          "help": "With Always first person (or the FO4VR crafting gate): power-armour frames, chairs, couches, beds ... run the game's own furniture camera (their enter animation needs it), then first person again. Only workbenches (menu opened directly) and terminals (on their monitor) stay in first person. 0 = every furniture refused (frames / chairs never complete). Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "text": "Third person",
+          "type": "section"
+        },
+        {
+          "id": "bFurnitureSequenceScene:Camera",
+          "text": "Furniture camera as a scene view",
+          "type": "switcher",
+          "help": "The game's furniture camera of such a sequence (getting into power armour, sitting down ...) is head-tracked like the other third-person views (game camera position + your head turn, no pitch). 0 = sPolicyFurniture decides. Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "text": "Camera locks (compare)",
+          "type": "section"
+        },
+        {
           "id": "bBodyCamera:Camera",
           "text": "Camera stays on the body",
           "type": "switcher",
@@ -624,6 +650,63 @@
           "help": "Mod menus that take input (Silhouette, Screen Archer Menu, F4SE menus) on the menu panel with the pointer.",
           "valueOptions": {
             "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bPointerViewportFix:Menus",
+          "text": "Pointer hits where the dot is",
+          "type": "switcher",
+          "help": "Mouse positions relative to the menu's own (16:9 letterboxed) viewport. 0 = old mapping: hits land right of the dot.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bLooksMenuPointerCursor:Menus",
+          "text": "Pointer moves the face-sculpt cursor",
+          "type": "switcher",
+          "help": "In the looks menu the feature highlight follows the pointer through the game's own mouse handler (FO4VR: the wand moves it). 0 = only the stick moves it. Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bModMenuFlatAspect:Menus",
+          "text": "Mod menus at your flat display's aspect",
+          "type": "switcher",
+          "help": "A mod menu that fills the screen (Screen Archer Menu, ...) is laid out at your flat display's aspect so its edges are not cut.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bGlassFitScreen:Menus",
+          "text": "Menu glass shading lines up",
+          "type": "switcher",
+          "help": "The game's 16:9 glass mesh (green shading behind menus / HUD panels) is stretched over the wider render buffer.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bAspectGapFix:Menus",
+          "text": "HUD markers / VATS labels through the letterbox",
+          "type": "switcher",
+          "help": "Buffer wider than 16:9 but under 2:1: markers and V.A.T.S. labels use the game's ultrawide placement, the fader covers the whole view.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "fModMenuAspect:Menus",
+          "text": "Mod menu aspect (0 = Fallout4Prefs iSize)",
+          "type": "slider",
+          "help": "Width / height for the mod-menu layout, e.g. 2.389 for 3440x1440; 0 = your Fallout4Prefs.ini iSize W/H.",
+          "valueOptions": {
+            "min": 0.0,
+            "max": 4.0,
+            "step": 0.01,
+            "sourceType": "ModSettingFloat"
           }
         },
         {
@@ -6227,6 +6310,129 @@
           "text": "ROCK grabbing",
           "type": "switcher",
           "help": "ROCK's hands grab, pull and catch objects (grip). Off: no new grab starts and the grip goes back to the game; a held object stays until released. Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bWeapons:ROCK",
+          "text": "ROCK weapons",
+          "type": "switcher",
+          "help": "Weapon collision, two-handed support grip (a full-authority grip moves the gun), the weapon-held hand switch and the grip alignment. Off: ROCK sees no weapon. Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bWeaponGripAlign:ROCK",
+          "text": "ROCK gun grip alignment",
+          "type": "switcher",
+          "help": "ROCK aligns the held gun to the animation's own grip every frame (position only, as on FO4VR). Off: the gun stays where the floating gun puts it. Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bRecoilControl:ROCK",
+          "text": "ROCK recoil on the held gun",
+          "type": "switcher",
+          "help": "The floating gun's kick goes through ROCK (FO4VR): while ROCK holds the gun it kicks the hand carrying it. Off: the gun kicks on its own (ROCK's pose then hides it). Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bPhysicalMelee:ROCK",
+          "text": "ROCK physical melee",
+          "type": "switcher",
+          "help": "Swing the held weapon (gun bash too) or the bare hand into an actor and the game's melee hit lands on it (FO4VR). Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "iMeleeLinearSpeed:ROCK",
+          "text": "Melee swing speed (units/s)",
+          "type": "slider",
+          "help": "Hand speed a swing needs to hit (FO4VR 200). Live.",
+          "valueOptions": {
+            "min": 50,
+            "max": 600,
+            "step": 10,
+            "sourceType": "ModSettingInt"
+          }
+        },
+        {
+          "id": "iMeleeAngularSpeedDeciRad:ROCK",
+          "text": "Melee swing turn speed (0.1 rad/s)",
+          "type": "slider",
+          "help": "Or this wrist turn speed (FO4VR 1.0 rad/s = 10). Live.",
+          "valueOptions": {
+            "min": 2,
+            "max": 60,
+            "step": 1,
+            "sourceType": "ModSettingInt"
+          }
+        },
+        {
+          "id": "bMeleeTriggerClaim:ROCK",
+          "text": "Melee trigger = power attack",
+          "type": "switcher",
+          "help": "As FO4VR: with a melee weapon or fists drawn the trigger does not swing; hold it while swinging for a power attack. Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bHandEquip:ROCK",
+          "text": "ROCK hand equip",
+          "type": "switcher",
+          "help": "Grab a gun from the world and pull that hand's trigger: it becomes your weapon (silently, as FO4VR ROCK). Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bGrenadeQuickDraw:ROCK",
+          "text": "B hold = grenade in hand",
+          "type": "switcher",
+          "help": "As FO4VR with ROCK: tap B = V.A.T.S., hold B = a grenade drawn into your hand to throw. The grip-hold grenade throw stays. Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bHandEquipLeftFiring:ROCK",
+          "text": "Left-hand equip fires left",
+          "type": "switcher",
+          "help": "As FO4VR: a gun equipped from the left hand stays in the left hand as the firing hand (its trigger fires). Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bWeaponContactKeepAim:ROCK",
+          "text": "Gun keeps its aim at walls",
+          "type": "switcher",
+          "help": "The held gun pushed against a wall slides back along its aim instead of twisting (ROCK's soft contact response turned the gun 40-98 deg). 0 = ROCK's own response. Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bFollowLeftHanded:ROCK",
+          "text": "ROCK follows left-handed mode",
+          "type": "switcher",
+          "help": "With [Controllers] bLeftHanded=1 ROCK's default firing hand is the left (FO4VR: ROCK FiringHand.DefaultHand=left): the grenade goes to the free right hand, the left trigger fires, the right trigger stays the Pip-Boy's; the hand switch works from the left (grip the handle with the right hand, let go with the left: the right trigger then fires). 0 = ROCK's own DefaultHand. Live.",
+          "valueOptions": {
+            "sourceType": "ModSettingBool"
+          }
+        },
+        {
+          "id": "bDiagLog:ROCK",
+          "text": "ROCK diagnostic log",
+          "type": "switcher",
+          "help": "ROCK-flat diagnostic lines in ROCK.log (grip press, squeeze, release, hand-switch zone, input, frame time). Live.",
           "valueOptions": {
             "sourceType": "ModSettingBool"
           }

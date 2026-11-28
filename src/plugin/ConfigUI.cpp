@@ -1553,6 +1553,24 @@ namespace fo4flatvr::configui
             return std::format("{}:{} current={} saved={} base={} pending={} lastApply={}", r->key, r->section, Current(s, *r), Saved(*r), Base(*r),
                 s.pending.size(), s.lastApply);
         }
+        // 28 Nov (ROCK agent 5): a session-only override of ANY key for test harnesses (e.g. [Controllers] bLeftHanded, not a
+        // panel row): a ConfigStore preview - in the merged file, never saved (MCM / the user's ini untouched), dropped by
+        // "unpreview" or at the next launch. Live readers re-apply through their subscriptions.
+        if (a_arg.rfind("preview ", 0) == 0) {
+            char      sec[64]{}, key[64]{}, val[128]{};
+            const int n = sscanf_s(a_arg.c_str() + 8, "%63s %63s %127s", sec, static_cast<unsigned>(sizeof(sec)), key,
+                static_cast<unsigned>(sizeof(key)), val, static_cast<unsigned>(sizeof(val)));
+            if (n < 3) return "error: cfgui preview <Section> <Key> <value>";
+            cfgstore::SetPreview(sec, key, val);
+            cfgstore::Rebuild();
+            REX::INFO("cfgui: session preview [{}] {}={} (not saved)", sec, key, val);
+            return std::format("preview [{}] {}={} (session only; previews={})", sec, key, val, cfgstore::PreviewCount());
+        }
+        if (a_arg == "unpreview") {
+            cfgstore::ClearAllPreviews();
+            cfgstore::Rebuild();
+            return "previews cleared";
+        }
         if (a_arg == "save") {
             Save(s);
             return s.toast;

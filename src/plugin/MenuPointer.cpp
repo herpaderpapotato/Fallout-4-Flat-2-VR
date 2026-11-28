@@ -327,7 +327,7 @@ namespace fo4flatvr::menuptr
         const auto pad = pad::Last();  // what the virtual pad got last (trigger suppression check)
         return std::format("enabled={} active={} target='{}' onQuad={} u={:.4f} v={:.4f} down={} leftHanded={} frames={} hits={} clicks={} wheels={} cursorFrames={} padLT={:.2f} padRT={:.2f} | quad {} | aim {} | pointer {} | game {}",
                    g_enabled.load() ? 1 : 0, g_active ? 1 : 0, target, g_onQuad ? 1 : 0, g_u, g_v, g_trigDown ? 1 : 0, g_cfg.leftHanded ? 1 : 0, g_frames.load(),
-                   g_hits.load(), g_clicks.load(), g_wheels.load(), g_cursorFrames.load(), pad.lt, pad.rt, quad, aim, hit, game::MenuPointerGameReport()) +
+                   g_hits.load(), g_clicks.load(), g_wheels.load(), g_cursorFrames.load(), pad.lt, pad.rt, quad, aim, hit, game::MenuPointerGameReport()) + " | " + game::FitReport() +
                std::format(" | world active={} on={} hits={} {}", g_ws.active ? 1 : 0, g_onWorld ? 1 : 0, g_worldHits.load(), game::WorldScreenReport());
     }
 }

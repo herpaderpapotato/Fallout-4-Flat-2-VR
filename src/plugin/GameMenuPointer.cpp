@@ -14,12 +14,15 @@
 #include <memory>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <deque>
+#include <vector>
 #include <format>
 #include <mutex>
 
 #include <F4SE/F4SE.h>
 #include <RE/Fallout.h>
+#include <Scaleform/G/GFx_MovieDef.h>
 #include <Scaleform/G/GFx_Viewport.h>
 
 #include <Windows.h>
@@ -322,6 +325,52 @@ namespace fo4flatvr::game
             bool          movieUv{ false };  // world-screen pick: already movie uv
         };
         bool g_queueMovieUv = false;  // main thread: movieUv of the events SetMenuPointer queues now
+        std::atomic<bool> g_vpFix{ true };  // 28 Nov: [Menus] bPointerViewportFix (events relative to the movie's viewport)
+        // 28 Nov (PA/LooksMenu agent): [Menus] bLooksMenuPointerCursor. FO4VR moves the face-sculpt cursor only from the menu
+        // cursor (VR LooksMenu::HandleEvent(MouseMoveEvent) 140B61270 is MoveSculptCursor's only caller; the wand drives the
+        // cursor). Our pointer talks to the movie directly (GFx mouse events), so the engine's LooksMenu never heard it and the
+        // cursor stayed at 550,360. Each pointer move over LooksMenu now sets the menu cursor (MenuCursor singleton 327A568,
+        // +0x24/+0x28 screen px) and runs flat's own handler (LooksMenu::HandleEvent(MouseMoveEvent) A81A20 on the menu's
+        // BSInputEventUser at +0x10): ShouldMoveCursor -> MoveSculptCursor(x, y, mouse) with its letterbox rule, the pick, and
+        // the mouse sculpt / rotate branches exactly as for a real mouse.
+        std::atomic<bool>          g_looksCursor{ true };
+        std::atomic<std::uint64_t> g_looksMoves{ 0 };
+        int                        g_looksOk = -1;  // prologue checked (-1 unknown)
+        constexpr std::uintptr_t   kMenuCursorSingleton = 0x327A568;  // MenuCursor* (LooksMenu mouse handler A81A3F)
+        constexpr std::uintptr_t   kScreenW = 0x3D87218, kScreenH = 0x3D8721C;  // screen px (MoveSculptCursor A85B81 / A85BC9)
+        constexpr std::uintptr_t   kLooksMouseMove = 0xA81A20;     // LooksMenu::HandleEvent(MouseMoveEvent) (this = menu + 0x10)
+        bool CallLooksMouseMove(void* a_user, void* a_ev)
+        {
+            using Fn = void (*)(void*, void*);
+            __try {
+                reinterpret_cast<Fn>(REL::Offset(kLooksMouseMove).address())(a_user, a_ev);
+                return true;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return false;
+            }
+        }
+        void LooksMenuCursor(RE::IMenu* a_menu, float a_u, float a_v)  // UI task (main thread)
+        {
+            const auto b = REL::Offset(0).address();
+            if (g_looksOk < 0) {
+                static constexpr std::uint8_t kPro[] = { 0x4C, 0x8B, 0xDC, 0x49, 0x89, 0x5B, 0x08, 0x49, 0x89, 0x73, 0x10 };
+                g_looksOk = std::memcmp(reinterpret_cast<const void*>(b + kLooksMouseMove), kPro, sizeof(kPro)) == 0 ? 1 : 0;
+                REX::INFO("menu pointer: LooksMenu sculpt cursor via the game's mouse handler {}", g_looksOk ? "ready" : "OFF (prologue mismatch)");
+            }
+            if (g_looksOk != 1 || !a_menu) return;
+            auto* mc = *reinterpret_cast<std::uint8_t**>(b + kMenuCursorSingleton);
+            const auto w = *reinterpret_cast<const std::uint32_t*>(b + kScreenW), h = *reinterpret_cast<const std::uint32_t*>(b + kScreenH);
+            if (!mc || w == 0 || h == 0) return;
+            *reinterpret_cast<std::int32_t*>(mc + 0x24) = static_cast<std::int32_t>(std::clamp(a_u, 0.0f, 1.0f) * static_cast<float>(w));
+            *reinterpret_cast<std::int32_t*>(mc + 0x28) = static_cast<std::int32_t>(std::clamp(a_v, 0.0f, 1.0f) * static_cast<float>(h));
+            alignas(16) std::uint8_t ev[0x60]{};  // the handler only writes +0x24 (handled) in its rotate branch
+            if (CallLooksMouseMove(reinterpret_cast<std::uint8_t*>(a_menu) + 0x10, ev)) {
+                ++g_looksMoves;
+            } else {
+                g_looksOk = 0;
+                REX::WARN("menu pointer: LooksMenu mouse handler faulted - sculpt cursor drive off");
+            }
+        }
 
         std::mutex                 g_lock;  // g_events, g_downMenu, report strings
         std::deque<QueuedEvent>    g_events;
@@ -406,6 +455,45 @@ namespace fo4flatvr::game
         {
             GValue v;
             return a_obj.IsObject() && a_obj.GetMember(a_name, &v) ? Str(v) : std::string("-");
+        }
+
+        // 28 Nov (menus agent): a movie's geometry for the pipe probe "pointer movie [<Menu>]": viewport, scale mode,
+        // alignment, visible frame rect (stage units), the SWF's own size, the AS3 stage, root1, and where the stage
+        // corners land in viewport pixels (TranslateToScreen).
+        std::string MovieGeometry(const char* a_name, Scaleform::GFx::Movie* a_mv)
+        {
+            Scaleform::GFx::Viewport vp{};
+            a_mv->GetViewport(&vp);
+            const auto  vis = a_mv->GetVisibleFrameRect();
+            const auto  safe = a_mv->GetSafeRect();
+            float       dw = -1.0f, dh = -1.0f;
+            if (auto* def = a_mv->GetMovieDef()) {
+                dw = def->GetWidth(), dh = def->GetHeight();
+            }
+            Scaleform::Render::Point<float> p0{ 0.0f, 0.0f }, p1{ dw, dh };
+            const auto s0 = a_mv->TranslateToScreen(p0, nullptr);
+            const auto s1 = a_mv->TranslateToScreen(p1, nullptr);
+            float mx = 0.0f, my = 0.0f;
+            std::uint32_t mb = 0;
+            a_mv->GetMouseState(0, &mx, &my, &mb);
+            GValue root, stage;
+            std::string st = "no root1";
+            if (a_mv->GetVariable(&root, "root1") && root.IsObject()) {
+                st = std::format("root1 x={} y={} sx={} sy={} w={} h={}", MemberNum(root, "x"), MemberNum(root, "y"), MemberNum(root, "scaleX"),
+                    MemberNum(root, "scaleY"), MemberNum(root, "width"), MemberNum(root, "height"));
+                if (root.GetMember("stage", &stage) && stage.IsObject()) {
+                    st += std::format(" stage {}x{} scaleMode={} align='{}' mouse {:.1f},{:.1f}", MemberNum(stage, "stageWidth"),
+                        MemberNum(stage, "stageHeight"), MemberStr(stage, "scaleMode"), MemberStr(stage, "align"), MemberNum(stage, "mouseX"),
+                        MemberNum(stage, "mouseY"));
+                }
+            }
+            return std::format("{}: vp buf {}x{} rect {},{} {}x{} sc {},{} {}x{} flags 0x{:X} scale {:.3f} aspect {:.3f} | mode {} align {} | def {}x{} "
+                               "vis {:.1f},{:.1f}..{:.1f},{:.1f} safe {:.1f},{:.1f}..{:.1f},{:.1f} | stage(0,0)->{:.1f},{:.1f} stage(def)->{:.1f},{:.1f} "
+                               "| gfxMouse {:.1f},{:.1f} | {}",
+                a_name, vp.bufferWidth, vp.bufferHeight, vp.left, vp.top, vp.width, vp.height, vp.scissorLeft, vp.scissorTop, vp.scissorWidth,
+                vp.scissorHeight, vp.flags.underlying(), vp.scale, vp.aspectRatio, static_cast<int>(a_mv->GetViewScaleMode()),
+                static_cast<int>(a_mv->GetViewAlignment()), dw, dh, vis.x1, vis.y1, vis.x2, vis.y2, safe.x1, safe.y1, safe.x2, safe.y2, s0.x,
+                s0.y, s1.x, s1.y, mx, my, st);
         }
 
         // Walks the bar's children; a_report: one entry per child. Returns the index of the visible child under the stage
@@ -572,8 +660,8 @@ namespace fo4flatvr::game
             const float bh = static_cast<float>(vp.bufferHeight > 0 ? vp.bufferHeight : vp.height);
             GfxMouseEvent ev{};
             ev.type = a_e.type;
-            ev.x = a_e.u * bw;
-            ev.y = a_e.v * bh;
+            ev.x = a_e.u * bw - (g_vpFix.load() ? static_cast<float>(vp.left) : 0.0f);  // 28 Nov: viewport-relative (see DrainEvents)
+            ev.y = a_e.v * bh - (g_vpFix.load() ? static_cast<float>(vp.top) : 0.0f);
             ev.scrollDelta = a_e.wheel;
             const auto rc = bar->uiMovie->HandleEvent(*reinterpret_cast<const Scaleform::GFx::Event*>(&ev));
             if (a_e.type == 3 && g_barDown) {
@@ -584,6 +672,44 @@ namespace fo4flatvr::game
             if (a_e.type != 1) {
                 std::scoped_lock l(g_lock);
                 g_barLast = std::format("type {} x={:.1f} y={:.1f} rc={} buf {}x{}", a_e.type, ev.x, ev.y, static_cast<int>(rc), vp.bufferWidth, vp.bufferHeight);
+            }
+        }
+
+        // 28 Nov: the mouse-button half of LooksMenu's engine input (flat LooksMenu::HandleEvent(ButtonEvent) A81590, mouse
+        // branch; FO4VR 140B60B70 the same): left button -> +0x1F9 on the menu's BSInputEventUser (+0x10) = held (the mouse
+        // move handler sculpts with it: SculptModeLStickMouse(delta)), and in face mode (menuMode 1) Invoke SculptMode (the
+        // feature under the cursor). Our pointer's trigger = that left button. UI task (main thread).
+        std::atomic<std::uint64_t> g_looksButtons{ 0 }, g_looksSculptCalls{ 0 };
+        std::atomic<std::uint64_t> g_looksHintSkips{ 0 };
+        void LooksMenuButton(RE::IMenu* a_menu, bool a_down)
+        {
+            if (g_looksOk != 1 || !a_menu) return;
+            // a click on a button hint (the pointer clicks those through the movie: HintClickFallback) is not a face click:
+            // without this, a hint click in face mode also started sculpting the feature under the cursor (measured)
+            if (a_down && a_menu->uiMovie) {
+                GValue data;
+                const auto rep = ObjectsUnderMouse(a_menu->uiMovie.get(), &data, nullptr);
+                // a hint clip under the mouse (its ButtonHintData member is not always readable as an object)
+                const bool hintHit = data.IsObject() || rep.find("(hint '") != std::string::npos;
+                static int logged = 0;
+                if (logged < 12) {
+                    ++logged;
+                    REX::INFO("menu pointer: LooksMenu click -> {}: {}", hintHit ? "hint (no face click)" : "face click", rep.substr(0, 300));
+                }
+                if (hintHit) {
+                    ++g_looksHintSkips;
+                    return;
+                }
+            }
+            *(reinterpret_cast<std::uint8_t*>(a_menu) + 0x10 + 0x1F9) = a_down ? 1 : 0;
+            ++g_looksButtons;
+            // the release only clears the held flag: the press already started sculpting (menuMode 1 -> 3), and a release
+            // after a hint click (press skipped above) must not start it either
+            if (!a_down) return;
+            GValue mode;
+            if (a_menu->menuObj.IsObject() && a_menu->menuObj.GetMember("menuMode", &mode) && static_cast<int>(Num(mode, -1.0)) == 1) {
+                a_menu->menuObj.Invoke("SculptMode");
+                ++g_looksSculptCalls;
             }
         }
 
@@ -656,10 +782,20 @@ namespace fo4flatvr::game
                 }
                 GfxMouseEvent ev{};
                 ev.type = e.type;
-                ev.x = mu * bw;
-                ev.y = mv * bh;
+                // 28 Nov (menus agent; user: "the pointing visual is offset to the left of where it's actually pointing"):
+                // GFx takes mouse coordinates relative to the movie's viewport origin (measured: PauseMenu viewport 171,0
+                // 4778x2688 in a 5120x2688 buffer; event x 3227.7 -> stage.mouseX 864.7 = 3227.7 * 1280 / 4778). The game
+                // letterboxes 16:9 menus inside wider screens (InitMovieViewport 141B1BB30: left = (W - H*16/9) / 2), so the
+                // buffer position u*W must lose the viewport's left/top, or the hit lands 'left' px right of the drawn dot.
+                // [Menus] bPointerViewportFix.
+                ev.x = mu * bw - (g_vpFix.load() ? static_cast<float>(vp.left) : 0.0f);
+                ev.y = mv * bh - (g_vpFix.load() ? static_cast<float>(vp.top) : 0.0f);
                 ev.scrollDelta = e.wheel;
                 const auto rc = dst->uiMovie->HandleEvent(*reinterpret_cast<const Scaleform::GFx::Event*>(&ev));
+                if (g_looksCursor.load() && _stricmp(dstName.c_str(), "LooksMenu") == 0) {
+                    if (e.type == 1 || e.type == 2) LooksMenuCursor(dst.get(), mu, mv);  // the button acts at the cursor
+                    if (e.type == 2 || e.type == 3) LooksMenuButton(dst.get(), e.type == 2);
+                }
                 if (e.type < 5) {
                     ++g_sent[e.type];
                 }
@@ -844,8 +980,425 @@ namespace fo4flatvr::game
 
     void SetModPanelMenus(int a_on) { g_modPanelLive = a_on; }
 
+    // ---- 28 Nov (menus agent): mod menus at the aspect of the user's flat display ---------------------------------------
+    // User: "The right 1/3rd edge of some menus is cut off, such as the screen archer menu." Measured (work/ui/menufix.py):
+    // the render buffer is the double-wide 5120x2688 (1.905:1). The game letterboxes its own menus to 16:9 (InitMovieViewport
+    // 141B1BB30 with LoadMovie's last argument), but a mod menu like SAM gets the whole buffer with showAll, so its visible
+    // stage is 720 x 1.905 = 1371 wide (-45.7..1325.7). SAM lays its slider list at stage 1143..~1450 and its notification
+    // at about -190: made for the user's 3440x1440 monitor (visible -220..1500), so both edges are cut on our buffer.
+    // Fix: while such a menu (viewport = the whole buffer, not exactFit) is on the menu panel, its viewport gets the aspect
+    // of the user's flat display (Fallout4Prefs.ini [Display] iSize W/H, or [Menus] fModMenuAspect): wider -> the full
+    // width and a centred band of the height (letterbox), narrower -> a centred column. Put back when it leaves the panel.
+    // The pointer maps through the viewport (bPointerViewportFix). [Menus] bModMenuFlatAspect.
+    namespace
+    {
+        std::atomic<bool> g_fitLoaded{ false };
+        bool              g_fitOn = true;      // main thread
+        float             g_fitAspect = 0.0f;  // main thread: 0 = none known
+        std::mutex        g_fitLock;
+        std::string       g_fitWant;  // the Presenter's panel menu
+        std::string       g_fitReport{ "none" };
+        struct Fitted
+        {
+            Scaleform::GFx::Movie*   movie{ nullptr };
+            Scaleform::GFx::Viewport orig{};
+            Scaleform::GFx::Viewport ours{};
+        };
+        std::vector<std::pair<std::string, Fitted>> g_fitted;  // main thread
+
+        float FlatDisplayAspect()
+        {
+            char buf[64]{};
+            ::GetPrivateProfileStringA("Menus", "fModMenuAspect", "0", buf, sizeof(buf), Settings::Path().c_str());
+            const float a = static_cast<float>(std::atof(buf));
+            if (a > 0.5f) {
+                return a;
+            }
+            // the game's own display size (MO2 maps the profile's Fallout4Prefs.ini onto this path for the game process)
+            char path[MAX_PATH]{};
+            char* up = nullptr;
+            std::size_t n = 0;
+            if (_dupenv_s(&up, &n, "USERPROFILE") == 0 && up) {
+                std::snprintf(path, sizeof(path), "%s\\Documents\\My Games\\Fallout4\\Fallout4Prefs.ini", up);
+                std::free(up);
+            }
+            const int w = ::GetPrivateProfileIntA("Display", "iSize W", 0, path);
+            const int h = ::GetPrivateProfileIntA("Display", "iSize H", 0, path);
+            return w > 0 && h > 0 ? static_cast<float>(w) / static_cast<float>(h) : 0.0f;
+        }
+
+        Scaleform::GFx::Movie* MovieOf(const std::string& a_name)
+        {
+            auto* ui = RE::UI::GetSingleton();
+            Scaleform::Ptr<RE::IMenu> m = ui ? ui->GetMenu(RE::BSFixedString(a_name.c_str())) : nullptr;
+            return m && m->OnStack() && m->uiMovie ? m->uiMovie.get() : nullptr;
+        }
+
+        bool SameVp(const Scaleform::GFx::Viewport& a, const Scaleform::GFx::Viewport& b)
+        {
+            return a.bufferWidth == b.bufferWidth && a.bufferHeight == b.bufferHeight && a.left == b.left && a.top == b.top && a.width == b.width &&
+                   a.height == b.height;
+        }
+    }
+
+    // ---- 28 Nov (menus agent): the menu / HUD glass mesh over the whole render buffer ------------------------------------
+    // User (screenshot, main menu): "the green backdrop/shading is generally misaligned". The green shading is the HUD-glass
+    // pass: FlatScreenModel / HUDScreenModel (ctors aid 2219859 / 2219872) draw their offscreen target through a screen-
+    // attached glass mesh picked by the screen aspect (1.6 -> HUDGlassFlat16x10.nif, >= 3 SUW, >= 2 UW, else HUDGlassFlat.nif
+    // = 16:9). Our render buffer is 5120x2688 = 1.905 -> the 16:9 mesh, which covers only the centred 16:9 part of the screen
+    // but maps the WHOLE target (uv 0..1) onto it: the glass shading lands at x' = 171 + x * 4778/5120 (measured: backdrop mask
+    // x 1264..1858 -> tint 1372..1870, centre 1628 = predicted), while the menu itself is drawn 1:1. Fix: stretch the mesh's
+    // horizontal axis by screen aspect / mesh aspect (renderer +0x80 = screen-attached root, local rotate column), so its uv
+    // span covers the buffer 1:1 again. [Menus] bGlassFitScreen; pipe "pointer glass [k] [axis]".
+    namespace
+    {
+        constexpr std::uintptr_t kRendererGetByNameRva = 0xA3A770;  // Interface3D::Renderer::GetByName (byte-checked in GamePipboy)
+        constexpr std::uintptr_t kRendererScreenAttached = 0x80;    // Interface3D::Renderer screen-attached 3D root (MainScreen_SetScreenAttached3D A3A990)
+        struct GlassFit
+        {
+            RE::NiAVObject* node{ nullptr };
+            RE::NiMatrix3   orig{};
+            float           k{ 1.0f };
+            int             axis{ 0 };
+        };
+        constexpr int    kGlassRenderers = 5;
+        GlassFit         g_glass[kGlassRenderers];
+        bool             g_glassOn = true;      // main thread ([Menus] bGlassFitScreen)
+        float            g_glassOverrideK = 0;  // pipe: 0 = computed
+        int              g_glassAxis = 0;       // pipe: mesh axis that is screen-horizontal
+        std::atomic<int> g_glassApplied{ 0 };
+        std::string      g_glassReport{ "none" };  // under g_fitLock
+
+        float MeshAspect(float a_screen)  // the game's own pick (ctors above)
+        {
+            if (std::abs(1.6f - a_screen) <= 0.0001f) return 1.6f;
+            if (a_screen >= 3.0f) return 32.0f / 9.0f;
+            if (a_screen >= 2.0f) return 21.0f / 9.0f;
+            return 16.0f / 9.0f;
+        }
+
+        void GlassTick()
+        {
+            static int ok = -1;
+            if (ok < 0) {
+                static constexpr std::uint8_t kGbn[] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x30 };
+                ok = std::memcmp(reinterpret_cast<const void*>(Base() + kRendererGetByNameRva), kGbn, sizeof(kGbn)) == 0 ? 1 : 0;
+                if (!ok) REX::ERROR("menu glass: Interface3D::Renderer::GetByName bytes differ; glass fit off");
+            }
+            if (!ok) return;
+            const auto W = *reinterpret_cast<const std::uint32_t*>(Base() + 0x3D87218);  // screen size (InitMovieViewport)
+            const auto H = *reinterpret_cast<const std::uint32_t*>(Base() + 0x3D8721C);
+            if (W == 0 || H == 0) return;
+            const float screen = static_cast<float>(W) / static_cast<float>(H);
+            const float want = !g_glassOn ? 1.0f : g_glassOverrideK > 0.0f ? g_glassOverrideK : screen / MeshAspect(screen);
+            using GetByName_t = std::uint8_t* (*)(const RE::BSFixedString&);
+            // 28 Nov (audit round 2): every Interface3D renderer whose screen-attached model the game picks by the same aspect buckets:
+            // menus / HUD glass (aid 2219859 / 2219872), loading screen (BackgroundScreenModel 14099A250 -> LoadScreen02 + Translucent,
+            // HUDGlass material), power-armour dash (PowerArmorGeometry::InitializePAHUDGeom 1052C90, PADash 16:9 / UW / SUW),
+            // ScopeMenu (140AFC190: the same HUDGlassFlat* meshes)
+            static const RE::BSFixedString kNames[kGlassRenderers] = { RE::BSFixedString("FlatScreenModel"), RE::BSFixedString("HUDScreenModel"),
+                RE::BSFixedString("BackgroundScreenModel"), RE::BSFixedString("PowerArmorRenderer"), RE::BSFixedString("ScopeMenu") };
+            std::string rep;
+            for (int i = 0; i < kGlassRenderers; ++i) {
+                auto*       r = reinterpret_cast<GetByName_t>(Base() + kRendererGetByNameRva)(kNames[i]);
+                auto*       node = r ? *reinterpret_cast<RE::NiAVObject**>(r + kRendererScreenAttached) : nullptr;
+                GlassFit&   g = g_glass[i];
+                if (node != g.node) {  // new (or no) mesh: remember its own rotate
+                    g = GlassFit{};
+                    g.node = node;
+                    if (node) g.orig = node->local.rotate;
+                }
+                if (!node) continue;
+                if (std::abs(g.k - want) > 1e-4f || g.axis != g_glassAxis) {
+                    RE::NiMatrix3 m = g.orig;
+                    for (int row = 0; row < 3; ++row) m.entry[row][g_glassAxis] *= want;
+                    node->local.rotate = m;
+                    RE::NiUpdateData ud{};
+                    node->Update(ud);
+                    g.k = want;
+                    g.axis = g_glassAxis;
+                    ++g_glassApplied;
+                    REX::INFO("menu glass: '{}' mesh axis {} x{:.4f} (screen {}x{} = {:.3f}, mesh {:.3f})", kNames[i].c_str(), g_glassAxis, want, W, H, screen,
+                        MeshAspect(screen));
+                }
+                rep += std::format("{} k={:.4f} axis={} ", kNames[i].c_str(), g.k, g.axis);
+            }
+            std::scoped_lock l(g_fitLock);
+            g_glassReport = rep.empty() ? std::string("no renderers") : rep;
+        }
+    }
+
+    std::string GlassCommand(const std::string& a_arg)  // pipe "pointer glass [k] [axis]" (k 0 = computed)
+    {
+        float k = 0.0f;
+        int   axis = g_glassAxis;
+        if (std::sscanf(a_arg.c_str(), "%f %d", &k, &axis) >= 1) {
+            g_glassOverrideK = k;
+            g_glassAxis = std::clamp(axis, 0, 2);
+        }
+        std::scoped_lock l(g_fitLock);
+        return std::format("glass on={} override={:.4f} axis={} applied={} | {}", g_glassOn ? 1 : 0, g_glassOverrideK, g_glassAxis, g_glassApplied.load(),
+            g_glassReport);
+    }
+
+    // ---- 28 Nov (menus agent): aspect audit - the "aspect gap" (work/handoff/ui-menus.md "Aspect audit") -----------------
+    // The engine sorts the screen into buckets (Ghidra, every reader of the screen-size globals 3D87218/3D8721C): 16:10
+    // (|a-1.6| < 1e-4), "16:9" (a < 2.0), UW (2..3), SUW (>= 3), and only its UW/SUW paths know that the Scaleform menus are
+    // letterboxed. But BSScaleformManager::InitMovieViewport (141B1BB30) letterboxes every menu above 16/9 = 1.778. Our
+    // buffer is 5120x2688 = 1.905: in the gap. Every 16:9-bucket path that maps between the whole screen and a menu's stage
+    // is off by the letterbox (171 px each side): input (pointer, fixed in DrainEvents), screen-texture meshes (glass,
+    // GlassTick), world points projected into menus (HUD floating markers, VATS part labels: below), full-screen fills (the
+    // fader: FitFullScreenMenus). One rule for all of them: map through the letterbox rect, which for a world point is exactly
+    // the engine's own UW formula u' = (a * 9/16 * (2u - 1) + 1) / 2 (CalculateFloatingMarkerPositionAndVisiblity 1409CC840).
+    // [Menus] bAspectGapFix (markers + VATS labels + fader); off = the engine's 16:9-bucket behaviour.
+    namespace
+    {
+        std::atomic<bool>          g_gapOn{ true };
+        std::atomic<std::uint64_t> g_gapMarkers{ 0 }, g_gapVats{ 0 };
+        std::atomic<float>         g_gapLastU{ -1.0f }, g_gapLastU2{ -1.0f };
+        std::atomic<float>         g_gapVatsU{ -1.0f }, g_gapVatsU2{ -1.0f };
+        float                      g_gapVatsRing[16]{};  // audit: last raw part x values
+        std::atomic<std::uint32_t> g_gapVatsN{ 0 };
+        std::string                g_gapInstall{ "not installed" };
+
+        float ScreenAspect()
+        {
+            const auto W = *reinterpret_cast<const std::uint32_t*>(Base() + 0x3D87218);
+            const auto H = *reinterpret_cast<const std::uint32_t*>(Base() + 0x3D8721C);
+            return W && H ? static_cast<float>(W) / static_cast<float>(H) : 0.0f;
+        }
+        bool InGap(float a) { return a > 16.0f / 9.0f + 1e-3f && a < 2.0f; }  // letterboxed, but not the engine's UW bucket
+        float GapRemap(float u, float a) { return (a * 0.5625f * (2.0f * u - 1.0f) + 1.0f) * 0.5f; }
+
+        // HUDMarkerData::CalculateFloatingMarkerPositionAndVisiblity(marker, float rect[4]) -> visible; writes x/y at +0x10/+0x14
+        using Marker_t = bool (*)(void*, float*);
+        Marker_t g_origMarker = nullptr;
+        bool HkMarker(void* a_marker, float* a_rect)
+        {
+            const bool vis = g_origMarker(a_marker, a_rect);
+            const float a = ScreenAspect();
+            if (!g_gapOn.load(std::memory_order_relaxed) || !InGap(a) || !a_marker || !a_rect) {
+                return vis;
+            }
+            float* xy = reinterpret_cast<float*>(static_cast<std::uint8_t*>(a_marker) + 0x10);
+            const float w = a_rect[2] - a_rect[0];
+            if (w <= 0.0f) return vis;
+            const float u = (xy[0] - a_rect[0]) / w;
+            const float u2 = GapRemap(u, a);
+            xy[0] = a_rect[0] + w * u2;
+            ++g_gapMarkers;
+            g_gapLastU = u, g_gapLastU2 = u2;
+            return vis && xy[0] >= a_rect[0] && xy[0] <= a_rect[2];  // the engine's own on-screen test, with the remapped x
+        }
+
+        // VATSMenu::UpdateState part labels: NiCamera project (1416D2270)(cam, pt, &x, &y, &z, eps) -> x 0..1 of the screen,
+        // passed to AS3 UpdatePartPositions over the letterboxed stage
+        using Project_t = std::uint64_t (*)(void*, float*, float*, float*, float*, float);
+        Project_t g_origProject = nullptr;
+        std::uint64_t HkVatsProject(void* a_cam, float* a_pt, float* a_x, float* a_y, float* a_z, float a_eps)
+        {
+            const auto r = g_origProject(a_cam, a_pt, a_x, a_y, a_z, a_eps);
+            const float a = ScreenAspect();
+            if ((r & 0xFF) && a_x && g_gapOn.load(std::memory_order_relaxed) && InGap(a)) {
+                g_gapVatsRing[g_gapVatsN++ % 16] = *a_x;
+                g_gapVatsU = *a_x;
+                *a_x = GapRemap(*a_x, a);
+                g_gapVatsU2 = *a_x;
+                ++g_gapVats;
+            }
+            return r;
+        }
+
+        bool CallSiteOk(std::uintptr_t a_site, std::uintptr_t a_target, const char* a_what)
+        {
+            const auto* p = reinterpret_cast<const std::uint8_t*>(Base() + a_site);
+            std::int32_t rel;
+            std::memcpy(&rel, p + 1, 4);
+            if (p[0] != 0xE8 || a_site + 5 + rel != a_target) {
+                REX::ERROR("aspect gap: {} call at {:X} is not E8 -> {:X}; not patching", a_what, a_site, a_target);
+                return false;
+            }
+            return true;
+        }
+
+        // full-screen fill menus the game letterboxes: their viewport goes back to the whole buffer (FaderMenu: exactFit
+        // solid fade, letterboxed it leaves 171 px strips unfaded at both sides)
+        std::uint64_t g_fullFits = 0;
+        void FitFullScreenMenus()
+        {
+            if (!g_gapOn.load(std::memory_order_relaxed)) return;
+            static const RE::BSFixedString kFader("FaderMenu");
+            auto* ui = RE::UI::GetSingleton();
+            Scaleform::Ptr<RE::IMenu> m = ui ? ui->GetMenu(kFader) : nullptr;
+            if (!m || !m->uiMovie) return;
+            Scaleform::GFx::Viewport vp{};
+            m->uiMovie->GetViewport(&vp);
+            if (vp.bufferWidth > 0 && vp.bufferHeight > 0 && (vp.left != 0 || vp.top != 0 || vp.width != vp.bufferWidth || vp.height != vp.bufferHeight)) {
+                vp.left = vp.top = 0;
+                vp.width = vp.bufferWidth;
+                vp.height = vp.bufferHeight;
+                m->uiMovie->SetViewport(vp);
+                if (++g_fullFits <= 3) REX::INFO("aspect gap: FaderMenu viewport -> whole buffer {}x{}", vp.bufferWidth, vp.bufferHeight);
+            }
+        }
+    }
+
+    void InstallAspectGapHooks()
+    {
+        g_gapOn = ::GetPrivateProfileIntA("Menus", "bAspectGapFix", 1, Settings::Path().c_str()) != 0;
+        auto&                    tramp = REL::GetTrampoline();
+        constexpr std::uintptr_t kMarkerSite = 0x9C87DA, kMarker = 0x9CC840;  // aid_2220476 -> CalculateFloatingMarkerPositionAndVisiblity
+        constexpr std::uintptr_t kVatsSite = 0xB1EAA5, kProject = 0x16D2270;   // VATSMenu::UpdateState part positions -> project
+        std::string s;
+        if (CallSiteOk(kMarkerSite, kMarker, "HUD floating marker")) {
+            g_origMarker = reinterpret_cast<Marker_t>(tramp.write_call<5>(Base() + kMarkerSite, &HkMarker));
+            s += "markers ";
+        }
+        if (CallSiteOk(kVatsSite, kProject, "VATS part labels")) {
+            g_origProject = reinterpret_cast<Project_t>(tramp.write_call<5>(Base() + kVatsSite, &HkVatsProject));
+            s += "vatsLabels ";
+        }
+        g_gapInstall = s.empty() ? std::string("none") : s;
+        REX::INFO("aspect gap: hooks {} ([Menus] bAspectGapFix={}; screen aspect {:.3f}, in gap {})", g_gapInstall, g_gapOn.load() ? 1 : 0,
+            ScreenAspect(), InGap(ScreenAspect()) ? 1 : 0);
+    }
+
+    std::string AspectGapReport()
+    {
+        // LooksMenu sculpt cursor (screen px, MoveSculptCursor 140A85B50 globals 2F2CB30 / 2F2CB34): audit check against the pointer
+        const float sx = *reinterpret_cast<const float*>(Base() + 0x2F2CB30), sy = *reinterpret_cast<const float*>(Base() + 0x2F2CB34);
+        return std::format("aspectGap on={} hooks={} aspect={:.3f} inGap={} markers={} lastU {:.4f}->{:.4f} vatsLabels={} lastVats {:.4f}->{:.4f} faderFits={} "
+                           "sculpt {:.1f},{:.1f} looksCursor on={} ok={} moves={} buttons={} sculptCalls={} hintSkips={}",
+            g_gapOn.load() ? 1 : 0, g_gapInstall, ScreenAspect(), InGap(ScreenAspect()) ? 1 : 0, g_gapMarkers.load(), g_gapLastU.load(), g_gapLastU2.load(),
+            g_gapVats.load(), g_gapVatsU.load(), g_gapVatsU2.load(), g_fullFits, sx, sy, g_looksCursor.load() ? 1 : 0, g_looksOk, g_looksMoves.load(),
+            g_looksButtons.load(), g_looksSculptCalls.load(), g_looksHintSkips.load());
+    }
+
+    void SetPanelMenu(const std::string& a_name)
+    {
+        std::scoped_lock l(g_fitLock);
+        if (g_fitWant != a_name) {
+            g_fitWant = a_name;
+        }
+    }
+
+    void FitPanelViewportTick()  // main tick
+    {
+        if (!g_fitLoaded.exchange(true)) {
+            g_fitOn = ::GetPrivateProfileIntA("Menus", "bModMenuFlatAspect", 1, Settings::Path().c_str()) != 0;
+            g_vpFix = ::GetPrivateProfileIntA("Menus", "bPointerViewportFix", 1, Settings::Path().c_str()) != 0;
+            g_looksCursor = ::GetPrivateProfileIntA("Menus", "bLooksMenuPointerCursor", 1, Settings::Path().c_str()) != 0;
+            g_fitAspect = FlatDisplayAspect();
+            g_glassOn = ::GetPrivateProfileIntA("Menus", "bGlassFitScreen", 1, Settings::Path().c_str()) != 0;
+            g_gapOn = ::GetPrivateProfileIntA("Menus", "bAspectGapFix", 1, Settings::Path().c_str()) != 0;
+            REX::INFO("menu viewport: flat-display aspect {} ([Menus] bModMenuFlatAspect; aspect {:.3f}{})", g_fitOn ? "on" : "off", g_fitAspect,
+                g_fitAspect > 0.0f ? "" : " - unknown: nothing changed");
+        }
+        GlassTick();  // 28 Nov: glass mesh over the whole buffer (main menu backdrop)
+        FitFullScreenMenus();  // 28 Nov: aspect gap - full-screen fills (FaderMenu) over the whole buffer
+        std::string want;
+        {
+            std::scoped_lock l(g_fitLock);
+            want = g_fitWant;
+        }
+        // put back what left the panel (or everything when off)
+        for (auto it = g_fitted.begin(); it != g_fitted.end();) {
+            if (g_fitOn && it->first == want) {
+                ++it;
+                continue;
+            }
+            if (auto* mv = MovieOf(it->first); mv && mv == it->second.movie) {
+                Scaleform::GFx::Viewport cur{};
+                mv->GetViewport(&cur);
+                if (SameVp(cur, it->second.ours)) {
+                    mv->SetViewport(it->second.orig);
+                }
+            }
+            REX::INFO("menu viewport: '{}' put back", it->first);
+            it = g_fitted.erase(it);
+        }
+        if (!g_fitOn || want.empty() || g_fitAspect <= 0.0f) {
+            return;
+        }
+        auto* mv = MovieOf(want);
+        if (!mv) {
+            return;
+        }
+        Scaleform::GFx::Viewport cur{};
+        mv->GetViewport(&cur);
+        for (auto& [name, f] : g_fitted) {
+            if (name != want) continue;
+            if (f.movie != mv) {  // menu re-created: start over below
+                g_fitted.clear();
+                break;
+            }
+            if (!SameVp(cur, f.ours) && SameVp(cur, f.orig)) {
+                mv->SetViewport(f.ours);  // the game re-initialised it (InitMovieViewport): ours again
+            }
+            return;
+        }
+        // only menus the game gave the whole buffer (not its 16:9 letterbox) and that keep their aspect
+        const auto mode = mv->GetViewScaleMode();
+        if (cur.left != 0 || cur.top != 0 || cur.width != cur.bufferWidth || cur.height != cur.bufferHeight || cur.width <= 0 || cur.height <= 0 ||
+            mode == Scaleform::GFx::Movie::ScaleModeType::kExactFit) {
+            return;
+        }
+        const float bufAspect = static_cast<float>(cur.width) / static_cast<float>(cur.height);
+        Fitted f;
+        f.movie = mv;
+        f.orig = cur;
+        f.ours = cur;
+        if (std::abs(g_fitAspect - bufAspect) > 0.01f) {
+            if (g_fitAspect > bufAspect) {
+                f.ours.height = static_cast<std::int32_t>(std::lround(static_cast<float>(cur.width) / g_fitAspect));
+                f.ours.top = (cur.height - f.ours.height) / 2;
+            } else {
+                f.ours.width = static_cast<std::int32_t>(std::lround(static_cast<float>(cur.height) * g_fitAspect));
+                f.ours.left = (cur.width - f.ours.width) / 2;
+            }
+            mv->SetViewport(f.ours);
+        }
+        const auto        vis = mv->GetVisibleFrameRect();
+        const std::string rep = std::format("'{}' viewport {},{} {}x{} in {}x{} (aspect {:.3f} -> {:.3f}), visible stage {:.1f}..{:.1f} x {:.1f}..{:.1f}",
+            want, f.ours.left, f.ours.top, f.ours.width, f.ours.height, cur.bufferWidth, cur.bufferHeight, bufAspect, g_fitAspect, vis.x1, vis.x2, vis.y1,
+            vis.y2);
+        REX::INFO("menu viewport: {}", rep);
+        {
+            std::scoped_lock l(g_fitLock);
+            g_fitReport = rep;
+        }
+        g_fitted.emplace_back(want, f);
+    }
+
+    std::string FitReport()
+    {
+        std::string want, rep;
+        {
+            std::scoped_lock l(g_fitLock);
+            want = g_fitWant;
+            rep = g_fitReport;
+        }
+        return std::format("flatAspect on={} aspect={:.3f} vpFix={} want='{}' last {} | {}", g_fitOn ? 1 : 0, g_fitAspect, g_vpFix.load() ? 1 : 0, want, rep,
+            AspectGapReport());
+    }
+
+    void LooksMenuCall(const char* a_fn)
+    {
+        tq::RunOnMain([fn = std::string(a_fn)]() {
+            auto* ui = RE::UI::GetSingleton();
+            Scaleform::Ptr<RE::IMenu> m = ui ? ui->GetMenu(RE::BSFixedString("LooksMenu")) : nullptr;
+            if (m && m->OnStack() && m->menuObj.IsObject()) {
+                const bool ok = m->menuObj.Invoke(fn.c_str());
+                REX::INFO("menu pointer: LooksMenu {} -> {}", fn, ok ? "invoked" : "failed");
+            }
+        });
+    }
+
     void ReloadPointerSettings()
     {
+        g_vpFix = ::GetPrivateProfileIntA("Menus", "bPointerViewportFix", 1, Settings::Path().c_str()) != 0;
+        g_looksCursor = ::GetPrivateProfileIntA("Menus", "bLooksMenuPointerCursor", 1, Settings::Path().c_str()) != 0;
+        g_fitLoaded = false;
         g_anyMenu = -1;
         std::scoped_lock l(g_modPanelLock);
         g_modPanel.loaded = false;
@@ -1402,6 +1955,42 @@ namespace fo4flatvr::game
                 std::string s = name + ":";
                 TreeDump(root, 0, 3, s);
                 done->set_value(s);
+            });
+            if (!queued) return "error: no main-thread queue";
+            if (fut.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
+                return "error: UI task did not run within 2 s";
+            }
+            return fut.get();
+        }
+        if (a_arg == "gap ring") {  // last 16 raw VATS part x (0..1 of the screen) as the engine projected them
+            std::string r = std::format("n={} raw:", g_gapVatsN.load());
+            for (float v : g_gapVatsRing) r += std::format(" {:.4f}", v);
+            return r;
+        }
+        if (a_arg == "gap on" || a_arg == "gap off") {  // 28 Nov: pointer gap on|off (runtime [Menus] bAspectGapFix, A/B tests)
+            g_gapOn = a_arg == "gap on";
+            return AspectGapReport();
+        }
+        if (a_arg.rfind("glass", 0) == 0) {  // 28 Nov: pointer glass [k] [axis]
+            return GlassCommand(a_arg.size() > 6 ? a_arg.substr(6) : std::string{});
+        }
+        if (a_arg.rfind("movie", 0) == 0) {  // pointer movie [<MenuName>]: movie geometry (viewport, scale mode, stage) per open menu
+            const std::string name = a_arg.size() > 6 ? a_arg.substr(6) : std::string{};
+            auto done = std::make_shared<std::promise<std::string>>();
+            auto fut = done->get_future();
+            const bool queued = tq::RunOnUI([done, name]() {
+                auto* ui = RE::UI::GetSingleton();
+                std::string s;
+                if (!ui) {
+                    done->set_value("no UI");
+                    return;
+                }
+                for (const auto& m : ui->menuStack) {
+                    if (!m || !m->uiMovie || (!name.empty() && _stricmp(name.c_str(), m->menuName.c_str()) != 0)) continue;
+                    s += MovieGeometry(m->menuName.c_str(), m->uiMovie.get());
+                    s += " || ";
+                }
+                done->set_value(s.empty() ? std::string("no such menu with a movie") : s);
             });
             if (!queued) return "error: no main-thread queue";
             if (fut.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {

@@ -28,6 +28,7 @@
 #include "plugin/VirtualPad.h"
 #include "plugin/Presenter.h"
 #include "plugin/Roomscale.h"
+#include "plugin/Scope.h"
 #include "plugin/StereoPoC.h"
 #include "plugin/VatsWindow.h"
 #include "plugin/ThreadQueues.h"
@@ -422,7 +423,7 @@ namespace fo4flatvr::command
                     menuptr::SetEnabled(arg == "on");
                     return std::format("pointer {}", menuptr::Enabled() ? "on" : "off");
                 }
-                if (arg.rfind("findref ", 0) == 0 || arg.rfind("count ", 0) == 0 || arg == "bar" || arg == "probe" || arg.rfind("tree ", 0) == 0 || arg.rfind("hints ", 0) == 0) {  // test helpers; bar = button-hint dump, probe = AS3 objects under the pointer
+                if (arg.rfind("findref ", 0) == 0 || arg.rfind("count ", 0) == 0 || arg == "bar" || arg == "probe" || arg.rfind("movie", 0) == 0 || arg.rfind("glass", 0) == 0 || arg.rfind("gap ", 0) == 0 || arg.rfind("tree ", 0) == 0 || arg.rfind("hints ", 0) == 0) {  // test helpers; bar = button-hint dump, probe = AS3 objects under the pointer
                     return game::MenuTestCommand(arg);
                 }
                 if (!arg.empty()) {
@@ -521,6 +522,10 @@ namespace fo4flatvr::command
             if (verb == "comfort") {
                 // C8: comfort [cfg [<k> <v>]|turn snap|smooth|off|move head|hand|body|vignette on|off|stats reset]
                 return comfort::Command(arg);
+            }
+            if (verb == "scope") {
+                // 27 Nov: FO4VR raise-to-eye scope: scope [status|on|off|test|cap <bmp>] (on/off force the raise for tests)
+                return scope::Command(arg);
             }
             if (verb == "vatswin") {
                 // VATS camera window: vatswin [status|on|off|every n|scene 0|1|fov d|exposure x|mask 0|1|cap <bmp>]

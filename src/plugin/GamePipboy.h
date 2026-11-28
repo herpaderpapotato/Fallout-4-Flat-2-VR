@@ -64,6 +64,9 @@ namespace fo4flatvr::game
     // 20 Nov (controls): the PipboyMenu's current page (0 STAT, 1 INV, 2 DATA, 3 MAP, 4 RADIO), -1 = PipboyMenu not open.
     // Any thread (plain read of the menu's page global).
     int PipboyPage();
+    // 27 Nov (UI): the current page's section (tab) index (u32[5] at 3287640 per page; STAT: 0 STATUS, 1 SPECIAL, 2 PERKS;
+    // FO4VR keeps the same array, DAT_145ac9f58), -1 = PipboyMenu not open.
+    int PipboyTab();
 
     // 20 Nov (controls, user: "pipboy light hasnt worked"): FO4VR's hold-L-grip Pip-Boy light as the engine does it once
     // PipboyHandler's hold passes: PlayerCharacter::TogglePipboyLight (D76930: UIPipBoyLightOn/Off sound + ShowPipboyLight +

@@ -5,6 +5,7 @@
 #include "plugin/GameBridge.h"
 #include "plugin/Roomscale.h"
 #include "plugin/ConfigStore.h"
+#include "plugin/ControllerBindings.h"
 #include "plugin/Settings.h"
 
 #include <F4SE/F4SE.h>
@@ -289,7 +290,9 @@ namespace fo4flatvr::comfort
             a_f.rx = 0.0f;  // the engine's own right-stick yaw must not apply on top
         } else {
             s.smoothStick = 0.0f;
-            s.armed = std::abs(x) < c.snapRearm;  // a stick held over an ownership change does not snap
+            // 28 Nov: with [Controllers] bStickCarryOver=1 (default) a stick held while leaving VATS / a menu snaps at once
+            // (the user primes the turn); 0 = it must come back below fSnapRearm first (before)
+            s.armed = bindings::StickCarryOver() || std::abs(x) < c.snapRearm;
         }
         if (turnDeg != 0.0f) {
             rs::UserTurn(turnDeg * kD2R);

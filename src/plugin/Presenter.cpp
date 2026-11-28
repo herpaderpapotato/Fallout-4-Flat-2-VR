@@ -19,7 +19,9 @@
 #include "plugin/PointerBeam.h"
 #include "plugin/VirtualPad.h"
 #include "plugin/Presenter.h"
+#include "plugin/QuickMenu.h"
 #include "plugin/Roomscale.h"
+#include "plugin/Scope.h"
 #include "plugin/StereoPoC.h"
 #include "plugin/VatsWindow.h"
 #include "plugin/FloatingGun.h"
@@ -104,7 +106,8 @@ namespace fo4flatvr::present
             float       anchorYaw{ 0.0f };        // head yaw the quad was anchored to (radians, OpenXR, + = left)
             std::uint64_t anchors{ 0 };
             bool          workbenchGeometry{ false };  // round 6: the last anchor used FO4VR's workbench panel geometry
-            bool          workshopOnHand{ false };     // round 6: the WorkshopMenu panel follows the off-hand grip this frame
+            bool          workshopOnHand{ false };
+            bool          quickMenuOnHand{ false };  // 28 Nov: the FO4VR quick menu quad rides on the primary wand     // round 6: the WorkshopMenu panel follows the off-hand grip this frame
             std::uint64_t workshopHandFrames{ 0 };
             bool          workshopCropOn{ false };     // 21 Nov: the hand panel shows only the build area (SetCinemaQuadCrop)
             float         workshopFaceDeg{ -1.0f };    // 22 Nov: hand panel normal vs the direction to the head (deg; -1 = none)
@@ -642,6 +645,10 @@ namespace fo4flatvr::present
             if (game::WorldScreenMenu(a_name)) {
                 return true;
             }
+            // 27 Nov (scopes, Scope.h): the game's ScopeMenu while the gun is raised to the eye = FO4VR's in-headset scope
+            if (_stricmp(a_name, "ScopeMenu") == 0 && scope::ScopeMenuInWorld()) {
+                return true;
+            }
             if (game::PipboyWristOpen()) {
                 if (_stricmp(a_name, "PipboyHolotapeMenu") == 0) {
                     return true;
@@ -841,6 +848,11 @@ namespace fo4flatvr::present
                     s.worldScreen = ws;
                 }
             }
+            // 28 Nov (UI agent): FO4VR quick menu (QuickMenu.h): FavoritesMenu with the FO4VR movie on the cinema quad, which follows
+            // the primary wand below (the world_favorites.nif geometry)
+            if (!menu && !panel && s.mono && quickmenu::Active()) {
+                panel = "FavoritesMenu";
+            }
             // Dialogue options (DialogueMenu, FlatScreenModel; not view-taking: first-person dialogue stays head-tracked) on
             // the same panel: otherwise the game draws them at the bottom centre of the double-wide stereo frame = the seam
             // between the eyes ("in my nose"). [Menus] bDialoguePanel; the [Dialogue] crop panel takes precedence if on.
@@ -861,6 +873,7 @@ namespace fo4flatvr::present
                 REX::INFO("menu panel {} -> {}", s.lastPanel.empty() ? "-" : s.lastPanel, panel ? panel : "-");
                 s.lastPanel = panel ? panel : "";
             }
+            game::SetPanelMenu(s.lastPanel);  // 28 Nov: mod menus at the flat display's aspect while on the panel (GameMenuPointer.h)
             // VATS over the live world: with the VATS camera gate (camdir::VatsWorldView: the VATS camera is not pushed, the
             // player camera stays enabled; [Menus] bVatsLiveWorld turns the gate on) VATSMenu is not view-taking, the flat
             // VATS logic runs as usual, and its overlay (FlatScreenModel: target boxes, hit chances, queue) is laid
@@ -1100,7 +1113,46 @@ namespace fo4flatvr::present
                             offRight ? "right" : "left", c.active ? 1 : 0);
                     }
                 }
-                if (!handQuad) {
+                // 28 Nov: FO4VR quick menu on the primary wand (world_favorites.nif under the wand node: the shape 20.57 u above
+                // the wand origin in the wand's forward-facing plane, fFavoritesX/Y/Z/Pitch:VRUI 0, scale 1); the quad shows the
+                // nif's UV area of the 1024x1024 movie stage (letterboxed in the menu image)
+                bool qmQuad = false;
+                if (!handQuad && quadShown && panelNow && s.lastPanel == "FavoritesMenu" && quickmenu::Active()) {
+                    const auto& c = s.runtime.Controllers();
+                    const bool  pRight = !s.settings.leftHanded;
+                    if (c.active && (pRight ? c.rightGripPoseValid : c.leftGripPoseValid)) {
+                        const xr::Pose& g = pRight ? c.rightGripPose : c.leftGripPose;
+                        auto qmul = [](const xr::Quat& a, const xr::Quat& b) {
+                            return xr::Quat{ a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+                                a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z };
+                        };
+                        auto axisQ = [](float x, float y, float z, float deg) {
+                            const float h = deg * 0.5f * 0.0174532925f;
+                            return xr::Quat{ x * std::sin(h), y * std::sin(h), z * std::sin(h), std::cos(h) };
+                        };
+                        const float*   rd = s.settings.wandGripRotDeg;  // grip -> FO4VR wand frame, as the workshop hand panel
+                        const float    mir = pRight ? 1.0f : -1.0f;
+                        const xr::Quat cw = qmul(qmul(axisQ(0, 1, 0, rd[2] * mir), axisQ(0, 0, 1, -rd[1] * mir)), axisQ(1, 0, 0, rd[0]));
+                        const xr::Quat q = qmul(g.orientation, cw);
+                        const float*   oc = s.settings.wandGripOffsetCm;
+                        const xr::Vec3 wo = RotXr(g.orientation, { oc[0] * mir * 0.01f, oc[2] * 0.01f, -oc[1] * 0.01f });
+                        const auto     geo = quickmenu::GetGeometry();
+                        const xr::Vec3 off = RotXr(q, { 0.0f, geo.up, 0.0f });
+                        const xr::Pose hp{ q, { g.position.x + wo.x + off.x, g.position.y + wo.y + off.y, g.position.z + wo.z + off.z } };
+                        s.runtime.SetCinemaQuadOverride(&hp, geo.width);
+                        const float sw = aspect > 1.0f ? 1.0f / aspect : 1.0f, sh = aspect > 1.0f ? 1.0f : aspect;  // square stage
+                        const float crop[4] = { 0.5f - 0.5f * sw + sw * geo.u0, 0.5f - 0.5f * sh + sh * geo.v0, 0.5f - 0.5f * sw + sw * geo.u1,
+                            0.5f - 0.5f * sh + sh * geo.v1 };
+                        s.runtime.SetCinemaQuadCrop(crop);
+                        qmQuad = true;
+                        if (!s.quickMenuOnHand) {
+                            REX::INFO("quick menu: on the {} wand, {:.2f} m wide, {:.2f} m above the wand, crop {:.3f},{:.3f}..{:.3f},{:.3f} (image aspect {:.3f})",
+                                pRight ? "right" : "left", geo.width, geo.up, crop[0], crop[1], crop[2], crop[3], aspect);
+                        }
+                    }
+                }
+                s.quickMenuOnHand = qmQuad;
+                if (!handQuad && !qmQuad) {
                     s.runtime.SetCinemaQuadOverride(nullptr, 0.0f);
                     s.runtime.SetCinemaQuadCrop(nullptr);
                     s.workshopCropOn = false;
@@ -1168,13 +1220,21 @@ namespace fo4flatvr::present
                             Capture(s, backBuffer, eyeCapStem + "_bb.bmp");
                             s.runtime.SetEyeCapture(true);
                         }
+                        bool scopeFrame = false;  // 27 Nov (scopes): this frame was rendered as the scope view
                         if (s.afr) {
                             s.runtime.SubmitEye(s.context, backBuffer, s.renderEye, s.renderPose, used);
                         } else if (unsigned ex[2]{}, ew = 0, eh = 0;
                                    stereo::StereoSubmitActive() && stereo::UsedEyes(u) && stereo::EyeRegions(backBuffer, ex, ew, eh)) {
+                            // 27 Nov (scopes, Scope.h): a scope frame goes onto the scope quad (masked round, ScopeMenu reticle on
+                            // top); no projection layer = the world is black around it (FO4VR's blackout)
+                            if (scope::PresentedIsScope()) {
+                                bool premul = true;
+                                auto* menuTex = static_cast<ID3D11Texture2D*>(hud::MenuPanelTexture(premul));
+                                scopeFrame = scope::Submit(s.runtime, s.context, backBuffer, ex[0], ew, eh, menuTex, premul);
+                            }
                             // Single-pass stereo (iMode 2/3): the back buffer is [left | right]; each half
                             // goes to its eye with the pose/FOV its constants were built from.
-                            for (int e = 0; e < 2; ++e) {
+                            for (int e = 0; !scopeFrame && e < 2; ++e) {
                                 const xr::Pose p{ { u.eyeQ[e][0], u.eyeQ[e][1], u.eyeQ[e][2], u.eyeQ[e][3] },
                                     { u.eyeP[e][0], u.eyeP[e][1], u.eyeP[e][2] } };
                                 const xr::Fov f{ u.fov[e][0], u.fov[e][1], u.fov[e][2], u.fov[e][3] };
@@ -1211,7 +1271,7 @@ namespace fo4flatvr::present
                         // world panorama (round 4): this head-tracked frame into the cube, so a later flat window (VATS, ...)
                         // has the world all around it. Only steady tracked frames: TRACK policy, no fade, the heading not
                         // turning, from the 3rd frame on (the camera may still show the previous state's view), every 2nd frame.
-                        if (s.settings.menuBackdropPanorama) {
+                        if (s.settings.menuBackdropPanorama && !scopeFrame) {
                             float      yaw = 0.0f;
                             const auto r2w = PanoRefToWorld(yaw);
                             const bool steady = camdir::ViewPolicy(camState) == camdir::Policy::kTrack && fadeAlpha <= 0.0f &&
@@ -1222,7 +1282,10 @@ namespace fo4flatvr::present
                                 s.runtime.CapturePanorama(s.context, r2w);
                             }
                         }
-                        if (vigOn) {  // C8 comfort vignette: head-locked, above the world, below the HUD
+                        if (const float sf = scope::Fade(); sf > 0.0f && !scopeFrame) {
+                            // 27 Nov (scopes): FO4VR's blackout fade as the scoped gun comes up to the eye (whole view, below the HUD)
+                            vigSent = s.runtime.SubmitVignette(s.context, sf, 0.0f, 0.01f);
+                        } else if (vigOn && !scopeFrame) {  // C8 comfort vignette: head-locked, above the world, below the HUD
                             vigSent = s.runtime.SubmitVignette(s.context, vigAlpha, vigInner, vigOuter);
                         }
                         stereo::GpuProfMark("fo4flatvr present 2: HUD pieces, menu panel, settings / mod panels, beam");
@@ -1490,6 +1553,18 @@ namespace fo4flatvr::present
                 // VR controllers -> the game's gamepad (Fallout 4 Xbox layout). Inactive (session not
                 // focused, e.g. Quest system menu) maps to a neutral pad.
                 // 20 Nov: the VR settings panel keeps its pointing hand's trigger / stick / face buttons (ConfigUI.h)
+                {
+                    // 27 Nov (scopes, Scope.h): FO4VR's raise-to-eye test on this frame's head + primary aim pose (before the
+                    // bindings, which hold the game's aim while raised)
+                    const auto& rc = s.runtime.Controllers();
+                    const bool  left = s.settings.leftHanded;
+                    const bool  blocked = !s.lastMenu.empty() || !s.lastPanel.empty() || s.vatsOverlay || game::PipboyWristOpen() ||
+                                         game::MenuOpen("FavoritesMenu") || game::MenuOpen("DialogueMenu") || game::MenuOpen("VATSMenu");
+                    scope::Update(fi.head, began && fi.headValid, left ? rc.leftAim : rc.rightAim,
+                        began && rc.active && (left ? rc.leftAimValid : rc.rightAimValid),
+                        inputWorld && !worldScreenNow && (camState == 0 || camState == 4), blocked, s.settings.unitsPerMeter,
+                        game::MenuOpen("ScopeMenu"), s.mono && !s.afr && stereo::StereoSubmitActive());
+                }
                 xr::ControllerState cmask = s.runtime.Controllers();
                 configui::MaskControllers(cmask);
                 panelhost::MaskControllers(cmask);
@@ -1593,6 +1668,9 @@ namespace fo4flatvr::present
                             ef.fov[e][2] = v.fov.angleUp, ef.fov[e][3] = v.fov.angleDown;
                         }
                     }
+                    // 27 Nov (scopes): while scoped both eyes are the scope camera (eye -> along the aim ray, the weapon's zoom);
+                    // the head (= the world camera) stays. No change otherwise.
+                    scope::FillEyes(ef);
                     stereo::PublishEyes(ef);
                 }
                 s.pubHead = renderFrom;
@@ -1635,7 +1713,8 @@ namespace fo4flatvr::present
             head::ClosePublishWindow();  // pose, eyes, hand ray, gun data and target FOV for the next game frame are out
             // next frame's H2: leave FlatScreenModel out of the world image while a menu panel is up
             const bool vatsNow = worldView && s.vatsOverlay;
-            hud::SetMenuPanelNext((panelNow || vatsNow) && s.submitting && s.runtime.running());
+            // 27 Nov (scopes): the ScopeMenu overlay (reticle) is copied for the scope image, not drawn into the stereo frame
+            hud::SetMenuPanelNext((panelNow || vatsNow || (worldView && scope::WantMenuCopy())) && s.submitting && s.runtime.running());
             // a game-pausing panel menu (PauseMenu) stops the camera update: drive it for the next frame (head published above)
             // (first person only: the stall test counts FirstPersonState updates, which no other camera state makes)
             // (round 7: also a terminal on its monitor - TerminalMenu pauses the game, kPausesGame in flat and FO4VR)

@@ -11,6 +11,7 @@
 #include "plugin/ConfigStore.h"
 #include "plugin/ComfortEffects.h"
 #include "plugin/ControllerBindings.h"
+#include "plugin/QuickMenu.h"
 #include "plugin/Dialogue.h"
 #include "plugin/GameBridge.h"
 #include "plugin/GameHud.h"
@@ -31,6 +32,7 @@
 #include "plugin/Roomscale.h"
 #include "plugin/VirtualPad.h"
 #include "plugin/Settings.h"
+#include "plugin/Scope.h"
 #include "plugin/StereoPoC.h"
 #include "plugin/VatsWindow.h"
 #include "plugin/ThreadQueues.h"
@@ -420,6 +422,7 @@ namespace fo4flatvr
         window::SetEngineRenderSize(renderPlan.width, renderPlan.height);
         window::InstallSmallWindow(g_settings.windowWidth, g_settings.windowHeight);
         pad::Install();
+        quickmenu::Install();  // 28 Nov: FO4VR quick menu movie (FavoritesMenu LoadMovie call 104994D; QuickMenu.h)
         bindings::InstallGlyphs();  // 20 Nov: glyphs name the Touch control that does each action (call sites B71C2C..B72238, A504CC; byte-checked)
         game::camtweak::Configure({ g_settings.camNoAimZoom, g_settings.camFirstPersonDialogue, g_settings.camNoKillCams,
             g_settings.camNoIdleOrbit });  // [Camera] step 0: data writes only, applied from GameDataReady / Present
@@ -434,6 +437,7 @@ namespace fo4flatvr
         modsreset::Install();  // 26 Nov: hold the mod-change reset prompt while character creation is open ([General] bModsResetGuard)
         facediag::Install();  // FaceGen customization render guard: call sites 6DF69B/6EC07E (byte-checked; [Stereo] bFaceGenOffscreen)
         dlss::Install();      // 20 Nov: per-eye DLSS + neural rendering at the TAA draw ([DLSS], [NeuralRendering]; Dlss.h)
+        scope::Install();     // 27 Nov: FO4VR raise-to-eye scopes ([Scope]; Scope.h): no code patches, a main tick
         // Code patches go in now, before the game's main loop runs (no other thread can be inside them).
         // 20 Nov (live settings): the aim hooks are installed whatever bAimWithController says and pass through while it is
         // off (every hook checks the aim switch), so it and the follow-up switches apply live
@@ -468,6 +472,7 @@ namespace fo4flatvr
             // installed always, so bSeparateHud / bPanel / the Pip-Boy modes / the dialogue panel can be switched on while running.
             game::InstallHudHooks();
         }
+        game::InstallAspectGapHooks();  // 28 Nov (menus agent): aspect gap - HUD markers / VATS labels through the letterbox ([Menus] bAspectGapFix)
         // Wrist Pip-Boy (D3 stage 1): open/close detours + RenderEffect(0xC) call site; off-switch = no patches.
         {
             pipboy::Configure(PipboyConfigOf(g_settings));
@@ -508,6 +513,7 @@ namespace fo4flatvr
         tq::AddMainTick(&camdir::PollWorkbenchBody, "camdir::PollWorkbenchBody");
         tq::AddMainTick(&camdir::PollHeadHide, "camdir::PollHeadHide");
         tq::AddMainTick(&game::AimTick, "game::AimTick");
+        tq::AddMainTick(&game::FitPanelViewportTick, "game::FitPanelViewportTick");  // 28 Nov: panel mod menus at the flat display's aspect
         tq::AddMainTick(&PollPendingLive, "live settings");  // 20 Nov: deferred live changes (Pip-Boy mode while it is closed)
         tq::Install();
         // 20 Nov (live settings, ConfigStore.h): the Settings.h keys with a runtime setter (others subscribe in their modules)

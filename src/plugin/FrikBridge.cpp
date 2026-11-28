@@ -54,6 +54,9 @@ namespace fo4flatvr::frikbridge
         std::atomic<FO4FlatVR_FrameCallback>    g_frameCb{ nullptr };
         std::atomic<void*>                      g_frameCtx{ nullptr };
         std::atomic<std::uint64_t>              g_frameCalls{ 0 };
+        std::atomic<FO4FlatVR_FrameCallback>    g_preCb{ nullptr };   // v11: before the floating gun (graph output)
+        std::atomic<void*>                      g_preCtx{ nullptr };
+        std::atomic<std::uint64_t>              g_preCalls{ 0 };
 
         // ---- 16 Nov (user: at a terminal "the hands end up freezing in the air"): pause-time frame ----
         // Main::OnIdle (C339D0) runs every frame; the player update (OnIdle_UpdatePlayer -> C351F3) only runs on the job threads it
@@ -116,6 +119,10 @@ namespace fo4flatvr::frikbridge
         {
             // 15 Nov: the floating gun (next in the chain) and the notify run FIRST, then FRIK-flat's frame: FRIK's primary hand
             // takes the gun's WEAPON of this frame as its grip target (frik-flat C27), so the hand stays on the gun with no lag.
+            if (const auto pre = g_preCb.load(std::memory_order_acquire); pre && !g_cbSkip.load(std::memory_order_relaxed)) {
+                ++g_preCalls;
+                pre(g_preCtx.load(std::memory_order_relaxed));  // v11: the engine's graph output, before the gun moves the rig
+            }
             const int r = g_origNotify(a_src, a_evt);
             const long long t0 = Qpc();
             double cbUs = -1.0;
@@ -345,6 +352,14 @@ namespace fo4flatvr::frikbridge
             return g_hooked ? 1 : 0;
         }
 
+        std::uint8_t SetPreFrameCallbackC(FO4FlatVR_FrameCallback a_cb, void* a_ctx)
+        {
+            g_preCtx.store(a_ctx, std::memory_order_relaxed);
+            g_preCb.store(a_cb, std::memory_order_release);
+            REX::INFO("[FRIK] pre-frame (graph output) callback {} (C351F3 hook {})", a_cb ? "registered" : "cleared", g_hooked ? "installed" : "NOT installed");
+            return g_hooked ? 1 : 0;
+        }
+
         std::uint8_t BodyEnabled() { return Body() ? 1 : 0; }
 
         std::uint8_t SetCameraOffsetCallback(FO4FlatVR_CameraOffsetCallback a_cb, void* a_ctx)
@@ -395,6 +410,12 @@ namespace fo4flatvr::frikbridge
             return bindings::SetClaims(a_owner, a_left, a_right) ? 1 : 0;
         }
 
+        // v10: input adds (ROCK-flat left-hand fire / button layout; ControllerBindings.h SetAdds)
+        std::uint8_t SetInputAddsC(std::uint32_t a_owner, std::uint32_t a_left, std::uint32_t a_right)
+        {
+            return bindings::SetAdds(a_owner, a_left, a_right) ? 1 : 0;
+        }
+
         // v9: main-thread queue for FRIK-flat (engine cull calls)
         std::uint8_t RunOnMainC(void (*a_fn)(void*), void* a_ctx)
         {
@@ -402,9 +423,44 @@ namespace fo4flatvr::frikbridge
             return tq::RunOnMain([a_fn, a_ctx] { a_fn(a_ctx); }) ? 1 : 0;
         }
 
+        // v12 (28 Nov, ROCK-flat R35): the floating gun's kick through FRIK's recoil controllers (FO4FlatVR_KickCallback).
+        // [ROCK] bRecoilControl=1 (live): 0 = the gun never calls it and always kicks on its own (the pre-R35 behaviour).
+        std::atomic<FO4FlatVR_KickCallback> g_kickCb{ nullptr };
+        std::atomic<void*>                  g_kickCtx{ nullptr };
+        std::atomic<bool>                   g_kickOn{ true };
+        std::atomic<std::uint64_t>          g_kickCalls{ 0 }, g_kickTaken{ 0 }, g_kickDropped{ 0 };
+        bool IniRecoilControl() { return ::GetPrivateProfileIntA("ROCK", "bRecoilControl", 1, IniPath().c_str()) != 0; }
+        std::uint8_t GetInputContextC() { return bindings::InputContext(); }  // v13
+        std::uint8_t SetKickCallbackC(FO4FlatVR_KickCallback a_cb, void* a_ctx)
+        {
+            g_kickCtx.store(a_ctx, std::memory_order_relaxed);
+            g_kickCb.store(a_cb, std::memory_order_release);
+            REX::INFO("[FRIK] kick callback {} ([ROCK] bRecoilControl={})", a_cb ? "registered" : "cleared", g_kickOn.load() ? 1 : 0);
+            return g_kickOn.load() ? 1 : 0;
+        }
+
         constexpr FO4FlatVR_FrikBridge kBridge{ FO4FLATVR_FRIK_BRIDGE_VERSION, 0, &GetFrame, &Vibrate, &SetFrikActive, &IniPathC, &SetFrameCallback,
             &BodyEnabled, &SetCameraOffsetCallback, &GetSelfie, &RecentreCount, &NoScalingC, &SetFrikConfigApiC, &ConfigRevisionC, &SetInputClaimsC,
-            &RunOnMainC };
+            &RunOnMainC, &SetInputAddsC, &SetPreFrameCallbackC, &SetKickCallbackC, &GetInputContextC };
+    }
+
+    bool FilterGunKick(const RE::NiTransform& a_kick, RE::NiTransform& a_out)
+    {
+        static_assert(sizeof(RE::NiTransform) == 16 * sizeof(float), "bridge v12 kick layout");
+        const auto cb = g_kickOn.load(std::memory_order_relaxed) && !g_cbSkip.load(std::memory_order_relaxed) ? g_kickCb.load(std::memory_order_acquire) : nullptr;
+        if (!cb) return false;
+        ++g_kickCalls;
+        float in[16], out[16];
+        std::memcpy(in, &a_kick, sizeof(in));
+        std::memcpy(out, &a_kick, sizeof(out));
+        if (cb(g_kickCtx.load(std::memory_order_relaxed), in, out) == 0) return false;
+        std::memcpy(&a_out, out, sizeof(out));
+        ++g_kickTaken;
+        const auto& r = a_out.rotate.entry;
+        if (a_out.translate.x == 0.0f && a_out.translate.y == 0.0f && a_out.translate.z == 0.0f && r[0][0] == 1.0f && r[1][1] == 1.0f && r[2][2] == 1.0f) {
+            ++g_kickDropped;
+        }
+        return true;
     }
 
     bool BodyActive() { return g_frikActive.load(); }
@@ -416,7 +472,13 @@ namespace fo4flatvr::frikbridge
         // 20 Nov (live settings): fUnitsPerMeter goes to FRIK-flat in every frame snapshot (a change applies at the next frame);
         // bPausedFrame gates the paused-frame hook; bGunStepsAside re-decides the floating gun's role while FRIK is active.
         // FRIK-flat's own [FRIK] switches follow the bridge v7 settings revision (vrshim iniIntLive).
-        cfgstore::Subscribe("frikbridge", "General/fUnitsPerMeter,FRIK/bPausedFrame,FRIK/bGunStepsAside", [](const cfgstore::Changes& a_ch) {
+        g_kickOn = IniRecoilControl();
+        cfgstore::Subscribe("frikbridge", "General/fUnitsPerMeter,FRIK/bPausedFrame,FRIK/bGunStepsAside,ROCK/bRecoilControl", [](const cfgstore::Changes& a_ch) {
+            if (a_ch.Has("ROCK", "bRecoilControl")) {
+                g_kickOn = IniRecoilControl();
+                REX::INFO("[FRIK] [ROCK] bRecoilControl={} (live): the floating gun's kick {}", g_kickOn.load() ? 1 : 0,
+                    g_kickOn.load() ? "goes through FRIK's recoil controllers (ROCK)" : "stays the gun's own");
+            }
             if (a_ch.Has("General", "fUnitsPerMeter")) {
                 char buf[64]{};
                 ::GetPrivateProfileStringA("General", "fUnitsPerMeter", "70", buf, sizeof(buf), IniPath().c_str());
@@ -597,19 +659,21 @@ namespace fo4flatvr::frikbridge
             return "error: frik [status|smooth on|off|smooth xy on|off|reset|perf|cb on|off|paused on|off|noscale|cfg [<Section> <Key>]]";
         }
         return std::format("frik v={} enable={} body={} smooth={} xy={} frikdll={} camcb={} steps={} valid={} off=({:.3f},{:.3f},{:.3f}) maxz={:.3f} "
-                           "maxxy={:.3f} framecb={} frames={} active={} paused={}/{} pausedFrames={} pausedSkipFirst={} noscale={} frikcfg={}",
+                           "maxxy={:.3f} framecb={} frames={} active={} paused={}/{} pausedFrames={} pausedSkipFirst={} noscale={} frikcfg={} "
+                           "kick cb={} on={} calls={} taken={} dropped={}",
             FO4FLATVR_FRIK_BRIDGE_VERSION, Enabled() ? 1 : 0, g_body.load() ? 1 : 0, g_smooth.load() ? 1 : 0, g_smoothXY.load() ? 1 : 0,
             ::GetModuleHandleW(L"FRIK.dll") ? 1 : 0, g_camCb.load() ? 1 : 0, g_camSteps.load(), g_camValidSteps.load(),
             g_camX.load(), g_camY.load(), g_camZ.load(), g_camMaxAbsZ.load(), g_camMaxAbsXY.load(), g_frameCb.load() ? 1 : 0,
             g_frameCalls.load(), g_frikActive.load() ? 1 : 0, g_idleHooked ? 1 : 0, g_pausedFrame.load() ? 1 : 0, g_pausedCalls.load(),
-            g_pausedSkipStall.load(), NoScaling() ? 1 : 0, ConfigApi() ? 1 : 0);
+            g_pausedSkipStall.load(), NoScaling() ? 1 : 0, ConfigApi() ? 1 : 0, g_kickCb.load() ? 1 : 0, g_kickOn.load() ? 1 : 0,
+            g_kickCalls.load(), g_kickTaken.load(), g_kickDropped.load());
     }
 }
 
 extern "C" __declspec(dllexport) const FO4FlatVR_FrikBridge* FO4FLATVR_GetFrikBridge(std::uint32_t a_version)
 {
     using namespace fo4flatvr::frikbridge;
-    // v4 appends GetSelfie, v5 RecentreCount, v6 NoScaling + SetFrikConfigApi, v7 ConfigRevision, v8 SetInputClaims, v9 RunOnMain: an older FRIK.dll gets the same table (it never
+    // v4 appends GetSelfie, v5 RecentreCount, v6 NoScaling + SetFrikConfigApi, v7 ConfigRevision, v8 SetInputClaims, v9 RunOnMain, v10 SetInputAdds, v11 SetPreFrameCallback, v12 SetKickCallback: an older FRIK.dll gets the same table (it never
     // reads past its own fields)
     if (a_version < FO4FLATVR_FRIK_BRIDGE_MIN_VERSION || a_version > FO4FLATVR_FRIK_BRIDGE_VERSION) {
         REX::WARN("[FRIK] FRIK.dll asked for bridge v{}, have v{}..v{}: FRIK-flat stays dormant", a_version, FO4FLATVR_FRIK_BRIDGE_MIN_VERSION,

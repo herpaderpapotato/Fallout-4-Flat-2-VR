@@ -28,6 +28,11 @@
 
 #include <string>
 
+namespace RE
+{
+    class NiTransform;
+}
+
 struct FO4FlatVR_FrikConfigApi;
 
 namespace xr
@@ -59,6 +64,11 @@ namespace fo4flatvr::frikbridge
     const FO4FlatVR_FrikConfigApi* ConfigApi();
     // v6: [General] bNoScaling (live, re-read about once a second)
     bool NoScaling();
+
+    // v12 (ROCK-flat R35): the floating gun's kick (FO4VR PrimaryWeaponKickbackRecoilNode local) offered to FRIK-flat's recoil
+    // controllers (ROCK) before the gun places the weapon. false = nobody took it (the gun applies a_kick); true = apply a_out
+    // instead (identity = none). Player-update job thread (the gun's W1 hook). [ROCK] bRecoilControl=0 = always false.
+    bool FilterGunKick(const RE::NiTransform& a_kick, RE::NiTransform& a_out);
 
     // pipe: frik [status|smooth on|off|reset]
     std::string Command(const std::string& a_arg);

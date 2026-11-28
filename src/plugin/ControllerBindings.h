@@ -63,6 +63,8 @@ namespace fo4flatvr::bindings
     // 20 Nov, FO4VR workshop mode ([Controllers] bWorkshopFO4VR=1): X minimised the build menu -> the Presenter hides the
     // WorkshopMenu panel (workshop mode stays on, the off stick walks); off stick click held = settlement stats -> the panel
     // is drawn this much larger ([Menus] fWorkshopStatsScale). Any thread; set by the last Map().
+    // 28 Nov: [Controllers] bStickCarryOver (default 1): a stick held over a context change drives the new context at once.
+    bool  StickCarryOver();
     bool  WorkshopPanelHidden();
     float WorkshopPanelScale();
 
@@ -80,5 +82,12 @@ namespace fo4flatvr::bindings
     bool SetClaims(std::uint32_t a_owner, std::uint32_t a_left, std::uint32_t a_right);
     // the ORed masks of every owner as Map() applies them (0, 0 while [ROCK] bInputClaims=0). Any thread.
     void Claims(std::uint32_t& a_left, std::uint32_t& a_right);
+    // 28 Nov, bridge v10: input adds of a client (same bits / owners / contexts / switch as the claims): inputs Map() sees
+    // pressed on that physical hand although they are not (ROCK's left-hand fire = right trigger added while the left trigger
+    // is claimed). Applied after the claims, before the gestures and the pad mapping. Any thread. Logs on change.
+    bool SetAdds(std::uint32_t a_owner, std::uint32_t a_left, std::uint32_t a_right);
+    // 28 Nov, bridge v13 (ROCK-flat R50): the input context of the last Map(): 0 gameplay, 1 quick loot, 2 Pip-Boy,
+    // 3 favourites / quick menu, 4 V.A.T.S., 5 workshop, 6 lockpick, 7 dialogue, 8 other menu. Any thread.
+    std::uint8_t InputContext();
 
 }
